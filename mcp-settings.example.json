@@ -1,0 +1,23 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/claude-code/main/schemas/mcp-settings.json",
+  "mcpServers": {
+    "franka": {
+      "command": "ssh",
+      "args": [
+        "-o", "StrictHostKeyChecking=no",
+        "pi@panda-pi.local",
+        "cd /home/pi/panda-mcp && ./venv/bin/python -m franka_mcp.server"
+      ],
+      "env": {}
+    },
+    "camera": {
+      "command": "ssh",
+      "args": [
+        "-o", "StrictHostKeyChecking=no",
+        "pi@panda-pi.local",
+        "cd /home/pi/panda-mcp && ./venv/bin/python -m camera_mcp.server"
+      ],
+      "env": {}
+    }
+  }
+}

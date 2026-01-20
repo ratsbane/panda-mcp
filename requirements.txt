@@ -1,0 +1,18 @@
+# MCP Server
+mcp>=1.0.0
+
+# Franka control (panda-python requires libfranka built from source on ARM64)
+panda-python>=0.8.0
+numpy>=1.24.0
+
+# Camera
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Utilities
+pydantic>=2.0.0
+structlog>=23.0.0
+
+# Development
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
