@@ -309,27 +309,52 @@ class CameraController:
         """Change camera resolution."""
         if not self._connected:
             return {"success": False, "error": "Camera not connected"}
-        
+
         if self._mock_mode:
             self.config.width = width
             self.config.height = height
             return {"success": True, "width": width, "height": height, "mock": True}
-        
+
         try:
             self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            
+
             actual_width = int(self._capture.get(cv2.CAP_PROP_FRAME_WIDTH))
             actual_height = int(self._capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            
+
             return {
                 "success": True,
                 "requested": {"width": width, "height": height},
                 "actual": {"width": actual_width, "height": actual_height},
             }
-            
+
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def capture_raw(self) -> Optional[np.ndarray]:
+        """
+        Capture a raw BGR frame for processing.
+
+        Returns:
+            numpy array in BGR format, or None if capture failed
+        """
+        if not self._connected:
+            return None
+
+        if self._mock_mode:
+            # Return a mock frame
+            width, height = self.config.width, self.config.height
+            frame = np.zeros((height, width, 3), dtype=np.uint8)
+
+            # Simple test pattern
+            for y in range(height):
+                frame[y, :, 0] = int(255 * y / height)
+                frame[y, :, 2] = int(255 * (1 - y / height))
+
+            return frame
+
+        ret, frame = self._capture.read()
+        return frame if ret else None
 
 
 # Singleton controller

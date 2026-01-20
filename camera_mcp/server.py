@@ -7,6 +7,8 @@ Provides workspace observation for Claude.
 import asyncio
 import json
 import logging
+import sys
+import os
 from typing import Any
 
 from mcp.server import Server
@@ -14,6 +16,10 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ImageContent
 
 from .controller import get_camera_controller
+
+# Add parent directory to path for common module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.scene_interpreter import interpret_scene, annotate_scene
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -117,6 +123,35 @@ async def list_tools() -> list[Tool]:
                 "required": ["width", "height"],
             },
         ),
+        Tool(
+            name="describe_scene",
+            description="Capture an image and analyze the scene. Returns detected objects, their positions, colors, spatial relationships, and a natural language summary.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "use_color_detection": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Use color-based object detection",
+                    },
+                    "use_contour_detection": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Use edge/contour-based detection",
+                    },
+                    "min_area": {
+                        "type": "integer",
+                        "default": 500,
+                        "description": "Minimum object area in pixels",
+                    },
+                    "include_annotated_image": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Include an annotated image showing detected objects",
+                    },
+                },
+            },
+        ),
     ]
 
 
@@ -212,7 +247,55 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
                 height=arguments["height"],
             )
             return json_response(result)
-        
+
+        elif name == "describe_scene":
+            if not controller.connected:
+                return json_response({"error": "Camera not connected. Call 'connect' first."})
+
+            # Capture raw frame
+            frame = controller.capture_raw()
+            if frame is None:
+                return json_response({"error": "Failed to capture frame"})
+
+            # Interpret scene
+            scene = interpret_scene(
+                frame,
+                use_color_detection=arguments.get("use_color_detection", True),
+                use_contour_detection=arguments.get("use_contour_detection", True),
+                min_area=arguments.get("min_area", 500),
+            )
+
+            responses: list[TextContent | ImageContent] = []
+
+            # Include annotated image if requested
+            if arguments.get("include_annotated_image", False):
+                import cv2
+                from PIL import Image
+                import io
+                import base64
+
+                annotated = annotate_scene(frame, scene, show_labels=True, show_relationships=True)
+                # Convert BGR to RGB
+                annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(annotated_rgb)
+                buffer = io.BytesIO()
+                img.save(buffer, format="JPEG", quality=85)
+                image_data = buffer.getvalue()
+
+                responses.append(ImageContent(
+                    type="image",
+                    data=base64.b64encode(image_data).decode("utf-8"),
+                    mimeType="image/jpeg",
+                ))
+
+            # Add scene description as JSON
+            responses.append(TextContent(
+                type="text",
+                text=json.dumps(scene.to_dict(), indent=2),
+            ))
+
+            return responses
+
         else:
             return json_response({"error": f"Unknown tool: {name}"})
     
