@@ -26,7 +26,7 @@ MCP (Model Context Protocol) servers for controlling a Franka Emika Panda robot 
         ▼                 ▼                 ▼
 ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
 │  Franka Panda │ │  USB Camera   │ │  USB Speaker  │
-│ (172.16.0.2)  │ │ (/dev/video0) │ │ (plughw:3,0)  │
+│(192.168.0.253)│ │ (/dev/video0) │ │ (plughw:3,0)  │
 └───────────────┘ └───────────────┘ └───────────────┘
 ```
 
@@ -42,16 +42,21 @@ The camera daemon enables multiple clients (camera-mcp, scene_viewer) to share t
 - USB speaker for voice output
 
 ### Network Configuration
-The Pi connects directly to the Panda arm's control interface (not the shop floor controller):
+The Pi connects to the Panda's shop floor controller via Ethernet. The controller expects a DHCP server, so configure the Pi to share its connection using NetworkManager's "shared" method, which automatically runs a DHCP server (dnsmasq):
 
 ```bash
-# Configure static IP on eth0
-sudo nmcli con add con-name panda type ethernet ifname eth0 \
-    ipv4.addresses 172.16.0.1/24 ipv4.method manual
+# Create a shared connection on eth0 (runs DHCP server automatically)
+sudo nmcli con add con-name franka-direct type ethernet ifname eth0 \
+    ipv4.addresses 192.168.0.2/24 ipv4.method shared
+
+# Activate the connection
+sudo nmcli con up franka-direct
 ```
 
-- **Panda arm control interface:** `172.16.0.2`
-- **Raspberry Pi:** `172.16.0.1`
+This configures:
+- **Raspberry Pi:** `192.168.0.2` (static)
+- **DHCP range:** `192.168.0.11 - 192.168.0.254` (served by dnsmasq)
+- **Panda shop floor controller:** Receives address via DHCP (typically `192.168.0.253`)
 
 ### Real-Time Kernel Setup
 For reliable FCI communication, install the RT kernel:
@@ -108,7 +113,30 @@ python -m voice_mcp.server
 
 ## Camera Daemon
 
-The camera daemon provides shared camera access via ZeroMQ, allowing multiple clients (camera-mcp, scene_viewer) to receive frames simultaneously.
+The camera daemon captures frames from the USB camera and publishes them over a ZeroMQ pub/sub bus. This architecture solves a key problem: only one process can open a V4L2 camera device at a time, but multiple clients need camera access (the MCP server for Claude, the scene viewer for monitoring, data collection scripts, etc.).
+
+### ZeroMQ Architecture
+```
+┌─────────────────┐
+│  USB Camera     │
+│  /dev/video0    │
+└────────┬────────┘
+         │ OpenCV VideoCapture
+         ▼
+┌─────────────────┐
+│  camera-daemon  │  Captures frames, publishes to ZMQ
+└────────┬────────┘
+         │ ZeroMQ PUB socket
+         │ ipc:///tmp/camera-daemon.sock
+         ▼
+    ┌────┴────┬─────────────┐
+    ▼         ▼             ▼
+┌───────┐ ┌───────┐ ┌──────────────┐
+│camera │ │scene  │ │ data         │
+│ -mcp  │ │viewer │ │ collection   │
+└───────┘ └───────┘ └──────────────┘
+   ZMQ SUB clients (can subscribe/unsubscribe freely)
+```
 
 ### Setup as systemd user service:
 ```bash
@@ -124,7 +152,12 @@ systemctl --user start camera-daemon
 # Check status
 systemctl --user status camera-daemon
 journalctl --user -u camera-daemon -f
+
+# Enable linger so service runs even when not logged in
+sudo loginctl enable-linger $USER
 ```
+
+The service runs as a user service (not system-wide) so it has access to the user's Python virtual environment. With linger enabled, the daemon starts at boot and continues running after logout.
 
 ### Manual startup:
 ```bash
@@ -207,6 +240,15 @@ python -m common.scene_viewer --width 1280 --height 720 --min-area 500
 
 The `speak` tool supports a `blocking` parameter (default: true). Set to false to continue execution while audio plays in the background.
 
+#### Voice Server Features
+- **Piper TTS**: Uses the fast, local Piper text-to-speech engine
+- **Sentence splitting**: Long text is split into sentences for natural pauses
+- **Audio primer**: A brief low-frequency tone primes the USB speaker to avoid clipping the first syllable
+- **Background playback**: Non-blocking mode allows Claude to continue working while speaking
+- **Multiple voices**: Download additional Piper voice models to `voices/` directory
+
+Audio output is configured for USB speaker at `plughw:3,0`. Adjust `AUDIO_DEVICE` in `voice_mcp/server.py` if your speaker is on a different device.
+
 ## Data Collection for Visuomotor Learning
 
 This project includes infrastructure for collecting training data to teach Claude to estimate gripper position from camera images.
@@ -216,16 +258,30 @@ Train a model on (image, robot_state) pairs to predict gripper position, enablin
 
 ### Data Collection Scripts
 
+The `scripts/collect_data.py` script captures synchronized (image, robot_state) pairs for training:
+
 ```bash
-# Collect random samples
+# Collect random samples - robot moves to random positions in workspace
 python scripts/collect_data.py --mode random --samples 500
 
-# Collect on a grid pattern
+# Collect on a grid pattern - systematic coverage of workspace
 python scripts/collect_data.py --mode grid --grid-resolution 5
 
-# Manual collection (press 's' to save)
+# Manual collection - you control the robot, press 's' to save samples
 python scripts/collect_data.py --mode manual
+
+# Specify output directory
+python scripts/collect_data.py --mode random --samples 100 --output-dir ./my_dataset
 ```
+
+Each sample saves:
+- JPEG image from the workspace camera
+- JSON metadata with joint positions, end-effector pose, gripper width, and timestamp
+
+#### Collection Modes
+- **random**: Robot moves to random positions within safe workspace bounds. Good for diverse coverage.
+- **grid**: Systematic grid pattern across the workspace. Good for uniform spatial coverage.
+- **manual**: Human teleoperates or guides the robot. Press 's' to save current state. Good for task-specific demonstrations.
 
 ### ArUco Marker Tracking
 For robust training with variable camera positions, use ArUco markers to track camera pose:
