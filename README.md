@@ -2,6 +2,24 @@
 
 MCP (Model Context Protocol) servers for controlling a Franka Emika Panda robot arm, USB camera, and text-to-speech from Claude.
 
+## Overview
+
+This project gives Claude physical embodiment. When you run [Claude Code](https://github.com/anthropics/claude-code) in this directory, Claude gains access to MCP tools that let it:
+
+- **See** the workspace through a USB camera
+- **Move** a 7-DOF robot arm to manipulate objects
+- **Speak** aloud through a USB speaker
+
+You can ask Claude to pick up objects, arrange blocks, or perform other manipulation tasks. Claude observes the scene through the camera, plans movements, executes them through the robot arm, and verifies the results visually.
+
+```
+"Pick up the green block and put it in the basket"
+    → Claude captures an image, identifies the block,
+      moves the arm, grasps, lifts, places, and confirms
+```
+
+The system runs on a Raspberry Pi 5 connected directly to the Franka Panda arm, with all perception and control happening locally.
+
 ## Architecture
 
 ```
