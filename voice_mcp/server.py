@@ -7,7 +7,7 @@ Gives Claude a voice using Piper TTS.
 import asyncio
 import json
 import logging
-import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -50,8 +50,104 @@ def list_available_voices() -> list[str]:
     return sorted(voices)
 
 
-async def speak_text(text: str, voice: str = None) -> dict:
-    """Speak text using Piper TTS."""
+def split_sentences(text: str) -> list[str]:
+    """Split text into sentences."""
+    import re
+    # Split on sentence-ending punctuation followed by space
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    return [s.strip() for s in sentences if s.strip()]
+
+
+async def generate_audio(text: str, voice_path: Path) -> tuple[str, list[str]]:
+    """Generate audio file from text. Returns (final_wav_path, temp_files_to_cleanup)."""
+    sentences = split_sentences(text)
+    temp_files = []
+
+    # Generate audio for each sentence separately
+    for i, sentence in enumerate(sentences):
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+            temp_wav = f.name
+            temp_files.append(temp_wav)
+
+        gen_cmd = (
+            f'echo {json.dumps(sentence)} | '
+            f'{PIPER_PATH} --model {voice_path} --output_file {temp_wav} 2>/dev/null'
+        )
+
+        proc = await asyncio.create_subprocess_shell(
+            gen_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+
+        if proc.returncode != 0:
+            raise RuntimeError(f"TTS generation failed for sentence {i+1}")
+
+    # Create final output file
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+        final_wav = f.name
+
+    # Generate a quiet primer tone to wake up the USB speaker
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+        primer_wav = f.name
+
+    primer_cmd = (
+        f'ffmpeg -y -f lavfi -i "sine=frequency=100:duration=0.2" '
+        f'-af "volume=0.01" -ar 22050 {primer_wav} 2>/dev/null'
+    )
+    await (await asyncio.create_subprocess_shell(primer_cmd)).communicate()
+
+    # Concatenate primer + all sentences
+    all_inputs = [primer_wav] + temp_files
+    inputs = ' '.join(f'-i {f}' for f in all_inputs)
+    n = len(all_inputs)
+    filter_concat = ''.join(f'[{i}:a]' for i in range(n))
+    concat_cmd = (
+        f'ffmpeg -y {inputs} -filter_complex "{filter_concat}concat=n={n}:v=0:a=1[out]" '
+        f'-map "[out]" {final_wav} 2>/dev/null'
+    )
+
+    temp_files.append(primer_wav)
+
+    proc = await asyncio.create_subprocess_shell(
+        concat_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+
+    play_file = final_wav if proc.returncode == 0 else temp_files[0]
+    return play_file, temp_files + [final_wav]
+
+
+async def play_and_cleanup(play_file: str, temp_files: list[str]):
+    """Play audio file and clean up temp files."""
+    play_cmd = f'aplay -D {AUDIO_DEVICE} {play_file} 2>/dev/null'
+
+    proc = await asyncio.create_subprocess_shell(
+        play_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+
+    # Clean up temp files
+    for f in temp_files:
+        try:
+            Path(f).unlink()
+        except:
+            pass
+
+
+async def speak_text(text: str, voice: str = None, blocking: bool = True) -> dict:
+    """Speak text using Piper TTS.
+
+    Args:
+        text: Text to speak
+        voice: Voice model to use
+        blocking: If True, wait for speech to complete. If False, return immediately.
+    """
     voice = voice or current_voice
     voice_path = get_voice_path(voice)
 
@@ -62,38 +158,24 @@ async def speak_text(text: str, voice: str = None) -> dict:
             "available_voices": list_available_voices(),
         }
 
-    # Prepend a brief pause to prevent clipping at the start
-    # The ellipsis creates a natural pause before the actual content
-    padded_text = "... " + text
-
-    # Build the command pipeline
-    cmd = (
-        f'echo {json.dumps(padded_text)} | '
-        f'{PIPER_PATH} --model {voice_path} --output-raw 2>/dev/null | '
-        f'aplay -D {AUDIO_DEVICE} -r 22050 -f S16_LE -t raw - 2>/dev/null'
-    )
-
     try:
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
+        # Generate the audio (always wait for this)
+        play_file, temp_files = await generate_audio(text, voice_path)
 
-        if proc.returncode == 0:
-            return {
-                "success": True,
-                "text": text,
-                "voice": voice,
-                "characters": len(text),
-            }
+        if blocking:
+            # Wait for playback to complete
+            await play_and_cleanup(play_file, temp_files)
         else:
-            return {
-                "success": False,
-                "error": f"Speech failed with code {proc.returncode}",
-                "stderr": stderr.decode() if stderr else None,
-            }
+            # Fire and forget - schedule playback as background task
+            asyncio.create_task(play_and_cleanup(play_file, temp_files))
+
+        return {
+            "success": True,
+            "text": text,
+            "voice": voice,
+            "characters": len(text),
+            "blocking": blocking,
+        }
     except Exception as e:
         return {
             "success": False,
@@ -114,6 +196,11 @@ async def list_tools() -> list[Tool]:
                     "text": {
                         "type": "string",
                         "description": "The text to speak aloud",
+                    },
+                    "blocking": {
+                        "type": "boolean",
+                        "description": "If true (default), wait for speech to complete. If false, return immediately while audio plays in background.",
+                        "default": True,
                     },
                 },
                 "required": ["text"],
@@ -163,7 +250,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if not text:
                 return json_response({"error": "No text provided"})
 
-            result = await speak_text(text)
+            blocking = arguments.get("blocking", True)
+            result = await speak_text(text, blocking=blocking)
             return json_response(result)
 
         elif name == "list_voices":

@@ -1,0 +1,20 @@
+[Unit]
+Description=Camera Daemon - ZeroMQ frame publisher
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/doug/panda-mcp
+ExecStart=/home/doug/panda-mcp/venv/bin/python -m camera_daemon.server
+Restart=on-failure
+RestartSec=5
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

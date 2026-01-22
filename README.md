@@ -16,14 +16,21 @@ MCP (Model Context Protocol) servers for controlling a Franka Emika Panda robot 
 │  franka-mcp   │ │  camera-mcp   │ │  voice-mcp    │
 └───────┬───────┘ └───────┬───────┘ └───────┬───────┘
         │                 │                 │
-        │ panda-py        │ OpenCV          │ Piper TTS
-        │                 │                 │
+        │ panda-py        │ ZeroMQ          │ Piper TTS
+        │                 ▼                 │
+        │         ┌───────────────┐         │
+        │         │ camera-daemon │         │
+        │         │  (systemd)    │         │
+        │         └───────┬───────┘         │
+        │                 │ OpenCV          │
         ▼                 ▼                 ▼
 ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
 │  Franka Panda │ │  USB Camera   │ │  USB Speaker  │
 │ (172.16.0.2)  │ │ (/dev/video0) │ │ (plughw:3,0)  │
 └───────────────┘ └───────────────┘ └───────────────┘
 ```
+
+The camera daemon enables multiple clients (camera-mcp, scene_viewer) to share the camera simultaneously via ZeroMQ pub/sub.
 
 ## Hardware Setup
 
@@ -99,6 +106,65 @@ python -m camera_mcp.server
 python -m voice_mcp.server
 ```
 
+## Camera Daemon
+
+The camera daemon provides shared camera access via ZeroMQ, allowing multiple clients (camera-mcp, scene_viewer) to receive frames simultaneously.
+
+### Setup as systemd user service:
+```bash
+# Copy service file
+mkdir -p ~/.config/systemd/user
+cp systemd/camera-daemon.service ~/.config/systemd/user/
+
+# Enable and start
+systemctl --user daemon-reload
+systemctl --user enable camera-daemon
+systemctl --user start camera-daemon
+
+# Check status
+systemctl --user status camera-daemon
+journalctl --user -u camera-daemon -f
+```
+
+### Manual startup:
+```bash
+python -m camera_daemon.server
+```
+
+### Configuration
+The daemon publishes frames on:
+- **IPC:** `ipc:///tmp/camera-daemon.sock` (preferred, faster)
+- **TCP:** `tcp://127.0.0.1:5555` (fallback)
+
+Environment variables:
+- `CAMERA_DEVICE`: Camera device number (default: 0)
+- `CAMERA_WIDTH`: Frame width (default: 640)
+- `CAMERA_HEIGHT`: Frame height (default: 480)
+- `CAMERA_FPS`: Target FPS (default: 30)
+
+## Scene Viewer
+
+Interactive viewer with live object detection overlays. Useful for monitoring the workspace on a connected display.
+
+```bash
+# Run with daemon (default)
+python -m common.scene_viewer
+
+# Run with direct camera access
+python -m common.scene_viewer --direct
+
+# With custom settings
+python -m common.scene_viewer --width 1280 --height 720 --min-area 500
+```
+
+### Keyboard controls:
+- `q` - Quit
+- `s` - Save current frame and scene description
+- `c` - Toggle color detection
+- `e` - Toggle edge/contour detection
+- `r` - Toggle relationship lines
+- `Space` - Pause/resume
+
 ## MCP Tool Reference
 
 ### franka-mcp Tools
@@ -110,6 +176,8 @@ python -m voice_mcp.server
 | `move_cartesian` | Move end effector to [x, y, z, roll, pitch, yaw] |
 | `move_joints` | Move to joint configuration [q1..q7] |
 | `move_relative` | Move EE relative to current position |
+| `move_cartesian_sequence` | Execute multiple waypoints as smooth continuous motion |
+| `move_joint_sequence` | Execute multiple joint configurations as smooth motion |
 | `gripper_move` | Move gripper to width (0.0 - 0.08m) |
 | `gripper_grasp` | Grasp with specified width and force |
 | `stop` | Immediate stop |
@@ -132,10 +200,12 @@ python -m voice_mcp.server
 
 | Tool | Description |
 |------|-------------|
-| `speak` | Speak text aloud using Piper TTS |
+| `speak` | Speak text aloud using Piper TTS (supports blocking/non-blocking) |
 | `list_voices` | List available voice models |
 | `set_voice` | Change the voice model |
 | `get_voice_status` | Current voice settings |
+
+The `speak` tool supports a `blocking` parameter (default: true). Set to false to continue execution while audio plays in the background.
 
 ## Data Collection for Visuomotor Learning
 
@@ -262,11 +332,13 @@ CAMERA_MOCK=1 python -m camera_mcp.server
 panda-mcp/
 ├── franka_mcp/          # Robot arm MCP server
 ├── camera_mcp/          # Camera MCP server
+├── camera_daemon/       # ZeroMQ camera frame publisher
 ├── voice_mcp/           # Text-to-speech MCP server
 ├── common/              # Shared utilities
 │   ├── data_collection.py    # Training data collection
 │   ├── mcp_data_collector.py # MCP-integrated collector
 │   ├── scene_interpreter.py  # Scene understanding
+│   ├── scene_viewer.py       # Interactive scene viewer
 │   ├── manipulation.py       # Manipulation helpers
 │   └── calibration.py        # Calibration utilities
 ├── models/              # Neural network models
@@ -275,6 +347,8 @@ panda-mcp/
 │   ├── collect_data.py       # Data collection runner
 │   ├── train_localizer.py    # Model training
 │   └── visualize_dataset.py  # Dataset visualization
+├── systemd/             # Systemd service files
+│   └── camera-daemon.service # Camera daemon user service
 ├── aruco_markers/       # Generated ArUco markers
 └── voices/              # Piper TTS voice models
 ```

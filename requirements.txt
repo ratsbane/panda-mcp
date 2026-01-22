@@ -5,9 +5,10 @@ mcp>=1.0.0
 panda-python>=0.8.0
 numpy>=1.24.0
 
-# Camera
+# Camera (use full version, not headless, for GUI support in scene_viewer)
 opencv-python>=4.8.0
 Pillow>=10.0.0
+pyzmq>=25.0.0  # For camera daemon
 
 # Utilities
 pydantic>=2.0.0

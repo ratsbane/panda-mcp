@@ -147,6 +147,68 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="move_cartesian_sequence",
+            description="Execute a sequence of Cartesian waypoints as smooth continuous motion. "
+                       "Eliminates gaps between movements for fluid trajectories like waving or gestures.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "waypoints": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "number", "description": "X position (meters)"},
+                                "y": {"type": "number", "description": "Y position (meters)"},
+                                "z": {"type": "number", "description": "Z position (meters)"},
+                                "roll": {"type": "number", "description": "Roll (radians, optional)"},
+                                "pitch": {"type": "number", "description": "Pitch (radians, optional)"},
+                                "yaw": {"type": "number", "description": "Yaw (radians, optional)"},
+                            },
+                            "required": ["x", "y", "z"],
+                        },
+                        "description": "List of waypoints to traverse smoothly",
+                    },
+                    "speed_factor": {
+                        "type": "number",
+                        "description": "Motion speed (0.0 to 1.0, default 0.1)",
+                        "default": 0.1,
+                        "minimum": 0.01,
+                        "maximum": 1.0,
+                    },
+                },
+                "required": ["waypoints"],
+            },
+        ),
+        Tool(
+            name="move_joint_sequence",
+            description="Execute a sequence of joint configurations as smooth motion. "
+                       "Each configuration is 7 joint angles in radians.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "configurations": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "minItems": 7,
+                            "maxItems": 7,
+                        },
+                        "description": "List of joint configurations [q1..q7] to traverse",
+                    },
+                    "speed_factor": {
+                        "type": "number",
+                        "description": "Motion speed (0.0 to 1.0, default 0.2)",
+                        "default": 0.2,
+                        "minimum": 0.01,
+                        "maximum": 1.0,
+                    },
+                },
+                "required": ["configurations"],
+            },
+        ),
+        Tool(
             name="stop",
             description="Immediately stop any current motion. Use this if something looks wrong.",
             inputSchema={
@@ -242,6 +304,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             return json_response(result)
         
+        elif name == "move_cartesian_sequence":
+            result = controller.move_cartesian_sequence(
+                waypoints=arguments["waypoints"],
+                speed_factor=arguments.get("speed_factor", 0.1),
+            )
+            return json_response(result)
+
+        elif name == "move_joint_sequence":
+            result = controller.move_joint_sequence(
+                configurations=arguments["configurations"],
+                speed_factor=arguments.get("speed_factor", 0.2),
+            )
+            return json_response(result)
+
         elif name == "gripper_move":
             result = controller.gripper_move(width=arguments["width"])
             return json_response(result)

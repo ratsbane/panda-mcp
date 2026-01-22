@@ -144,9 +144,11 @@ class MockRobot:
         return True
 
     def move_to_pose(self, positions, orientations, speed_factor=0.2):
-        self._ee_pos = np.array(positions[0])
-        self._ee_quat = np.array(orientations[0])
-        logger.info(f"Mock pose move to {positions[0]}")
+        # Handle sequences - move to final position
+        if positions:
+            self._ee_pos = np.array(positions[-1])
+            self._ee_quat = np.array(orientations[-1])
+            logger.info(f"Mock pose sequence: {len(positions)} waypoints, final={positions[-1]}")
         return True
 
     def get_robot(self):
@@ -450,6 +452,169 @@ class FrankaController:
 
         except Exception as e:
             logger.error(f"Joint move failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    def move_cartesian_sequence(
+        self,
+        waypoints: list[dict],
+        speed_factor: float = 0.1,
+    ) -> dict:
+        """
+        Execute a sequence of Cartesian waypoints as a smooth trajectory.
+
+        Each waypoint is a dict with x, y, z (required) and optional roll, pitch, yaw.
+        All waypoints are passed to panda-py at once for continuous motion.
+
+        Args:
+            waypoints: List of waypoint dicts with position and optional orientation
+            speed_factor: Motion speed (0.0 to 1.0)
+
+        Returns:
+            dict with success status
+        """
+        if not self._connected:
+            return {"success": False, "error": "Not connected to robot"}
+
+        if not waypoints:
+            return {"success": False, "error": "No waypoints provided"}
+
+        config = get_safety_config()
+        current_state = self.get_state()
+
+        # Get current orientation as default
+        current_roll, current_pitch, current_yaw = current_state.ee_orientation
+
+        # Validate all waypoints and build position/orientation lists
+        positions = []
+        orientations = []
+        all_warnings = []
+
+        for i, wp in enumerate(waypoints):
+            x = wp.get("x")
+            y = wp.get("y")
+            z = wp.get("z")
+
+            if x is None or y is None or z is None:
+                return {"success": False, "error": f"Waypoint {i} missing x, y, or z"}
+
+            # Validate position
+            validation = self.validator.validate_cartesian_target(x, y, z)
+
+            if not validation["valid"]:
+                return {
+                    "success": False,
+                    "error": f"Waypoint {i} invalid",
+                    "errors": validation["errors"],
+                }
+
+            # Apply clamping if needed
+            if validation["clamped_position"]:
+                x, y, z = validation["clamped_position"]
+
+            all_warnings.extend(validation.get("warnings", []))
+
+            # Get orientation (use current if not specified)
+            roll = wp.get("roll", current_roll)
+            pitch = wp.get("pitch", current_pitch)
+            yaw = wp.get("yaw", current_yaw)
+
+            positions.append(np.array([x, y, z]))
+            orientations.append(euler_to_quaternion(roll, pitch, yaw))
+
+        if config.dry_run:
+            return {
+                "success": True,
+                "dry_run": True,
+                "message": "Dry run - no movement executed",
+                "waypoint_count": len(waypoints),
+                "warnings": all_warnings,
+            }
+
+        try:
+            # panda-py's move_to_pose may return None on success
+            self._robot.move_to_pose(
+                positions,
+                orientations,
+                speed_factor=speed_factor,
+            )
+
+            return {
+                "success": True,
+                "waypoints_executed": len(waypoints),
+                "warnings": all_warnings if all_warnings else None,
+            }
+
+        except Exception as e:
+            logger.error(f"Sequence move failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    def move_joint_sequence(
+        self,
+        configurations: list[list[float]],
+        speed_factor: float = 0.2,
+    ) -> dict:
+        """
+        Execute a sequence of joint configurations as smooth motion.
+
+        Args:
+            configurations: List of 7-element joint angle arrays (radians)
+            speed_factor: Motion speed (0.0 to 1.0)
+
+        Returns:
+            dict with success status
+        """
+        if not self._connected:
+            return {"success": False, "error": "Not connected to robot"}
+
+        if not configurations:
+            return {"success": False, "error": "No configurations provided"}
+
+        config = get_safety_config()
+
+        # Validate all configurations
+        for i, joints in enumerate(configurations):
+            if len(joints) != 7:
+                return {"success": False, "error": f"Configuration {i} must have 7 joints"}
+
+            validation = self.validator.validate_joint_target(joints)
+            if not validation["valid"]:
+                return {
+                    "success": False,
+                    "error": f"Configuration {i} invalid",
+                    "errors": validation["errors"],
+                }
+
+        if config.dry_run:
+            return {
+                "success": True,
+                "dry_run": True,
+                "message": "Dry run - no movement executed",
+                "configuration_count": len(configurations),
+            }
+
+        try:
+            # Execute each configuration in sequence
+            # Note: panda-py's move_to_joint_position is per-waypoint,
+            # so we execute them in a tight loop for smoothest motion
+            for i, joints in enumerate(configurations):
+                success = self._robot.move_to_joint_position(
+                    np.array(joints),
+                    speed_factor=speed_factor,
+                )
+                if not success:
+                    return {
+                        "success": False,
+                        "error": f"Motion failed at configuration {i}",
+                        "completed": i,
+                    }
+
+            return {
+                "success": True,
+                "configurations_executed": len(configurations),
+            }
+
+        except Exception as e:
+            logger.error(f"Joint sequence failed: {e}")
             return {"success": False, "error": str(e)}
 
     def gripper_move(self, width: float, speed: float = 0.1) -> dict:

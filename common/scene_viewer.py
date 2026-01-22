@@ -5,6 +5,10 @@ Interactive scene viewer with live detection overlays.
 Shows camera feed with real-time object detection and scene interpretation.
 Requires a display (run with X forwarding if remote).
 
+Supports two modes:
+  1. Daemon mode (default): Gets frames from camera_daemon via ZeroMQ
+  2. Direct mode: Opens camera directly (use --direct flag)
+
 Usage:
     python -m common.scene_viewer [options]
 
@@ -24,6 +28,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from .scene_interpreter import interpret_scene, annotate_scene, SceneDescription
 
@@ -37,12 +42,14 @@ class SceneViewer:
         width: int = 1280,
         height: int = 720,
         output_dir: str = "./captures",
+        use_daemon: bool = True,
     ):
         self.camera_index = camera_index
         self.width = width
         self.height = height
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
+        self.use_daemon = use_daemon
 
         # Detection settings
         self.use_color_detection = True
@@ -55,13 +62,37 @@ class SceneViewer:
         self.last_frame = None
         self.last_scene: SceneDescription | None = None
         self.cap = None
+        self.daemon_client = None
+        self.using_daemon = False
 
         # Performance tracking
         self.fps_history = []
         self.last_time = time.time()
 
     def connect(self) -> bool:
-        """Initialize camera."""
+        """Initialize camera (via daemon or directly)."""
+        # Try daemon mode first
+        if self.use_daemon:
+            try:
+                from camera_daemon import CameraClient
+                self.daemon_client = CameraClient()
+
+                if self.daemon_client.connect():
+                    self.using_daemon = True
+                    info = self.daemon_client.get_info()
+                    print(f"Connected to camera daemon at {info.endpoint}")
+                    print(f"Resolution: {info.width}x{info.height}")
+                    return True
+                else:
+                    print("Camera daemon not available, falling back to direct mode")
+                    self.daemon_client = None
+            except ImportError:
+                print("camera_daemon not available, using direct mode")
+            except Exception as e:
+                print(f"Could not connect to daemon: {e}, falling back to direct mode")
+                self.daemon_client = None
+
+        # Fall back to direct camera access
         self.cap = cv2.VideoCapture(self.camera_index)
 
         if not self.cap.isOpened():
@@ -73,15 +104,33 @@ class SceneViewer:
 
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"Camera opened: {actual_w}x{actual_h}")
+        print(f"Camera opened directly: {actual_w}x{actual_h}")
+        self.using_daemon = False
 
         return True
 
     def disconnect(self):
         """Release camera."""
+        if self.daemon_client:
+            self.daemon_client.disconnect()
+            self.daemon_client = None
+
         if self.cap:
             self.cap.release()
             self.cap = None
+
+        self.using_daemon = False
+
+    def get_frame(self) -> Optional[np.ndarray]:
+        """Get a frame from daemon or camera."""
+        if self.using_daemon and self.daemon_client:
+            return self.daemon_client.get_frame()
+
+        if self.cap:
+            ret, frame = self.cap.read()
+            return frame if ret else None
+
+        return None
 
     def save_capture(self):
         """Save current frame and scene description."""
@@ -193,16 +242,18 @@ class SceneViewer:
         window_name = "Scene Viewer"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
-        print("Scene Viewer started. Press 'q' to quit.")
+        mode_str = "daemon" if self.using_daemon else "direct"
+        print(f"Scene Viewer started ({mode_str} mode). Press 'q' to quit.")
         print("Keys: s=save, c=color, e=edge, r=relations, space=pause")
 
         try:
             while True:
                 if not self.paused:
-                    ret, frame = self.cap.read()
-                    if not ret:
+                    frame = self.get_frame()
+                    if frame is None:
                         print("Error reading frame")
-                        break
+                        time.sleep(0.1)
+                        continue
 
                     self.last_frame = frame
 
@@ -292,6 +343,11 @@ def main():
         default=500,
         help="Minimum object area in pixels (default: 500)"
     )
+    parser.add_argument(
+        "--direct",
+        action="store_true",
+        help="Use direct camera access instead of daemon"
+    )
 
     args = parser.parse_args()
 
@@ -300,6 +356,7 @@ def main():
         width=args.width,
         height=args.height,
         output_dir=args.output,
+        use_daemon=not args.direct,
     )
     viewer.min_area = args.min_area
     viewer.run()
