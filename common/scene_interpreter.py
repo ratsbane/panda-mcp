@@ -19,6 +19,21 @@ from .vision import (
     COLOR_RANGES,
 )
 
+# Lazy import for segmentation (heavy dependency)
+_segmenter = None
+
+
+def _get_segmenter():
+    """Get the segmenter singleton (lazy-loaded)."""
+    global _segmenter
+    if _segmenter is None:
+        try:
+            from .segmentation import get_segmenter
+            _segmenter = get_segmenter()
+        except ImportError:
+            return None
+    return _segmenter
+
 
 class SpatialRelation(Enum):
     """Spatial relationships between objects."""
@@ -270,6 +285,7 @@ def interpret_scene(
     image: np.ndarray,
     use_color_detection: bool = True,
     use_contour_detection: bool = True,
+    use_segmentation: bool = False,
     min_area: int = 500,
 ) -> SceneDescription:
     """
@@ -279,6 +295,7 @@ def interpret_scene(
         image: BGR image from camera
         use_color_detection: Look for colored blocks
         use_contour_detection: Use edge-based detection
+        use_segmentation: Use MobileSAM for instance segmentation (slower but more accurate)
         min_area: Minimum object area in pixels
 
     Returns:
@@ -289,16 +306,38 @@ def interpret_scene(
 
     all_objects = []
 
-    # Color-based detection
-    if use_color_detection:
+    # Segmentation-based detection (most accurate, but slower)
+    if use_segmentation:
+        segmenter = _get_segmenter()
+        if segmenter is not None:
+            seg_objects = segmenter.segment(image)
+            # Filter by area
+            for obj in seg_objects:
+                if obj.bbox.area >= min_area:
+                    all_objects.append(obj)
+
+    # Color-based detection (if not using segmentation, or to augment it)
+    if use_color_detection and not use_segmentation:
         colored = find_colored_blocks(image, min_area=min_area)
         all_objects.extend(colored)
+    elif use_color_detection and use_segmentation:
+        # Augment segmentation with color labels
+        colored = find_colored_blocks(image, min_area=min_area)
+        for seg_obj in all_objects:
+            # Find matching color detection
+            for color_obj in colored:
+                cx1, cy1 = seg_obj.bbox.center
+                cx2, cy2 = color_obj.bbox.center
+                if abs(cx1 - cx2) < 50 and abs(cy1 - cy2) < 50:
+                    # Transfer color label
+                    seg_obj.label = color_obj.label
+                    break
 
-    # Contour-based detection (may find objects color detection missed)
-    if use_contour_detection:
+    # Contour-based detection (may find objects other methods missed)
+    if use_contour_detection and not use_segmentation:
         contour_objs = find_objects_by_contour(image, min_area=min_area)
 
-        # Add only if not overlapping with color detections
+        # Add only if not overlapping with existing detections
         for obj in contour_objs:
             cx, cy = obj.bbox.center
             is_duplicate = False
@@ -388,7 +427,16 @@ def annotate_scene(
             }
             color = color_map.get(obj_desc.color_name, (0, 255, 0))
         else:
-            color = (0, 255, 0)
+            # Use distinct colors for unlabeled objects
+            palette = [(255, 100, 100), (100, 255, 100), (100, 100, 255),
+                       (255, 255, 100), (255, 100, 255), (100, 255, 255)]
+            color = palette[i % len(palette)]
+
+        # Draw segmentation mask if available
+        if obj.mask is not None:
+            overlay = result.copy()
+            overlay[obj.mask] = color
+            result = cv2.addWeighted(result, 0.7, overlay, 0.3, 0)
 
         # Draw rectangle
         cv2.rectangle(

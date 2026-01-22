@@ -139,6 +139,11 @@ async def list_tools() -> list[Tool]:
                         "default": True,
                         "description": "Use edge/contour-based detection",
                     },
+                    "use_segmentation": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Use MobileSAM for instance segmentation (slower but more accurate)",
+                    },
                     "min_area": {
                         "type": "integer",
                         "default": 500,
@@ -262,6 +267,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
                 frame,
                 use_color_detection=arguments.get("use_color_detection", True),
                 use_contour_detection=arguments.get("use_contour_detection", True),
+                use_segmentation=arguments.get("use_segmentation", False),
                 min_area=arguments.get("min_area", 500),
             )
 

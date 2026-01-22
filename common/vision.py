@@ -46,6 +46,7 @@ class DetectedObject:
     confidence: float
     label: str
     color_bgr: Optional[tuple[int, int, int]] = None
+    mask: Optional[np.ndarray] = None  # (H, W) boolean segmentation mask
 
     def to_dict(self) -> dict:
         result = {
@@ -55,6 +56,9 @@ class DetectedObject:
         }
         if self.color_bgr:
             result["color_bgr"] = self.color_bgr
+        if self.mask is not None:
+            result["has_mask"] = True
+            result["mask_area"] = int(np.sum(self.mask))
         return result
 
 

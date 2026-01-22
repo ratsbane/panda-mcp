@@ -21,6 +21,7 @@ build/
 calibration.json
 voices/*.onnx
 voices/*.onnx.json
+models/*.onnx
 
 # OS
 .DS_Store
