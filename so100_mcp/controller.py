@@ -65,8 +65,8 @@ TEMP_CRITICAL = 65  # Celsius
 COMM_RETRIES = 3
 STALL_LOAD_THRESHOLD = 40.0  # % load indicating stall
 
-# Calibration file location
-CALIBRATION_DIR = Path(__file__).parent
+# Calibration file location (user config dir, works when installed from PyPI)
+CALIBRATION_DIR = Path.home() / '.config' / 'robot-mcp-so100'
 CALIBRATION_FILE = CALIBRATION_DIR / 'calibration.json'
 
 
@@ -187,18 +187,30 @@ class SO100Controller:
 
     def _load_calibration(self):
         """Load calibration data from file if it exists."""
-        if CALIBRATION_FILE.exists():
+        cal_file = CALIBRATION_FILE
+
+        # Migrate from old in-package location if new config dir doesn't exist yet
+        if not cal_file.exists():
+            legacy = Path(__file__).parent / 'calibration.json'
+            if legacy.exists():
+                logger.info(f"Migrating calibration from {legacy} to {cal_file}")
+                CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
+                import shutil
+                shutil.copy2(legacy, cal_file)
+
+        if cal_file.exists():
             try:
-                with open(CALIBRATION_FILE) as f:
+                with open(cal_file) as f:
                     cal = json.load(f)
                 if "position_limits" in cal:
                     self.position_limits.update(cal["position_limits"])
-                    logger.info(f"Loaded calibration from {CALIBRATION_FILE}")
+                    logger.info(f"Loaded calibration from {cal_file}")
             except Exception as e:
                 logger.warning(f"Failed to load calibration: {e}")
 
     def _save_calibration(self, data: dict):
         """Save calibration data to file."""
+        CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
         with open(CALIBRATION_FILE, 'w') as f:
             json.dump(data, f, indent=2)
         logger.info(f"Saved calibration to {CALIBRATION_FILE}")

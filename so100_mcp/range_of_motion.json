@@ -1,0 +1,62 @@
+{
+  "shoulder_pan": {
+    "motor_id": 1,
+    "start_position": 2061,
+    "min_ticks": 2011,
+    "max_ticks": 2086,
+    "range_ticks": 75,
+    "range_degrees": 6.6,
+    "safe_min": 2061,
+    "safe_max": 2036
+  },
+  "shoulder_lift": {
+    "motor_id": 2,
+    "start_position": 2182,
+    "min_ticks": 707,
+    "max_ticks": 2282,
+    "range_ticks": 1575,
+    "range_degrees": 138.4,
+    "safe_min": 757,
+    "safe_max": 2232
+  },
+  "elbow_flex": {
+    "motor_id": 3,
+    "start_position": 3033,
+    "min_ticks": 783,
+    "max_ticks": 3058,
+    "range_ticks": 2275,
+    "range_degrees": 200.0,
+    "safe_min": 833,
+    "safe_max": 3008
+  },
+  "wrist_flex": {
+    "motor_id": 4,
+    "start_position": 2049,
+    "min_ticks": 874,
+    "max_ticks": 3324,
+    "range_ticks": 2450,
+    "range_degrees": 215.3,
+    "safe_min": 924,
+    "safe_max": 3274
+  },
+  "wrist_roll": {
+    "motor_id": 5,
+    "start_position": 2056,
+    "min_ticks": 106,
+    "max_ticks": 3981,
+    "range_ticks": 3875,
+    "range_degrees": 340.6,
+    "safe_min": 156,
+    "safe_max": 3931
+  },
+  "gripper": {
+    "motor_id": 6,
+    "start_position": 1955,
+    "min_ticks": 1755,
+    "max_ticks": 3555,
+    "range_ticks": 1800,
+    "range_degrees": 158.2,
+    "safe_min": 1805,
+    "safe_max": 3505
+  }
+}

@@ -7,8 +7,6 @@ Provides workspace observation for Claude.
 import asyncio
 import json
 import logging
-import sys
-import os
 from typing import Any
 
 from mcp.server import Server
@@ -16,9 +14,6 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ImageContent
 
 from .controller import get_camera_controller
-
-# Add parent directory to path for common module
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.scene_interpreter import interpret_scene, annotate_scene
 
 logging.basicConfig(level=logging.INFO)
@@ -317,5 +312,10 @@ async def main():
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-if __name__ == "__main__":
+def main_entry():
+    """Sync entry point for console_scripts."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    main_entry()

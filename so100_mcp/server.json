@@ -1,0 +1,27 @@
+{
+  "name": "io.github.ratsbane/robot-mcp-so100",
+  "version": "0.1.0",
+  "description": "MCP server for SO-ARM100 robot arm control",
+  "packages": [
+    {
+      "registry_name": "pypi",
+      "name": "robot-mcp-so100"
+    }
+  ],
+  "tools": [
+    "connect",
+    "get_status",
+    "move_joint",
+    "move_joints",
+    "gripper_open",
+    "gripper_close",
+    "home",
+    "wave",
+    "enable_torque",
+    "disable_torque",
+    "stop",
+    "discover_ports",
+    "diagnose",
+    "calibrate_joint"
+  ]
+}

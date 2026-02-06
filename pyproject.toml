@@ -5,39 +5,17 @@ build-backend = "hatchling.build"
 [project]
 name = "panda-mcp"
 version = "0.1.0"
-description = "MCP servers for Franka Panda robot arm control"
+description = "MCP servers for robot arm control — development meta-package"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-dependencies = [
-    "mcp>=1.0.0",
-    "numpy>=1.24.0",
-    "pydantic>=2.0.0",
-    "structlog>=23.0.0",
-]
 
 [project.optional-dependencies]
-franka = [
-    "panda-python>=0.8.0",
-]
-camera = [
-    "opencv-python>=4.8.0",
-    "Pillow>=10.0.0",
-]
-all = [
-    "panda-mcp[franka,camera]",
-]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "build",
 ]
-
-[project.scripts]
-franka-mcp = "franka_mcp.server:main"
-camera-mcp = "camera_mcp.server:main"
-
-[tool.hatch.build.targets.wheel]
-packages = ["franka_mcp", "camera_mcp", "common"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

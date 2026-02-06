@@ -7,6 +7,8 @@ Gives Claude a voice using Piper TTS.
 import asyncio
 import json
 import logging
+import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -21,11 +23,11 @@ logger = logging.getLogger(__name__)
 # Create the MCP server
 server = Server("voice-mcp")
 
-# Default configuration
-PIPER_PATH = "/home/doug/panda-mcp/venv/bin/piper"
-VOICES_DIR = Path("/home/doug/panda-mcp/voices")
-DEFAULT_VOICE = "en_US-lessac-medium"
-AUDIO_DEVICE = "plughw:3,0"
+# Configuration via environment variables with sensible defaults
+PIPER_PATH = os.environ.get("PIPER_PATH") or shutil.which("piper") or "piper"
+VOICES_DIR = Path(os.environ.get("VOICES_DIR", Path.home() / ".local" / "share" / "piper-voices"))
+DEFAULT_VOICE = os.environ.get("PIPER_VOICE", "en_US-lessac-medium")
+AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE", "default")
 
 # Current settings
 current_voice = DEFAULT_VOICE
@@ -303,5 +305,10 @@ async def main():
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-if __name__ == "__main__":
+def main_entry():
+    """Sync entry point for console_scripts."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    main_entry()
