@@ -275,6 +275,58 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="start_recording",
+            description="Begin recording a trajectory demonstration for VLA training. "
+                       "Records robot joint states + camera frames at target FPS in background. "
+                       "Call this BEFORE executing pick_at/place_at, then stop_recording when done.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "instruction": {
+                        "type": "string",
+                        "description": "Natural language task description (e.g. 'pick up the red block and place it to the right')",
+                    },
+                    "fps": {
+                        "type": "integer",
+                        "description": "Recording frame rate (default: 30)",
+                        "default": 30,
+                    },
+                },
+                "required": ["instruction"],
+            },
+        ),
+        Tool(
+            name="stop_recording",
+            description="Stop trajectory recording and save the episode to disk. "
+                       "Returns episode stats (frames, duration, path).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "success": {
+                        "type": "boolean",
+                        "description": "Whether the demonstration was successful",
+                    },
+                },
+                "required": ["success"],
+            },
+        ),
+        Tool(
+            name="get_recording_status",
+            description="Check if trajectory recording is active and get current stats.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="list_episodes",
+            description="List all recorded trajectory episodes with metadata.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
             name="get_safety_limits",
             description="Get current safety limits (workspace bounds, velocity limits).",
             inputSchema={
@@ -411,6 +463,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "teaching_mode":
             result = controller.teaching_mode(active=arguments["active"])
+            return json_response(result)
+
+        elif name == "start_recording":
+            result = controller.start_recording(
+                language_instruction=arguments["instruction"],
+                fps=arguments.get("fps", 30),
+            )
+            return json_response(result)
+
+        elif name == "stop_recording":
+            result = controller.stop_recording(
+                success=arguments["success"],
+            )
+            return json_response(result)
+
+        elif name == "get_recording_status":
+            result = controller.get_recording_status()
+            return json_response(result)
+
+        elif name == "list_episodes":
+            result = controller.list_episodes()
             return json_response(result)
 
         elif name == "get_safety_limits":

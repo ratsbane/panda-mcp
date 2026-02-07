@@ -815,6 +815,33 @@ class FrankaController:
             "steps": steps,
         }
 
+    def start_recording(self, language_instruction: str, fps: int = 30) -> dict:
+        """Start trajectory recording for current episode."""
+        if not self._connected:
+            return {"success": False, "error": "Not connected to robot"}
+
+        from common.trajectory_recorder import get_recorder
+        recorder = get_recorder(fps=fps)
+        return recorder.start_episode(language_instruction, self)
+
+    def stop_recording(self, success: bool) -> dict:
+        """Stop recording and save episode."""
+        from common.trajectory_recorder import get_recorder
+        recorder = get_recorder()
+        return recorder.stop_episode(success)
+
+    def get_recording_status(self) -> dict:
+        """Check if recording is active + stats."""
+        from common.trajectory_recorder import get_recorder
+        recorder = get_recorder()
+        return recorder.get_status()
+
+    def list_episodes(self) -> dict:
+        """List recorded episodes."""
+        from common.trajectory_recorder import get_recorder
+        recorder = get_recorder()
+        return recorder.list_episodes()
+
     def teaching_mode(self, active: bool) -> dict:
         """
         Enable/disable teaching mode (gravity compensation).
