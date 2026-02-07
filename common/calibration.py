@@ -63,6 +63,27 @@ class CalibrationData:
             json.dump(data, f, indent=2)
 
     @classmethod
+    def load_from_npz(cls, path: str, workspace_z: float = 0.013) -> "CalibrationData":
+        """Load calibration from ArUco NPZ file (as saved by ArUco calibration script)."""
+        data = np.load(path, allow_pickle=True)
+        H = data["H"]
+        pixel_pts = data["pixel_pts"]
+        robot_pts = data["robot_pts"]
+        table_z = float(data.get("table_z", workspace_z))
+
+        cal = cls(workspace_z=table_z)
+        cal.homography = H
+
+        # Store calibration points
+        for i in range(len(pixel_pts)):
+            cal.calibration_points.append((
+                float(pixel_pts[i][0]), float(pixel_pts[i][1]),
+                float(robot_pts[i][0]), float(robot_pts[i][1]),
+            ))
+
+        return cal
+
+    @classmethod
     def load(cls, path: str) -> "CalibrationData":
         """Load calibration from file."""
         with open(path, 'r') as f:

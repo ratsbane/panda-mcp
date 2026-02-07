@@ -209,6 +209,40 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="pick_at",
+            description="Pick an object at the given robot coordinates. "
+                       "Opens gripper, approaches from above, lowers to grasp height, grasps, and lifts. "
+                       "Use with describe_scene robot_coords to automate pick-and-place.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number", "description": "X position in robot frame (meters)"},
+                    "y": {"type": "number", "description": "Y position in robot frame (meters)"},
+                    "z": {"type": "number", "description": "Grasp height (meters, default: 0.013 = table)", "default": 0.013},
+                    "grasp_width": {"type": "number", "description": "Expected object width (meters, default: 0.03)", "default": 0.03},
+                    "grasp_force": {"type": "number", "description": "Grasp force in Newtons (default: 70)", "default": 70},
+                    "x_offset": {"type": "number", "description": "X offset to compensate calibration error (meters, default: 0.04)", "default": 0.04},
+                    "approach_height": {"type": "number", "description": "Height to approach from (meters, default: 0.15)", "default": 0.15},
+                },
+                "required": ["x", "y"],
+            },
+        ),
+        Tool(
+            name="place_at",
+            description="Place a held object at the given robot coordinates. "
+                       "Moves above target, lowers, releases gripper, and retreats upward.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number", "description": "X position in robot frame (meters)"},
+                    "y": {"type": "number", "description": "Y position in robot frame (meters)"},
+                    "z": {"type": "number", "description": "Place height (meters, default: 0.08)", "default": 0.08},
+                    "approach_height": {"type": "number", "description": "Height to approach/retreat from (meters, default: 0.15)", "default": 0.15},
+                },
+                "required": ["x", "y"],
+            },
+        ),
+        Tool(
             name="stop",
             description="Immediately stop any current motion. Use this if something looks wrong.",
             inputSchema={
@@ -222,6 +256,22 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {},
+            },
+        ),
+        Tool(
+            name="teaching_mode",
+            description="Enable/disable teaching mode (gravity compensation). "
+                       "When active, the arm goes compliant and can be physically moved by hand. "
+                       "Useful for recovering from joint limit issues or manual positioning.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "active": {
+                        "type": "boolean",
+                        "description": "True to enable, False to disable",
+                    },
+                },
+                "required": ["active"],
             },
         ),
         Tool(
@@ -330,6 +380,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             return json_response(result)
         
+        elif name == "pick_at":
+            result = controller.pick_at(
+                x=arguments["x"],
+                y=arguments["y"],
+                z=arguments.get("z", 0.013),
+                grasp_width=arguments.get("grasp_width", 0.03),
+                grasp_force=arguments.get("grasp_force", 70),
+                x_offset=arguments.get("x_offset", 0.04),
+                approach_height=arguments.get("approach_height", 0.15),
+            )
+            return json_response(result)
+
+        elif name == "place_at":
+            result = controller.place_at(
+                x=arguments["x"],
+                y=arguments["y"],
+                z=arguments.get("z", 0.08),
+                approach_height=arguments.get("approach_height", 0.15),
+            )
+            return json_response(result)
+
         elif name == "stop":
             result = controller.stop()
             return json_response(result)
@@ -337,7 +408,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "recover":
             result = controller.recover()
             return json_response(result)
-        
+
+        elif name == "teaching_mode":
+            result = controller.teaching_mode(active=arguments["active"])
+            return json_response(result)
+
         elif name == "get_safety_limits":
             config = get_safety_config()
             return json_response(config.to_dict())

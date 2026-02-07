@@ -139,6 +139,11 @@ async def list_tools() -> list[Tool]:
                         "default": False,
                         "description": "Use MobileSAM for instance segmentation (slower but more accurate)",
                     },
+                    "use_yolo_detection": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Use Hailo-accelerated YOLOv8 for real object class labels (e.g. person, cup, bottle)",
+                    },
                     "min_area": {
                         "type": "integer",
                         "default": 500,
@@ -263,6 +268,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
                 use_color_detection=arguments.get("use_color_detection", True),
                 use_contour_detection=arguments.get("use_contour_detection", True),
                 use_segmentation=arguments.get("use_segmentation", False),
+                use_yolo_detection=arguments.get("use_yolo_detection", False),
                 min_area=arguments.get("min_area", 500),
             )
 

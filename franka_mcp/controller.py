@@ -691,6 +691,164 @@ class FrankaController:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def pick_at(
+        self,
+        x: float,
+        y: float,
+        z: float = 0.013,
+        grasp_width: float = 0.03,
+        grasp_force: float = 70.0,
+        x_offset: float = 0.04,
+        approach_height: float = 0.15,
+    ) -> dict:
+        """
+        Pick an object at the given robot coordinates.
+
+        Executes: open gripper -> approach from above -> lower -> grasp -> lift.
+
+        Args:
+            x, y: Target position in robot frame (meters)
+            z: Grasp height (default: table height 0.013)
+            grasp_width: Expected object width for grasp (meters)
+            grasp_force: Grasp force in Newtons
+            x_offset: Systematic X offset to compensate homography error
+            approach_height: Height to approach/retreat from
+        """
+        if not self._connected:
+            return {"success": False, "error": "Not connected to robot"}
+
+        steps = []
+        target_x = x + x_offset
+
+        # Step 1: Open gripper
+        result = self.gripper_move(0.08)
+        steps.append({"action": "open_gripper", "result": result})
+
+        # Step 2: Move above target
+        result = self.move_cartesian(target_x, y, approach_height, confirmed=True)
+        steps.append({"action": "approach_above", "result": result})
+        # Verify position (move_cartesian may return success:false but still execute)
+        state = self.get_state()
+        pos = state.ee_position
+        xy_error = np.sqrt((pos[0] - target_x)**2 + (pos[1] - y)**2)
+        if xy_error > 0.05:
+            return {"success": False, "error": f"Failed to reach approach position (error={xy_error:.3f}m)", "steps": steps}
+
+        # Step 3: Lower to grasp height
+        result = self.move_cartesian(target_x, y, z, confirmed=True)
+        steps.append({"action": "lower_to_grasp", "result": result})
+        state = self.get_state()
+        actual_z = state.ee_position[2]
+        steps.append({"action": "check_z", "target_z": z, "actual_z": round(actual_z, 4)})
+
+        # Step 4: Grasp
+        result = self.gripper_grasp(width=grasp_width, force=grasp_force)
+        steps.append({"action": "grasp", "result": result})
+        # Check actual gripper width
+        state = self.get_state()
+        actual_grip = state.gripper_width
+        grasped = actual_grip < grasp_width + 0.005  # some tolerance
+        steps.append({"action": "check_grasp", "gripper_width": round(actual_grip, 4), "grasped": grasped})
+
+        # Step 5: Lift
+        result = self.move_relative(dz=approach_height, confirmed=True)
+        steps.append({"action": "lift", "result": result})
+        state = self.get_state()
+
+        return {
+            "success": grasped,
+            "gripper_width": round(actual_grip, 4),
+            "final_position": {
+                "x": round(state.ee_position[0], 4),
+                "y": round(state.ee_position[1], 4),
+                "z": round(state.ee_position[2], 4),
+            },
+            "steps": steps,
+        }
+
+    def place_at(
+        self,
+        x: float,
+        y: float,
+        z: float = 0.08,
+        approach_height: float = 0.15,
+    ) -> dict:
+        """
+        Place a held object at the given robot coordinates.
+
+        Executes: move above target -> lower -> release -> retreat up.
+
+        Args:
+            x, y: Target position in robot frame (meters)
+            z: Place height (default: 0.08 for gentle placement)
+            approach_height: Height to approach/retreat from
+        """
+        if not self._connected:
+            return {"success": False, "error": "Not connected to robot"}
+
+        steps = []
+
+        # Step 1: Move above target
+        result = self.move_cartesian(x, y, approach_height, confirmed=True)
+        steps.append({"action": "move_above", "result": result})
+
+        # Step 2: Lower to place height
+        result = self.move_cartesian(x, y, z, confirmed=True)
+        steps.append({"action": "lower_to_place", "result": result})
+
+        # Step 3: Open gripper to release
+        result = self.gripper_move(0.08)
+        steps.append({"action": "release", "result": result})
+
+        # Step 4: Retreat up
+        result = self.move_relative(dz=approach_height, confirmed=True)
+        steps.append({"action": "retreat", "result": result})
+        state = self.get_state()
+
+        return {
+            "success": True,
+            "final_position": {
+                "x": round(state.ee_position[0], 4),
+                "y": round(state.ee_position[1], 4),
+                "z": round(state.ee_position[2], 4),
+            },
+            "steps": steps,
+        }
+
+    def teaching_mode(self, active: bool) -> dict:
+        """
+        Enable/disable teaching mode (gravity compensation).
+
+        When active, the arm goes compliant - motors compensate for gravity
+        but don't resist external forces. The user can physically move the arm.
+        This bypasses joint wall checks, so it can be used to recover from
+        positions at or beyond joint limits.
+        """
+        if not self._connected:
+            return {"success": False, "error": "Not connected"}
+
+        if self._mock_mode:
+            return {"success": True, "teaching_mode": active, "mock": True}
+
+        try:
+            self._robot.teaching_mode(active)
+            if active:
+                return {
+                    "success": True,
+                    "teaching_mode": True,
+                    "message": "Teaching mode ON - arm is compliant. "
+                              "Physically move joints as needed, then disable teaching mode.",
+                }
+            else:
+                return {
+                    "success": True,
+                    "teaching_mode": False,
+                    "message": "Teaching mode OFF - arm is under position control again.",
+                }
+        except Exception as e:
+            logger.error(f"Teaching mode failed: {e}")
+            return {"success": False, "error": str(e)}
+
 
 # Singleton controller
 _controller: Optional[FrankaController] = None

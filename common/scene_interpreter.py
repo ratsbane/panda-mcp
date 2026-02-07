@@ -18,9 +18,14 @@ from .vision import (
     draw_detections,
     COLOR_RANGES,
 )
+from .calibration import get_transformer
 
 # Lazy import for segmentation (heavy dependency)
 _segmenter = None
+
+# Lazy import for Hailo YOLO detector
+_hailo_detector_checked = False
+_hailo_detector = None
 
 
 def _get_segmenter():
@@ -33,6 +38,19 @@ def _get_segmenter():
         except ImportError:
             return None
     return _segmenter
+
+
+def _get_hailo_detector():
+    """Get the Hailo YOLO detector singleton (lazy-loaded). Returns None if unavailable."""
+    global _hailo_detector_checked, _hailo_detector
+    if not _hailo_detector_checked:
+        _hailo_detector_checked = True
+        try:
+            from .hailo_detector import get_hailo_detector
+            _hailo_detector = get_hailo_detector()
+        except Exception:
+            _hailo_detector = None
+    return _hailo_detector
 
 
 class SpatialRelation(Enum):
@@ -81,20 +99,39 @@ class SceneDescription:
     summary: str = ""
 
     def to_dict(self) -> dict:
+        # Try to get calibration for robot coordinates
+        transformer = None
+        try:
+            t = get_transformer()
+            if t.calibration.homography is not None:
+                transformer = t
+        except Exception:
+            pass
+
+        objects_list = []
+        for o in self.objects:
+            obj_dict = {
+                "label": o.obj.label,
+                "position": o.position_description,
+                "size": o.size_description,
+                "color": o.color_name,
+                "distance": o.estimated_distance,
+                "bbox": o.obj.bbox.to_dict(),
+                "confidence": o.obj.confidence,
+            }
+            if transformer is not None:
+                cx, cy = o.obj.bbox.center
+                rx, ry, rz = transformer.pixel_to_robot(cx, cy)
+                obj_dict["robot_coords"] = {
+                    "x": round(rx, 4),
+                    "y": round(ry, 4),
+                    "z": round(rz, 4),
+                }
+            objects_list.append(obj_dict)
+
         return {
             "object_count": len(self.objects),
-            "objects": [
-                {
-                    "label": o.obj.label,
-                    "position": o.position_description,
-                    "size": o.size_description,
-                    "color": o.color_name,
-                    "distance": o.estimated_distance,
-                    "bbox": o.obj.bbox.to_dict(),
-                    "confidence": o.obj.confidence,
-                }
-                for o in self.objects
-            ],
+            "objects": objects_list,
             "relationships": [
                 {
                     "object1": self.objects[r.object1_idx].obj.label,
@@ -241,23 +278,58 @@ def _generate_summary(objects: list[ObjectDescription], workspace_state: str) ->
 
     n = len(objects)
 
-    # Count by color
-    colors = {}
-    for obj in objects:
-        color = obj.color_name or "unknown color"
-        colors[color] = colors.get(color, 0) + 1
+    # Check if we have YOLO class labels (not generic "object"/"colored_object")
+    has_class_labels = any(
+        o.obj.label not in ("object", "colored_object") and not o.obj.label.endswith("_block")
+        for o in objects
+    )
 
     # Build summary
     parts = []
 
-    if n == 1:
-        obj = objects[0]
-        color_str = f"{obj.color_name} " if obj.color_name else ""
-        parts.append(f"There is one {obj.size_description} {color_str}object in the {obj.position_description}.")
-    else:
-        parts.append(f"There are {n} objects in the workspace.")
+    if has_class_labels:
+        # Group by class label for richer summary
+        label_counts: dict[str, int] = {}
+        for obj in objects:
+            label = obj.obj.label
+            label_counts[label] = label_counts.get(label, 0) + 1
 
-        # Describe distribution
+        # Build "2 persons, 1 cup, 1 bottle" style summary
+        label_strs = []
+        for label, count in sorted(label_counts.items(), key=lambda x: -x[1]):
+            if count == 1:
+                label_strs.append(f"1 {label}")
+            else:
+                label_strs.append(f"{count} {label}s")
+
+        if n == 1:
+            obj = objects[0]
+            color_str = f"{obj.color_name} " if obj.color_name else ""
+            parts.append(f"There is one {color_str}{obj.obj.label} in the {obj.position_description}.")
+        else:
+            parts.append(f"Detected {n} objects: {', '.join(label_strs)}.")
+    else:
+        # Fallback: color-based summary (original behavior)
+        colors: dict[str, int] = {}
+        for obj in objects:
+            color = obj.color_name or "unknown color"
+            colors[color] = colors.get(color, 0) + 1
+
+        if n == 1:
+            obj = objects[0]
+            color_str = f"{obj.color_name} " if obj.color_name else ""
+            parts.append(f"There is one {obj.size_description} {color_str}object in the {obj.position_description}.")
+        else:
+            parts.append(f"There are {n} objects in the workspace.")
+
+            # Mention colors if interesting
+            if len(colors) > 1:
+                color_strs = [f"{count} {color}" for color, count in colors.items() if color != "unknown color"]
+                if color_strs:
+                    parts.append(f"Colors detected: {', '.join(color_strs)}.")
+
+    # Describe distribution
+    if n > 1:
         positions = [o.position_description for o in objects]
         if all("left" in p for p in positions):
             parts.append("All objects are on the left side.")
@@ -265,12 +337,6 @@ def _generate_summary(objects: list[ObjectDescription], workspace_state: str) ->
             parts.append("All objects are on the right side.")
         elif all("center" in p for p in positions):
             parts.append("Objects are clustered in the center.")
-
-        # Mention colors if interesting
-        if len(colors) > 1:
-            color_strs = [f"{count} {color}" for color, count in colors.items() if color != "unknown color"]
-            if color_strs:
-                parts.append(f"Colors detected: {', '.join(color_strs)}.")
 
     # Add workspace state
     if workspace_state == "cluttered":
@@ -286,6 +352,7 @@ def interpret_scene(
     use_color_detection: bool = True,
     use_contour_detection: bool = True,
     use_segmentation: bool = False,
+    use_yolo_detection: bool = False,
     min_area: int = 500,
 ) -> SceneDescription:
     """
@@ -296,6 +363,7 @@ def interpret_scene(
         use_color_detection: Look for colored blocks
         use_contour_detection: Use edge-based detection
         use_segmentation: Use MobileSAM for instance segmentation (slower but more accurate)
+        use_yolo_detection: Use Hailo-accelerated YOLOv8 for real object class labels
         min_area: Minimum object area in pixels
 
     Returns:
@@ -305,51 +373,66 @@ def interpret_scene(
     image_area = width * height
 
     all_objects = []
+    yolo_detected = False
 
-    # Segmentation-based detection (most accurate, but slower)
-    if use_segmentation:
-        segmenter = _get_segmenter()
-        if segmenter is not None:
-            seg_objects = segmenter.segment(image)
+    # YOLO detection (fastest, provides real class labels)
+    if use_yolo_detection:
+        detector = _get_hailo_detector()
+        if detector is not None:
+            yolo_objects = detector.detect(image)
             # Filter by area
-            for obj in seg_objects:
+            for obj in yolo_objects:
                 if obj.bbox.area >= min_area:
                     all_objects.append(obj)
+            if all_objects:
+                yolo_detected = True
 
-    # Color-based detection (if not using segmentation, or to augment it)
-    if use_color_detection and not use_segmentation:
-        colored = find_colored_blocks(image, min_area=min_area)
-        all_objects.extend(colored)
-    elif use_color_detection and use_segmentation:
-        # Augment segmentation with color labels
-        colored = find_colored_blocks(image, min_area=min_area)
-        for seg_obj in all_objects:
-            # Find matching color detection
-            for color_obj in colored:
-                cx1, cy1 = seg_obj.bbox.center
-                cx2, cy2 = color_obj.bbox.center
-                if abs(cx1 - cx2) < 50 and abs(cy1 - cy2) < 50:
-                    # Transfer color label
-                    seg_obj.label = color_obj.label
-                    break
+    # If YOLO handled detection, skip other methods
+    if not yolo_detected:
+        # Segmentation-based detection (most accurate, but slower)
+        if use_segmentation:
+            segmenter = _get_segmenter()
+            if segmenter is not None:
+                seg_objects = segmenter.segment(image)
+                # Filter by area
+                for obj in seg_objects:
+                    if obj.bbox.area >= min_area:
+                        all_objects.append(obj)
 
-    # Contour-based detection (may find objects other methods missed)
-    if use_contour_detection and not use_segmentation:
-        contour_objs = find_objects_by_contour(image, min_area=min_area)
+        # Color-based detection (if not using segmentation, or to augment it)
+        if use_color_detection and not use_segmentation:
+            colored = find_colored_blocks(image, min_area=min_area)
+            all_objects.extend(colored)
+        elif use_color_detection and use_segmentation:
+            # Augment segmentation with color labels
+            colored = find_colored_blocks(image, min_area=min_area)
+            for seg_obj in all_objects:
+                # Find matching color detection
+                for color_obj in colored:
+                    cx1, cy1 = seg_obj.bbox.center
+                    cx2, cy2 = color_obj.bbox.center
+                    if abs(cx1 - cx2) < 50 and abs(cy1 - cy2) < 50:
+                        # Transfer color label
+                        seg_obj.label = color_obj.label
+                        break
 
-        # Add only if not overlapping with existing detections
-        for obj in contour_objs:
-            cx, cy = obj.bbox.center
-            is_duplicate = False
+        # Contour-based detection (may find objects other methods missed)
+        if use_contour_detection and not use_segmentation:
+            contour_objs = find_objects_by_contour(image, min_area=min_area)
 
-            for existing in all_objects:
-                ex, ey = existing.bbox.center
-                if abs(cx - ex) < 50 and abs(cy - ey) < 50:
-                    is_duplicate = True
-                    break
+            # Add only if not overlapping with existing detections
+            for obj in contour_objs:
+                cx, cy = obj.bbox.center
+                is_duplicate = False
 
-            if not is_duplicate:
-                all_objects.append(obj)
+                for existing in all_objects:
+                    ex, ey = existing.bbox.center
+                    if abs(cx - ex) < 50 and abs(cy - ey) < 50:
+                        is_duplicate = True
+                        break
+
+                if not is_duplicate:
+                    all_objects.append(obj)
 
     # Build rich descriptions
     object_descriptions = []
@@ -453,7 +536,12 @@ def annotate_scene(
 
         # Draw label
         if show_labels:
-            label = f"{i+1}: {obj_desc.color_name or 'object'} ({obj_desc.size_description})"
+            # Use class label if it's a real YOLO label, otherwise fall back to color/size
+            has_class_label = obj.label not in ("object", "colored_object") and not obj.label.endswith("_block")
+            if has_class_label:
+                label = f"{obj.label} {obj.confidence:.2f}"
+            else:
+                label = f"{i+1}: {obj_desc.color_name or 'object'} ({obj_desc.size_description})"
             cv2.putText(
                 result,
                 label,
