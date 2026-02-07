@@ -18,6 +18,15 @@
         "cd /home/pi/panda-mcp && ./venv/bin/python -m camera_mcp.server"
       ],
       "env": {}
+    },
+    "depth": {
+      "command": "ssh",
+      "args": [
+        "-o", "StrictHostKeyChecking=no",
+        "pi@panda-pi.local",
+        "cd /home/pi/panda-mcp && ./venv/bin/python -m depth_mcp.server"
+      ],
+      "env": {}
     }
   }
 }

@@ -25,6 +25,13 @@ from .calibration import (
     save_calibration,
 )
 
+from .depth_calibration import (
+    DepthCalibrationData,
+    DepthCoordinateTransformer,
+    compute_rigid_transform,
+    get_depth_transformer,
+)
+
 from .manipulation import (
     GraspPlan,
     plan_grasp_for_object,
@@ -60,11 +67,16 @@ __all__ = [
     "find_colored_blocks",
     "draw_detections",
     "COLOR_RANGES",
-    # Calibration
+    # Calibration (2D)
     "CalibrationData",
     "CoordinateTransformer",
     "get_transformer",
     "save_calibration",
+    # Depth Calibration (3D)
+    "DepthCalibrationData",
+    "DepthCoordinateTransformer",
+    "compute_rigid_transform",
+    "get_depth_transformer",
     # Manipulation
     "GraspPlan",
     "plan_grasp_for_object",

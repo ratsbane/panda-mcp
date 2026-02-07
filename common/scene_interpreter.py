@@ -123,9 +123,9 @@ class SceneDescription:
                 cx, cy = o.obj.bbox.center
                 rx, ry, rz = transformer.pixel_to_robot(cx, cy)
                 obj_dict["robot_coords"] = {
-                    "x": round(rx, 4),
-                    "y": round(ry, 4),
-                    "z": round(rz, 4),
+                    "x": round(float(rx), 4),
+                    "y": round(float(ry), 4),
+                    "z": round(float(rz), 4),
                 }
             objects_list.append(obj_dict)
 
