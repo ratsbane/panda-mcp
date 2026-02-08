@@ -17,7 +17,7 @@ class WorkspaceLimits:
     x_max: float = 0.75   # Forward reach limit
     y_min: float = -0.5   # Left (from robot's perspective)
     y_max: float = 0.5    # Right
-    z_min: float = 0.05   # Don't hit the table
+    z_min: float = 0.01   # Just above table (IK can reach z=0.013)
     z_max: float = 0.7    # Upper limit
     
     def contains(self, x: float, y: float, z: float) -> bool:

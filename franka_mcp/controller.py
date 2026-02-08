@@ -80,6 +80,109 @@ def euler_to_quaternion(roll: float, pitch: float, yaw: float) -> np.ndarray:
     return np.array([x, y, z, w])
 
 
+def quaternion_to_rotation_matrix(q: np.ndarray) -> np.ndarray:
+    """
+    Convert quaternion [x, y, z, w] to 3x3 rotation matrix.
+    """
+    x, y, z, w = q
+    return np.array([
+        [1 - 2*(y*y + z*z),     2*(x*y - w*z),     2*(x*z + w*y)],
+        [    2*(x*y + w*z), 1 - 2*(x*x + z*z),     2*(y*z - w*x)],
+        [    2*(x*z - w*y),     2*(y*z + w*x), 1 - 2*(x*x + y*y)],
+    ])
+
+
+def _solve_ik(
+    position: np.ndarray,
+    orientation_quat: np.ndarray,
+    current_joints: np.ndarray,
+) -> Optional[np.ndarray]:
+    """
+    Solve analytical IK for a target Cartesian pose.
+
+    Args:
+        position: Target [x, y, z] in meters
+        orientation_quat: Target quaternion [x, y, z, w]
+        current_joints: Current 7 joint angles (used as seed)
+
+    Returns:
+        Best joint solution (7,) or None if no valid solution found.
+    """
+    if not PANDA_PY_AVAILABLE:
+        return None
+
+    # Build 4x4 SE(3) target pose
+    R = quaternion_to_rotation_matrix(orientation_quat)
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = position
+
+    # Panda joint limits for filtering
+    joint_limits = np.array([
+        [-2.8973, 2.8973],
+        [-1.7628, 1.7628],
+        [-2.8973, 2.8973],
+        [-3.0718, -0.0698],
+        [-2.8973, 2.8973],
+        [-0.0175, 3.7525],
+        [-2.8973, 2.8973],
+    ])
+
+    best_solution = None
+    best_cost = float('inf')
+
+    # Try multiple q_7 values to explore the null space
+    q7_candidates = [0.785, 0.0, -0.785, 1.57]
+
+    for q7 in q7_candidates:
+        try:
+            solutions = panda_py.ik_full(T, current_joints, q7)
+        except Exception as e:
+            logger.debug(f"IK failed for q7={q7}: {e}")
+            continue
+
+        if solutions is None or len(solutions) == 0:
+            continue
+
+        for sol in solutions:
+            sol = np.array(sol)
+            if sol.shape != (7,):
+                continue
+
+            # Check joint limits (with small margin)
+            margin = 0.01
+            in_limits = True
+            for i in range(7):
+                if sol[i] < joint_limits[i, 0] + margin or sol[i] > joint_limits[i, 1] - margin:
+                    in_limits = False
+                    break
+            if not in_limits:
+                continue
+
+            # Verify with FK: position error < 2mm
+            try:
+                fk_pose = panda_py.fk(sol)
+                fk_pos = fk_pose[:3, 3]
+                pos_error = np.linalg.norm(fk_pos - position)
+                if pos_error > 0.002:
+                    continue
+            except Exception:
+                continue
+
+            # Cost: minimize joint travel from current config
+            cost = np.sum((sol - current_joints) ** 2)
+            if cost < best_cost:
+                best_cost = cost
+                best_solution = sol
+
+    if best_solution is not None:
+        logger.info(f"IK solution found (cost={best_cost:.3f}, q7={best_solution[6]:.3f})")
+    else:
+        logger.warning("No valid IK solution found")
+
+    return best_solution
+
+
 @dataclass
 class RobotState:
     """Current state of the robot."""
@@ -382,6 +485,132 @@ class FrankaController:
                 "success": False,
                 "error": str(e),
             }
+
+    def move_cartesian_ik(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        roll: Optional[float] = None,
+        pitch: Optional[float] = None,
+        yaw: Optional[float] = None,
+        confirmed: bool = False,
+    ) -> dict:
+        """
+        Move end effector to Cartesian position using analytical IK.
+
+        Same interface as move_cartesian but uses IK + move_to_joint_position,
+        which can reliably reach table height (z~0.013) unlike the Cartesian planner.
+        """
+        if not self._connected:
+            return {"success": False, "error": "Not connected to robot"}
+
+        config = get_safety_config()
+        current_state = self.get_state()
+        current_pos = current_state.ee_position
+
+        if roll is None:
+            roll = current_state.ee_orientation[0]
+        if pitch is None:
+            pitch = current_state.ee_orientation[1]
+        if yaw is None:
+            yaw = current_state.ee_orientation[2]
+
+        # Validate target
+        validation = self.validator.validate_cartesian_target(
+            x, y, z, current_position=current_pos
+        )
+
+        if not validation["valid"]:
+            return {"success": False, "errors": validation["errors"]}
+
+        if validation["clamped_position"]:
+            x, y, z = validation["clamped_position"]
+
+        if validation["requires_confirmation"] and not confirmed:
+            distance = np.sqrt(
+                (x - current_pos[0])**2 +
+                (y - current_pos[1])**2 +
+                (z - current_pos[2])**2
+            )
+            return {
+                "success": False,
+                "requires_confirmation": True,
+                "message": f"Large move ({distance:.3f}m) requires confirmation.",
+                "target": {"x": x, "y": y, "z": z, "roll": roll, "pitch": pitch, "yaw": yaw},
+                "warnings": validation["warnings"],
+            }
+
+        if config.dry_run:
+            return {
+                "success": True,
+                "dry_run": True,
+                "message": "Dry run - no movement executed",
+                "would_move_to": {"x": x, "y": y, "z": z},
+                "warnings": validation["warnings"],
+            }
+
+        # Solve IK
+        target_quat = euler_to_quaternion(roll, pitch, yaw)
+        target_pos = np.array([x, y, z])
+        current_joints = np.array(current_state.joint_positions)
+
+        solution = _solve_ik(target_pos, target_quat, current_joints)
+
+        if solution is None:
+            return {
+                "success": False,
+                "error": "No valid IK solution found for target pose",
+                "target": {"x": x, "y": y, "z": z, "roll": roll, "pitch": pitch, "yaw": yaw},
+            }
+
+        # Verify solution via FK: check position and orientation errors
+        if PANDA_PY_AVAILABLE:
+            fk_pose = panda_py.fk(solution)
+            fk_pos = fk_pose[:3, 3]
+            pos_error = np.linalg.norm(fk_pos - target_pos)
+
+            # Orientation error via rotation matrix difference
+            R_target = quaternion_to_rotation_matrix(target_quat)
+            R_fk = fk_pose[:3, :3]
+            R_err = R_target.T @ R_fk
+            angle_error = np.arccos(np.clip((np.trace(R_err) - 1) / 2, -1, 1))
+
+            if pos_error > 0.002:
+                return {
+                    "success": False,
+                    "error": f"IK solution position error too large: {pos_error*1000:.1f}mm",
+                }
+            if angle_error > np.radians(5):
+                return {
+                    "success": False,
+                    "error": f"IK solution orientation error too large: {np.degrees(angle_error):.1f}deg",
+                }
+
+        # Execute via joint motion
+        try:
+            success = self._robot.move_to_joint_position(
+                solution,
+                speed_factor=0.15,
+            )
+
+            new_state = self.get_state()
+            return {
+                "success": True,
+                "method": "ik",
+                "position": {"x": x, "y": y, "z": z},
+                "orientation": {"roll": roll, "pitch": pitch, "yaw": yaw},
+                "actual_position": {
+                    "x": round(new_state.ee_position[0], 4),
+                    "y": round(new_state.ee_position[1], 4),
+                    "z": round(new_state.ee_position[2], 4),
+                },
+                "warnings": validation["warnings"],
+            }
+
+        except Exception as e:
+            logger.error(f"IK move failed: {e}")
+            return {"success": False, "error": str(e)}
 
     def move_relative(
         self,
@@ -734,9 +963,9 @@ class FrankaController:
         if xy_error > 0.05:
             return {"success": False, "error": f"Failed to reach approach position (error={xy_error:.3f}m)", "steps": steps}
 
-        # Step 3: Lower to grasp height
-        result = self.move_cartesian(target_x, y, z, confirmed=True)
-        steps.append({"action": "lower_to_grasp", "result": result})
+        # Step 3: Lower to grasp height (IK for reliable table reach)
+        result = self.move_cartesian_ik(target_x, y, z, confirmed=True)
+        steps.append({"action": "lower_to_grasp", "method": "ik", "result": result})
         state = self.get_state()
         actual_z = state.ee_position[2]
         steps.append({"action": "check_z", "target_z": z, "actual_z": round(actual_z, 4)})
@@ -792,9 +1021,9 @@ class FrankaController:
         result = self.move_cartesian(x, y, approach_height, confirmed=True)
         steps.append({"action": "move_above", "result": result})
 
-        # Step 2: Lower to place height
-        result = self.move_cartesian(x, y, z, confirmed=True)
-        steps.append({"action": "lower_to_place", "result": result})
+        # Step 2: Lower to place height (IK for reliable low-Z reach)
+        result = self.move_cartesian_ik(x, y, z, confirmed=True)
+        steps.append({"action": "lower_to_place", "method": "ik", "result": result})
 
         # Step 3: Open gripper to release
         result = self.gripper_move(0.08)
