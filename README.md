@@ -2,7 +2,12 @@
 
 **Claude Code autonomously picks up objects using a 7-DOF Franka Panda arm, 3D depth camera, AI-accelerated computer vision, and analytical inverse kinematics -- all orchestrated through the Model Context Protocol (MCP).**
 
-[![Demo Video](https://img.youtube.com/vi/Zig-_-1gK1Y/maxresdefault.jpg)](https://www.youtube.com/watch?v=Zig-_-1gK1Y)
+<div align="center">
+  <a href="https://www.youtube.com/watch?v=Zig-_-1gK1Y">
+    <img src="https://img.youtube.com/vi/Zig-_-1gK1Y/maxresdefault.jpg" alt="Demo Video" width="700">
+  </a>
+  <p><strong>▶ Watch the demo video</strong></p>
+</div>
 
 ## What This Is
 
