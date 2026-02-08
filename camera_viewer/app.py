@@ -1,8 +1,9 @@
-"""Camera viewer web app - live 2D USB camera stream + depth camera images."""
+"""Camera viewer web app - live 2D USB camera stream + depth camera images + 3D fusion."""
 
 import asyncio
 import logging
 import struct
+import time
 from pathlib import Path
 
 import cv2
@@ -73,6 +74,15 @@ HTML_PAGE = """<!DOCTYPE html>
     <img id="stream" alt="2D camera stream" style="display:none">
     <div id="stream-placeholder" class="placeholder">Connecting to camera...</div>
   </div>
+  <div class="panel">
+    <h2>3D Fusion (YOLO + Depth)</h2>
+    <img id="fusion" alt="3D fusion overlay" style="display:none">
+    <div id="fusion-placeholder" class="placeholder">Click "Capture New Scan" to generate</div>
+    <div class="controls">
+      <button id="fusion-btn" onclick="refreshFusion()">Refresh Fusion</button>
+      <span id="fusion-status" class="status"></span>
+    </div>
+  </div>
   <div class="depth-row">
     <div class="panel">
       <h2>Depth Texture</h2>
@@ -126,6 +136,29 @@ HTML_PAGE = """<!DOCTYPE html>
     loadImg('colormap', '/depth/colormap?t=' + t);
   }
 
+  function refreshFusion() {
+    var btn = document.getElementById('fusion-btn');
+    var status = document.getElementById('fusion-status');
+    btn.disabled = true;
+    status.textContent = 'Running YOLO + depth fusion...';
+    var t = Date.now();
+    var img = document.getElementById('fusion');
+    var ph = document.getElementById('fusion-placeholder');
+    var tmp = new Image();
+    tmp.onload = function() {
+      img.src = tmp.src;
+      img.style.display = '';
+      if (ph) ph.style.display = 'none';
+      btn.disabled = false;
+      status.textContent = '';
+    };
+    tmp.onerror = function() {
+      btn.disabled = false;
+      status.textContent = 'Fusion failed (no depth scan?)';
+    };
+    tmp.src = '/fusion?t=' + t;
+  }
+
   // Initial load + auto-refresh
   refreshDepth();
   setInterval(refreshDepth, 5000);
@@ -144,6 +177,7 @@ HTML_PAGE = """<!DOCTYPE html>
       } else {
         status.textContent = 'Scan complete (' + (data.depth_shape || '?') + ')';
         refreshDepth();
+        refreshFusion();
       }
     } catch (e) {
       status.textContent = 'Failed: ' + e.message;
@@ -323,10 +357,185 @@ async def depth_capture(request):
         return JSONResponse({"error": str(e)})
 
 
+def _grab_usb_frame() -> np.ndarray | None:
+    """Grab a single BGR frame from the camera daemon via ZeroMQ (sync)."""
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.SUB)
+    sock.setsockopt(zmq.RCVTIMEO, 3000)
+    sock.setsockopt_string(zmq.SUBSCRIBE, "frame")
+    try:
+        for endpoint in [ZMQ_IPC, ZMQ_TCP]:
+            try:
+                sock.connect(endpoint)
+                parts = sock.recv_multipart()
+                if len(parts) == 3:
+                    jpeg_bytes = parts[2]
+                    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+                    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            except Exception:
+                try:
+                    sock.disconnect(endpoint)
+                except Exception:
+                    pass
+        return None
+    finally:
+        sock.close()
+        ctx.term()
+
+
+# Source colors for annotation: fused=green, depth_only=cyan, yolo_only=yellow
+_SOURCE_COLORS = {
+    "fused": (0, 220, 0),
+    "depth_only": (220, 180, 0),
+    "yolo_only": (0, 220, 220),
+}
+
+
+def _render_fusion_image(
+    frame: np.ndarray,
+    scene_dict: dict,
+    usb_calibration_path: str = "/tmp/aruco_calibration.npz",
+) -> np.ndarray:
+    """Draw 3D fusion results on a USB camera frame."""
+    annotated = frame.copy()
+    h, w = annotated.shape[:2]
+
+    # Load inverse homography (robot XY -> pixel) for projecting 3D positions
+    cal_path = Path(usb_calibration_path)
+    H_inv = None
+    if cal_path.exists():
+        cal = np.load(str(cal_path), allow_pickle=True)
+        H = cal["H"]
+        H_inv = np.linalg.inv(H)
+
+    objects = scene_dict.get("objects", [])
+
+    for obj in objects:
+        source = obj.get("source", "fused")
+        color = _SOURCE_COLORS.get(source, (0, 220, 0))
+        label = obj.get("label", "?")
+        conf = obj.get("confidence", 0)
+        pos = obj.get("position_m", {})
+        dims = obj.get("dimensions_m", {})
+        grasp_w = obj.get("grasp_width_m")
+        point_count = obj.get("point_count", 0)
+
+        rx, ry, rz = pos.get("x", 0), pos.get("y", 0), pos.get("z", 0)
+
+        # Project robot XY to pixel using inverse homography
+        px, py = None, None
+        if H_inv is not None:
+            pt = np.array([[rx, ry]], dtype=np.float32).reshape(-1, 1, 2)
+            pixel = cv2.perspectiveTransform(pt, H_inv)
+            px, py = int(pixel[0, 0, 0]), int(pixel[0, 0, 1])
+
+        if px is None or not (0 <= px < w and 0 <= py < h):
+            # Off-screen — skip drawing but could add to a legend
+            continue
+
+        # Draw crosshair
+        size = 18
+        cv2.line(annotated, (px - size, py), (px + size, py), color, 2)
+        cv2.line(annotated, (px, py - size), (px, py + size), color, 2)
+        cv2.circle(annotated, (px, py), 4, color, -1)
+
+        # Build label text
+        if source == "fused" or source == "yolo_only":
+            text1 = f"{label} {conf:.0%}"
+        else:
+            text1 = f"unknown ({point_count}pts)"
+
+        text2 = f"({rx:.2f}, {ry:.2f}, {rz:.3f})"
+
+        # Draw text background + text
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.5
+        thickness = 1
+        (tw1, th1), _ = cv2.getTextSize(text1, font, scale, thickness)
+        (tw2, th2), _ = cv2.getTextSize(text2, font, scale * 0.8, thickness)
+        tw = max(tw1, tw2)
+        total_h = th1 + th2 + 12
+
+        # Position label above crosshair
+        lx = max(0, min(px - tw // 2, w - tw - 4))
+        ly = max(total_h + 4, py - size - 6)
+
+        cv2.rectangle(annotated, (lx - 2, ly - th1 - 4), (lx + tw + 4, ly + th2 + 8),
+                      (0, 0, 0), -1)
+        cv2.rectangle(annotated, (lx - 2, ly - th1 - 4), (lx + tw + 4, ly + th2 + 8),
+                      color, 1)
+        cv2.putText(annotated, text1, (lx + 1, ly), font, scale, color, thickness, cv2.LINE_AA)
+        cv2.putText(annotated, text2, (lx + 1, ly + th2 + 6), font, scale * 0.8,
+                    (180, 180, 180), thickness, cv2.LINE_AA)
+
+        # Draw grasp width indicator if available
+        if grasp_w and grasp_w > 0 and H_inv is not None:
+            half = grasp_w / 2
+            pt_l = np.array([[rx, ry - half]], dtype=np.float32).reshape(-1, 1, 2)
+            pt_r = np.array([[rx, ry + half]], dtype=np.float32).reshape(-1, 1, 2)
+            px_l = cv2.perspectiveTransform(pt_l, H_inv)
+            px_r = cv2.perspectiveTransform(pt_r, H_inv)
+            x1, y1 = int(px_l[0, 0, 0]), int(px_l[0, 0, 1])
+            x2, y2 = int(px_r[0, 0, 0]), int(px_r[0, 0, 1])
+            cv2.line(annotated, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
+
+    # Draw legend
+    ly = h - 14
+    for src, clr in _SOURCE_COLORS.items():
+        cv2.circle(annotated, (10, ly), 5, clr, -1)
+        cv2.putText(annotated, src, (20, ly + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                    clr, 1, cv2.LINE_AA)
+        ly -= 18
+
+    # Summary bar at top
+    summary = scene_dict.get("summary", "")
+    total = scene_dict.get("total_objects", 0)
+    fused = scene_dict.get("fused_count", 0)
+    header = f"Objects: {total} (fused: {fused})"
+    cv2.rectangle(annotated, (0, 0), (w, 28), (0, 0, 0), -1)
+    cv2.putText(annotated, header, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (255, 255, 255), 1, cv2.LINE_AA)
+
+    return annotated
+
+
+async def fusion_image(request):
+    """Render fusion overlay: USB camera frame + YOLO labels + depth 3D positions."""
+    try:
+        # Grab USB camera frame (sync ZMQ in thread to avoid blocking event loop)
+        loop = asyncio.get_event_loop()
+        frame = await loop.run_in_executor(None, _grab_usb_frame)
+        if frame is None:
+            return Response("Camera unavailable", status_code=503)
+
+        # Run fusion (CPU-bound with Hailo inference, run in executor)
+        def _run_fusion():
+            from common.depth_fusion import build_scene_graph
+            scene = build_scene_graph(
+                frame,
+                depth_npz_path="/tmp/phoxi_scan.npz",
+                max_age_seconds=300,
+                confidence_threshold=0.3,
+            )
+            return scene.to_dict()
+
+        scene_dict = await loop.run_in_executor(None, _run_fusion)
+
+        # Render annotated image
+        annotated = _render_fusion_image(frame, scene_dict)
+        _, jpeg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        return Response(jpeg.tobytes(), media_type="image/jpeg")
+
+    except Exception as e:
+        logger.exception("Fusion image failed")
+        return Response(f"Fusion failed: {e}", status_code=500)
+
+
 app = Starlette(
     routes=[
         Route("/", homepage),
         Route("/stream", mjpeg_stream),
+        Route("/fusion", fusion_image),
         Route("/depth/texture", depth_texture),
         Route("/depth/colormap", depth_colormap),
         Route("/depth/capture", depth_capture),

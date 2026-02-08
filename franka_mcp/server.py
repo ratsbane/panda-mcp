@@ -327,6 +327,30 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="jog_enable",
+            description="Enable gamepad jog mode. User controls arm with USB gamepad. Left stick=XY, right stick=Z, A=grasp, B=open, X=speed, LB=fine, Back=stop.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="jog_disable",
+            description="Disable gamepad jog mode and return to normal control.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="jog_status",
+            description="Get current gamepad jog status including position, speed mode, and stick state.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
             name="get_safety_limits",
             description="Get current safety limits (workspace bounds, velocity limits).",
             inputSchema={
@@ -484,6 +508,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "list_episodes":
             result = controller.list_episodes()
+            return json_response(result)
+
+        elif name == "jog_enable":
+            result = controller.start_jog()
+            return json_response(result)
+
+        elif name == "jog_disable":
+            result = controller.stop_jog()
+            return json_response(result)
+
+        elif name == "jog_status":
+            result = controller.get_jog_status()
             return json_response(result)
 
         elif name == "get_safety_limits":

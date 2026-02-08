@@ -6,6 +6,8 @@ Provides a safe, high-level interface to panda-py/libfranka.
 
 import os
 import logging
+import threading
+import time
 from typing import Optional
 from dataclasses import dataclass
 import numpy as np
@@ -953,17 +955,22 @@ class FrankaController:
         result = self.gripper_move(0.08)
         steps.append({"action": "open_gripper", "result": result})
 
-        # Step 2: Move above target
-        result = self.move_cartesian(target_x, y, approach_height, confirmed=True)
-        steps.append({"action": "approach_above", "result": result})
-        # Verify position (move_cartesian may return success:false but still execute)
-        state = self.get_state()
-        pos = state.ee_position
-        xy_error = np.sqrt((pos[0] - target_x)**2 + (pos[1] - y)**2)
-        if xy_error > 0.05:
-            return {"success": False, "error": f"Failed to reach approach position (error={xy_error:.3f}m)", "steps": steps}
+        # Step 2: Move above target (IK for accurate positioning)
+        result = self.move_cartesian_ik(target_x, y, approach_height, confirmed=True)
+        steps.append({"action": "approach_above", "method": "ik", "result": result})
 
-        # Step 3: Lower to grasp height (IK for reliable table reach)
+        # Step 3: Lower in increments (avoid large joint changes that trigger reflex)
+        state = self.get_state()
+        current_z = state.ee_position[2]
+        step_z = 0.04  # 4cm increments
+        while current_z - step_z > z + step_z:
+            intermediate_z = current_z - step_z
+            result = self.move_cartesian_ik(target_x, y, intermediate_z, confirmed=True)
+            steps.append({"action": "lower_step", "method": "ik", "target_z": round(intermediate_z, 4), "result": result})
+            state = self.get_state()
+            current_z = state.ee_position[2]
+
+        # Final lower to grasp height
         result = self.move_cartesian_ik(target_x, y, z, confirmed=True)
         steps.append({"action": "lower_to_grasp", "method": "ik", "result": result})
         state = self.get_state()
@@ -976,12 +983,19 @@ class FrankaController:
         # Check actual gripper width
         state = self.get_state()
         actual_grip = state.gripper_width
-        grasped = actual_grip < grasp_width + 0.005  # some tolerance
+        # Grasped if gripper stopped between fully-closed and target+tolerance
+        # If gripper < 1mm, it closed fully (nothing grasped)
+        # If gripper > target + 5mm, object was wider than expected
+        min_grip = 0.001  # 1mm - below this means fully closed / empty
+        grasped = actual_grip > min_grip and actual_grip < grasp_width + 0.005
         steps.append({"action": "check_grasp", "gripper_width": round(actual_grip, 4), "grasped": grasped})
 
-        # Step 5: Lift
-        result = self.move_relative(dz=approach_height, confirmed=True)
-        steps.append({"action": "lift", "result": result})
+        # Step 5: Lift (IK to avoid drift)
+        state = self.get_state()
+        result = self.move_cartesian_ik(
+            state.ee_position[0], state.ee_position[1],
+            state.ee_position[2] + approach_height, confirmed=True)
+        steps.append({"action": "lift", "method": "ik", "result": result})
         state = self.get_state()
 
         return {
@@ -1017,9 +1031,9 @@ class FrankaController:
 
         steps = []
 
-        # Step 1: Move above target
-        result = self.move_cartesian(x, y, approach_height, confirmed=True)
-        steps.append({"action": "move_above", "result": result})
+        # Step 1: Move above target (IK for accurate positioning)
+        result = self.move_cartesian_ik(x, y, approach_height, confirmed=True)
+        steps.append({"action": "move_above", "method": "ik", "result": result})
 
         # Step 2: Lower to place height (IK for reliable low-Z reach)
         result = self.move_cartesian_ik(x, y, z, confirmed=True)
@@ -1029,9 +1043,12 @@ class FrankaController:
         result = self.gripper_move(0.08)
         steps.append({"action": "release", "result": result})
 
-        # Step 4: Retreat up
-        result = self.move_relative(dz=approach_height, confirmed=True)
-        steps.append({"action": "retreat", "result": result})
+        # Step 4: Retreat up (IK to avoid drift)
+        state = self.get_state()
+        result = self.move_cartesian_ik(
+            state.ee_position[0], state.ee_position[1],
+            state.ee_position[2] + approach_height, confirmed=True)
+        steps.append({"action": "retreat", "method": "ik", "result": result})
         state = self.get_state()
 
         return {
@@ -1070,6 +1087,158 @@ class FrankaController:
         from common.trajectory_recorder import get_recorder
         recorder = get_recorder()
         return recorder.list_episodes()
+
+    # --- Gamepad jog mode ---
+
+    def start_jog(self) -> dict:
+        """Start gamepad jog mode. Polls gamepad and executes small moves."""
+        if not self._connected:
+            return {"success": False, "error": "Not connected"}
+
+        if hasattr(self, '_jog_active') and self._jog_active:
+            return {"success": False, "error": "Jog already active"}
+
+        try:
+            from .gamepad import GamepadHandler
+        except (ImportError, ModuleNotFoundError):
+            import importlib.util as _ilu
+            _spec = _ilu.spec_from_file_location(
+                "gamepad", __file__.replace("controller.py", "gamepad.py"))
+            _mod = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            GamepadHandler = _mod.GamepadHandler
+        self._gamepad = GamepadHandler()
+        result = self._gamepad.start()
+        if not result["success"]:
+            return result
+
+        self._jog_active = True
+        self._jog_thread = threading.Thread(target=self._jog_loop, daemon=True)
+        self._jog_thread.start()
+
+        return {
+            "success": True,
+            "message": "Gamepad jog mode enabled",
+            "controller": result.get("controller", ""),
+            "controls": {
+                "left_stick": "X-Y motion",
+                "right_stick_y": "Z motion (up/down)",
+                "A": "Grasp (30mm, 70N)",
+                "B": "Open gripper",
+                "X": "Cycle speed (slow/medium/fast)",
+                "LB_hold": "Fine mode (1mm steps)",
+                "Back": "Stop jog mode",
+            },
+            "speed": "medium (5mm/step)",
+        }
+
+    def _jog_loop(self):
+        """Background thread: read gamepad, execute moves."""
+        logger.info("Jog loop started")
+        move_interval = 0.05  # ~20Hz max move rate
+
+        while self._jog_active:
+            try:
+                state = self._gamepad.get_state()
+
+                # Handle button events first
+                for event in state.events:
+                    if event.action == "stop_jog":
+                        logger.info("Jog stopped via gamepad Back button")
+                        self._jog_active = False
+                        break
+                    elif event.action == "grasp":
+                        try:
+                            self.gripper_grasp(width=0.03, force=70, speed=0.1)
+                        except Exception as e:
+                            logger.warning(f"Grasp failed: {e}")
+                    elif event.action == "open_gripper":
+                        try:
+                            self.gripper_move(0.08)
+                        except Exception as e:
+                            logger.warning(f"Gripper open failed: {e}")
+
+                if not self._jog_active:
+                    break
+
+                # Execute move if sticks are displaced (IK-based for pure Cartesian motion)
+                if state.dx != 0 or state.dy != 0 or state.dz != 0:
+                    try:
+                        current = self.get_state()
+                        target_x = current.ee_position[0] + state.dx
+                        target_y = current.ee_position[1] + state.dy
+                        target_z = current.ee_position[2] + state.dz
+                        self.move_cartesian_ik(
+                            target_x, target_y, target_z,
+                            confirmed=True,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Jog move failed: {e}")
+
+                time.sleep(move_interval)
+
+            except Exception as e:
+                logger.error(f"Jog loop error: {e}")
+                time.sleep(0.5)
+
+        # Cleanup
+        if hasattr(self, '_gamepad') and self._gamepad:
+            self._gamepad.stop()
+        logger.info("Jog loop ended")
+
+    def stop_jog(self) -> dict:
+        """Stop gamepad jog mode."""
+        if not hasattr(self, '_jog_active') or not self._jog_active:
+            return {"success": False, "error": "Jog not active"}
+
+        self._jog_active = False
+        if hasattr(self, '_jog_thread') and self._jog_thread:
+            self._jog_thread.join(timeout=3.0)
+
+        # Get final position
+        if self._connected:
+            state = self.get_state()
+            return {
+                "success": True,
+                "message": "Jog mode stopped",
+                "final_position": {
+                    "x": round(state.ee_position[0], 4),
+                    "y": round(state.ee_position[1], 4),
+                    "z": round(state.ee_position[2], 4),
+                },
+                "gripper_width": round(state.gripper_width, 4),
+            }
+
+        return {"success": True, "message": "Jog mode stopped"}
+
+    def get_jog_status(self) -> dict:
+        """Get current jog mode status."""
+        active = hasattr(self, '_jog_active') and self._jog_active
+
+        result = {"active": active}
+
+        if active and hasattr(self, '_gamepad'):
+            state = self._gamepad.get_state()
+            result["speed"] = state.speed_name
+            result["step_size_mm"] = state.step_size * 1000
+            result["fine_mode"] = state.fine_mode
+            result["controller"] = state.controller_name
+            result["stick"] = {
+                "dx": round(state.dx * 1000, 1),
+                "dy": round(state.dy * 1000, 1),
+                "dz": round(state.dz * 1000, 1),
+            }
+
+        if self._connected:
+            s = self.get_state()
+            result["position"] = {
+                "x": round(s.ee_position[0], 4),
+                "y": round(s.ee_position[1], 4),
+                "z": round(s.ee_position[2], 4),
+            }
+            result["gripper_width"] = round(s.gripper_width, 4)
+
+        return result
 
     def teaching_mode(self, active: bool) -> dict:
         """

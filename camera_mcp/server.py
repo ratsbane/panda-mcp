@@ -157,6 +157,36 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
+        Tool(
+            name="describe_scene_3d",
+            description=(
+                "Fuse Hailo YOLOv8 detection (class labels) with PhotoNeo depth pointcloud "
+                "(3D positions) to produce a labeled, 3D-positioned scene graph. "
+                "Call depth-mcp capture_depth + save_scan first to provide fresh depth data. "
+                "Returns objects with COCO labels, robot-frame 3D positions, dimensions, "
+                "grasp widths, and colors."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "depth_npz_path": {
+                        "type": "string",
+                        "default": "/tmp/phoxi_scan.npz",
+                        "description": "Path to saved depth scan NPZ from depth-mcp save_scan",
+                    },
+                    "max_age_seconds": {
+                        "type": "number",
+                        "default": 60,
+                        "description": "Reject depth scans older than this many seconds",
+                    },
+                    "confidence_threshold": {
+                        "type": "number",
+                        "default": 0.3,
+                        "description": "YOLO confidence threshold (0-1)",
+                    },
+                },
+            },
+        ),
     ]
 
 
@@ -303,9 +333,33 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
 
             return responses
 
+        elif name == "describe_scene_3d":
+            if not controller.connected:
+                return json_response({"error": "Camera not connected. Call 'connect' first."})
+
+            # Capture raw frame from USB camera
+            frame = controller.capture_raw()
+            if frame is None:
+                return json_response({"error": "Failed to capture frame"})
+
+            from common.depth_fusion import build_scene_graph
+
+            depth_npz_path = arguments.get("depth_npz_path", "/tmp/phoxi_scan.npz")
+            max_age = arguments.get("max_age_seconds", 60)
+            confidence = arguments.get("confidence_threshold", 0.3)
+
+            scene = build_scene_graph(
+                frame,
+                depth_npz_path=depth_npz_path,
+                max_age_seconds=max_age,
+                confidence_threshold=confidence,
+            )
+
+            return json_response(scene.to_dict())
+
         else:
             return json_response({"error": f"Unknown tool: {name}"})
-    
+
     except Exception as e:
         logger.exception(f"Error in tool {name}")
         return json_response({"error": str(e)})
