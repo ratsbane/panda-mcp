@@ -207,7 +207,7 @@ MIT
 ## Acknowledgments
 
 - [Claude Code](https://github.com/anthropics/claude-code) by Anthropic
-- [panda-py](https://github.com/JeanElsworthy/panda-py) by Jean Elsworthy
+- [panda-py](https://github.com/JeanElsner/panda-py) by Jean Elsner
 - [Hailo](https://hailo.ai/) for the AI Hat
 - [PhotoNeo](https://www.photoneo.com/) for the MotionCam-3D
 - [MCP Protocol](https://modelcontextprotocol.io/)
