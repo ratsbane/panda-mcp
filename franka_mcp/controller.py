@@ -171,8 +171,8 @@ def _solve_ik(
             except Exception:
                 continue
 
-            # Cost: minimize joint travel from current config
-            cost = np.sum((sol - current_joints) ** 2)
+            # Cost: minimize joint travel + prefer q7 near 0.785 (good picking orientation)
+            cost = np.sum((sol - current_joints) ** 2) + 2.0 * (sol[6] - 0.785) ** 2
             if cost < best_cost:
                 best_cost = cost
                 best_solution = sol
@@ -951,12 +951,20 @@ class FrankaController:
         steps = []
         target_x = x + x_offset
 
+        # Standard top-down picking orientation (roll=pi, pitch=0, yaw=0)
+        import math
+        pick_roll = math.pi
+        pick_pitch = 0.0
+        pick_yaw = 0.0
+
         # Step 1: Open gripper
         result = self.gripper_move(0.08)
         steps.append({"action": "open_gripper", "result": result})
 
-        # Step 2: Move above target (IK for accurate positioning)
-        result = self.move_cartesian_ik(target_x, y, approach_height, confirmed=True)
+        # Step 2: Move above target (IK with straight-down orientation)
+        result = self.move_cartesian_ik(
+            target_x, y, approach_height,
+            roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True)
         steps.append({"action": "approach_above", "method": "ik", "result": result})
 
         # Step 3: Lower in increments (avoid large joint changes that trigger reflex)
@@ -965,13 +973,17 @@ class FrankaController:
         step_z = 0.04  # 4cm increments
         while current_z - step_z > z + step_z:
             intermediate_z = current_z - step_z
-            result = self.move_cartesian_ik(target_x, y, intermediate_z, confirmed=True)
+            result = self.move_cartesian_ik(
+                target_x, y, intermediate_z,
+                roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True)
             steps.append({"action": "lower_step", "method": "ik", "target_z": round(intermediate_z, 4), "result": result})
             state = self.get_state()
             current_z = state.ee_position[2]
 
         # Final lower to grasp height
-        result = self.move_cartesian_ik(target_x, y, z, confirmed=True)
+        result = self.move_cartesian_ik(
+            target_x, y, z,
+            roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True)
         steps.append({"action": "lower_to_grasp", "method": "ik", "result": result})
         state = self.get_state()
         actual_z = state.ee_position[2]
@@ -990,11 +1002,12 @@ class FrankaController:
         grasped = actual_grip > min_grip and actual_grip < grasp_width + 0.005
         steps.append({"action": "check_grasp", "gripper_width": round(actual_grip, 4), "grasped": grasped})
 
-        # Step 5: Lift (IK to avoid drift)
+        # Step 5: Lift (IK with straight-down orientation)
         state = self.get_state()
         result = self.move_cartesian_ik(
             state.ee_position[0], state.ee_position[1],
-            state.ee_position[2] + approach_height, confirmed=True)
+            state.ee_position[2] + approach_height,
+            roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True)
         steps.append({"action": "lift", "method": "ik", "result": result})
         state = self.get_state()
 
@@ -1031,23 +1044,34 @@ class FrankaController:
 
         steps = []
 
-        # Step 1: Move above target (IK for accurate positioning)
-        result = self.move_cartesian_ik(x, y, approach_height, confirmed=True)
+        # Standard top-down orientation for placing
+        import math
+        place_roll = math.pi
+        place_pitch = 0.0
+        place_yaw = 0.0
+
+        # Step 1: Move above target (IK with straight-down orientation)
+        result = self.move_cartesian_ik(
+            x, y, approach_height,
+            roll=place_roll, pitch=place_pitch, yaw=place_yaw, confirmed=True)
         steps.append({"action": "move_above", "method": "ik", "result": result})
 
         # Step 2: Lower to place height (IK for reliable low-Z reach)
-        result = self.move_cartesian_ik(x, y, z, confirmed=True)
+        result = self.move_cartesian_ik(
+            x, y, z,
+            roll=place_roll, pitch=place_pitch, yaw=place_yaw, confirmed=True)
         steps.append({"action": "lower_to_place", "method": "ik", "result": result})
 
         # Step 3: Open gripper to release
         result = self.gripper_move(0.08)
         steps.append({"action": "release", "result": result})
 
-        # Step 4: Retreat up (IK to avoid drift)
+        # Step 4: Retreat up (IK with straight-down orientation)
         state = self.get_state()
         result = self.move_cartesian_ik(
             state.ee_position[0], state.ee_position[1],
-            state.ee_position[2] + approach_height, confirmed=True)
+            state.ee_position[2] + approach_height,
+            roll=place_roll, pitch=place_pitch, yaw=place_yaw, confirmed=True)
         steps.append({"action": "retreat", "method": "ik", "result": result})
         state = self.get_state()
 

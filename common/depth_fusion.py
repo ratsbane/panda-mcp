@@ -33,7 +33,7 @@ DEFAULT_DEPTH_CALIBRATION = "/tmp/depth_calibration.npz"
 # Clustering params
 GRID_CELL_M = 0.02  # 2cm grid cells (finer = better block separation)
 MIN_CLUSTER_POINTS = 20  # minimum points to form a cluster
-Z_ABOVE_DESK_M = 0.03  # points must be above this height (robot frame, ~1.7cm above desk)
+Z_ABOVE_DESK_M = 0.02  # points must be above this height (robot frame, ~7mm above desk)
 
 # Workspace bounds for filtering (robot frame, meters)
 WORKSPACE_X = (-0.4, 0.75)
