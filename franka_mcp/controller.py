@@ -630,7 +630,7 @@ class FrankaController:
         y = state.ee_position[1] + dy
         z = state.ee_position[2] + dz
 
-        return self.move_cartesian(
+        return self.move_cartesian_ik(
             x, y, z,
             roll=state.ee_orientation[0],
             pitch=state.ee_orientation[1],
@@ -957,6 +957,16 @@ class FrankaController:
         pick_pitch = 0.0
         pick_yaw = 0.0
 
+        # SAWM data collection: start approach if collector is active
+        sawm_active = hasattr(self, '_sawm_collector') and self._sawm_collector is not None
+        if sawm_active:
+            self._sawm_collector.start_approach(target_robot_xy=(x, y))  # use original position
+
+        # SAWM monitor: start background inference if monitor is loaded
+        sawm_monitor = hasattr(self, '_sawm_monitor') and self._sawm_monitor is not None
+        if sawm_monitor:
+            self._sawm_monitor.start(target_xy=(x, y))  # use original position, not offset
+
         # Step 1: Open gripper
         result = self.gripper_move(0.08)
         steps.append({"action": "open_gripper", "result": result})
@@ -966,6 +976,10 @@ class FrankaController:
             target_x, y, approach_height,
             roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True)
         steps.append({"action": "approach_above", "method": "ik", "result": result})
+
+        # SAWM: record frame at approach height
+        if sawm_active:
+            self._sawm_record_frame()
 
         # Step 3: Lower in increments (avoid large joint changes that trigger reflex)
         state = self.get_state()
@@ -980,6 +994,27 @@ class FrankaController:
             state = self.get_state()
             current_z = state.ee_position[2]
 
+            # SAWM: record frame at each Z step
+            if sawm_active:
+                self._sawm_record_frame()
+
+            # SAWM monitor: check for correction (clamped to ±15mm)
+            if sawm_monitor:
+                correction = self._sawm_monitor.get_correction()
+                if correction:
+                    cdx, cdy = correction
+                    MAX_CORRECTION = 0.015  # 15mm max per step
+                    cdx = max(-MAX_CORRECTION, min(MAX_CORRECTION, cdx))
+                    cdy = max(-MAX_CORRECTION, min(MAX_CORRECTION, cdy))
+                    target_x += cdx
+                    y += cdy
+                    steps.append({
+                        "action": "sawm_correction",
+                        "dx_mm": round(cdx * 1000, 1),
+                        "dy_mm": round(cdy * 1000, 1),
+                    })
+                    logger.info(f"SAWM correction applied: dx={cdx*1000:.1f}mm dy={cdy*1000:.1f}mm")
+
         # Final lower to grasp height
         result = self.move_cartesian_ik(
             target_x, y, z,
@@ -988,6 +1023,10 @@ class FrankaController:
         state = self.get_state()
         actual_z = state.ee_position[2]
         steps.append({"action": "check_z", "target_z": z, "actual_z": round(actual_z, 4)})
+
+        # SAWM: record frame at grasp height (closest frame)
+        if sawm_active:
+            self._sawm_record_frame()
 
         # Step 4: Grasp
         result = self.gripper_grasp(width=grasp_width, force=grasp_force)
@@ -1001,6 +1040,18 @@ class FrankaController:
         min_grip = 0.001  # 1mm - below this means fully closed / empty
         grasped = actual_grip > min_grip and actual_grip < grasp_width + 0.005
         steps.append({"action": "check_grasp", "gripper_width": round(actual_grip, 4), "grasped": grasped})
+
+        # SAWM: end approach with grasp result
+        if sawm_active:
+            ee = self.get_state().ee_position
+            self._sawm_collector.end_approach(
+                success=grasped,
+                final_gripper_xy=(ee[0], ee[1]),
+            )
+
+        # SAWM monitor: stop
+        if sawm_monitor:
+            self._sawm_monitor.stop()
 
         # Step 5: Lift (IK with straight-down orientation)
         state = self.get_state()
@@ -1021,6 +1072,28 @@ class FrankaController:
             },
             "steps": steps,
         }
+
+    def _sawm_record_frame(self):
+        """Capture a camera frame and record it for SAWM data collection."""
+        try:
+            from camera_daemon.client import get_camera_client
+            client = get_camera_client()
+            frame = client.get_frame()
+            if frame is None:
+                logger.warning("SAWM: no camera frame available")
+                return
+
+            state = self.get_state()
+            ee = state.ee_position
+            joints = np.array(state.joint_positions)
+
+            self._sawm_collector.record_frame(
+                frame=frame,
+                gripper_robot_xy=(ee[0], ee[1]),
+                joints=joints,
+            )
+        except Exception as e:
+            logger.warning(f"SAWM frame recording failed: {e}")
 
     def place_at(
         self,
@@ -1192,8 +1265,10 @@ class FrankaController:
                         target_x = current.ee_position[0] + state.dx
                         target_y = current.ee_position[1] + state.dy
                         target_z = current.ee_position[2] + state.dz
+                        # Always enforce straight-down orientation to prevent drift accumulation
                         self.move_cartesian_ik(
                             target_x, target_y, target_z,
+                            roll=3.141592653589793, pitch=0.0, yaw=0.0,
                             confirmed=True,
                         )
                     except Exception as e:
@@ -1264,6 +1339,72 @@ class FrankaController:
 
         return result
 
+    # --- VLA autonomous control ---
+
+    def start_vla(self, server_url: str, task: str) -> dict:
+        """Start VLA autonomous control loop."""
+        if not self._connected:
+            return {"success": False, "error": "Not connected"}
+
+        if hasattr(self, '_vla_client') and self._vla_client is not None:
+            status = self._vla_client.get_status()
+            if status.get("active"):
+                return {"success": False, "error": "VLA already active"}
+
+        # Stop jog if active (mutual exclusion)
+        if hasattr(self, '_jog_active') and self._jog_active:
+            self.stop_jog()
+
+        from .vla_client import VLAClient
+        self._vla_client = VLAClient(self, server_url, task)
+        result = self._vla_client.start()
+
+        if result.get("success"):
+            result["controls"] = {
+                "stop": "Call vla_disable to stop",
+                "status": "Call vla_status to check progress",
+            }
+
+        return result
+
+    def stop_vla(self) -> dict:
+        """Stop VLA autonomous control."""
+        if not hasattr(self, '_vla_client') or self._vla_client is None:
+            return {"success": False, "error": "VLA not active"}
+
+        result = self._vla_client.stop()
+
+        # Include final position
+        if self._connected:
+            state = self.get_state()
+            result["final_position"] = {
+                "x": round(state.ee_position[0], 4),
+                "y": round(state.ee_position[1], 4),
+                "z": round(state.ee_position[2], 4),
+            }
+            result["gripper_width"] = round(state.gripper_width, 4)
+
+        self._vla_client = None
+        return result
+
+    def get_vla_status(self) -> dict:
+        """Get current VLA control status."""
+        if not hasattr(self, '_vla_client') or self._vla_client is None:
+            result = {"active": False}
+        else:
+            result = self._vla_client.get_status()
+
+        if self._connected:
+            state = self.get_state()
+            result["position"] = {
+                "x": round(state.ee_position[0], 4),
+                "y": round(state.ee_position[1], 4),
+                "z": round(state.ee_position[2], 4),
+            }
+            result["gripper_width"] = round(state.gripper_width, 4)
+
+        return result
+
     def teaching_mode(self, active: bool) -> dict:
         """
         Enable/disable teaching mode (gravity compensation).
@@ -1297,6 +1438,251 @@ class FrankaController:
         except Exception as e:
             logger.error(f"Teaching mode failed: {e}")
             return {"success": False, "error": str(e)}
+
+    # --- Skill episode logging ---
+
+    def start_skill_episode(self, task: str) -> dict:
+        """Start logging skill calls for VLM training data collection."""
+        from common.skill_logger import SkillLogger
+        if hasattr(self, '_skill_logger') and self._skill_logger and self._skill_logger.active:
+            return {"success": False, "error": "Skill episode already active"}
+        self._skill_logger = SkillLogger()
+        return self._skill_logger.start_episode(task)
+
+    def stop_skill_episode(self, success: bool) -> dict:
+        """Stop skill episode logging, capture final 'done' frame."""
+        if not hasattr(self, '_skill_logger') or not self._skill_logger or not self._skill_logger.active:
+            return {"success": False, "error": "No active skill episode"}
+        result = self._skill_logger.end_episode(success)
+        return result
+
+    def get_skill_episode_status(self) -> dict:
+        """Get current skill episode logging status."""
+        if not hasattr(self, '_skill_logger') or not self._skill_logger:
+            return {"active": False}
+        return self._skill_logger.get_status()
+
+    def list_skill_episodes(self) -> dict:
+        """List all collected skill episodes."""
+        from common.skill_logger import SkillLogger
+        if not hasattr(self, '_skill_logger') or not self._skill_logger:
+            self._skill_logger = SkillLogger()
+        return self._skill_logger.list_episodes()
+
+    # --- SAWM data collection ---
+
+    def sawm_enable(self, model_path: str) -> dict:
+        """Enable SAWM inference monitor for trajectory correction during picks."""
+        try:
+            from common.sawm.monitor import SAWMMonitor
+            self._sawm_monitor = SAWMMonitor(model_path)
+            return {
+                "success": True,
+                "message": f"SAWM monitor loaded from {model_path}. Will correct pick trajectories.",
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def sawm_disable(self) -> dict:
+        """Disable SAWM inference monitor."""
+        if not hasattr(self, '_sawm_monitor') or self._sawm_monitor is None:
+            return {"success": False, "error": "SAWM monitor not active"}
+
+        if self._sawm_monitor.active:
+            self._sawm_monitor.stop()
+
+        status = self._sawm_monitor.get_status()
+        self._sawm_monitor = None
+        return {
+            "success": True,
+            "message": "SAWM monitor disabled.",
+            "final_status": status,
+        }
+
+    def sawm_status(self) -> dict:
+        """Get SAWM monitor status."""
+        if not hasattr(self, '_sawm_monitor') or self._sawm_monitor is None:
+            return {"active": False, "monitor_loaded": False}
+        result = self._sawm_monitor.get_status()
+        result["monitor_loaded"] = True
+        return result
+
+    def sawm_collect_enable(self) -> dict:
+        """Enable SAWM data collection during pick_at() calls."""
+        from common.sawm.data_collector import get_collector
+        self._sawm_collector = get_collector()
+        return {
+            "success": True,
+            "message": "SAWM data collection enabled. Frames will be recorded during pick_at().",
+            "stats": self._sawm_collector.get_stats(),
+        }
+
+    def sawm_collect_disable(self) -> dict:
+        """Disable SAWM data collection."""
+        if not hasattr(self, '_sawm_collector') or self._sawm_collector is None:
+            return {"success": False, "error": "SAWM collection not active"}
+
+        # End any in-progress approach
+        if self._sawm_collector.active:
+            self._sawm_collector.end_approach(success=False, final_gripper_xy=(0, 0))
+
+        stats = self._sawm_collector.get_stats()
+        self._sawm_collector = None
+        return {
+            "success": True,
+            "message": "SAWM data collection disabled.",
+            "stats": stats,
+        }
+
+    def sawm_collect_stats(self) -> dict:
+        """Get SAWM data collection statistics."""
+        from common.sawm.data_collector import get_collector
+        collector = self._sawm_collector if hasattr(self, '_sawm_collector') and self._sawm_collector else get_collector()
+        return collector.get_stats()
+
+    # --- Plan executor ---
+
+    def execute_plan(self, steps: list[dict]) -> dict:
+        """
+        Execute a sequence of skill commands back-to-back with no inter-step
+        latency. Claude plans the full sequence, robot executes it all at once.
+
+        Supported skills:
+            pick  — pick_at(x, y, z?, grasp_width?, grasp_force?, approach_height?)
+            place — place_at(x, y, z?, approach_height?)
+            move  — move_cartesian_ik(x, y, z)
+            open_gripper — gripper_move(width?)
+            grasp — gripper_grasp(width?, force?)
+            home  — move to safe home position above table
+            wait  — pause for seconds
+        """
+        if not self._connected:
+            return {"success": False, "error": "Not connected"}
+
+        if not steps:
+            return {"success": False, "error": "No steps provided"}
+
+        results = []
+        t_plan_start = time.time()
+
+        # Check if skill logging is active
+        _logging = hasattr(self, '_skill_logger') and self._skill_logger and self._skill_logger.active
+
+        for i, step in enumerate(steps):
+            skill = step.get("skill")
+            t_step = time.time()
+            logger.info(f"Plan step {i+1}/{len(steps)}: {skill} {step}")
+
+            # Log skill BEFORE execution (captures pre-action frame)
+            step_params = {k: v for k, v in step.items() if k != "skill"}
+            if _logging:
+                self._skill_logger.log_skill(skill, step_params)
+
+            try:
+                if skill == "pick":
+                    r = self.pick_at(
+                        x=step["x"],
+                        y=step["y"],
+                        z=step.get("z", 0.013),
+                        grasp_width=step.get("grasp_width", 0.03),
+                        grasp_force=step.get("grasp_force", 70.0),
+                        x_offset=step.get("x_offset", 0.0),
+                        approach_height=step.get("approach_height", 0.15),
+                    )
+
+                elif skill == "place":
+                    r = self.place_at(
+                        x=step["x"],
+                        y=step["y"],
+                        z=step.get("z", 0.08),
+                        approach_height=step.get("approach_height", 0.15),
+                    )
+
+                elif skill == "move":
+                    r = self.move_cartesian_ik(
+                        x=step["x"],
+                        y=step["y"],
+                        z=step["z"],
+                        roll=step.get("roll"),
+                        pitch=step.get("pitch"),
+                        yaw=step.get("yaw"),
+                        confirmed=True,
+                    )
+
+                elif skill == "open_gripper":
+                    r = self.gripper_move(width=step.get("width", 0.08))
+
+                elif skill == "grasp":
+                    r = self.gripper_grasp(
+                        width=step.get("width", 0.03),
+                        force=step.get("force", 70.0),
+                        speed=step.get("speed", 0.1),
+                    )
+
+                elif skill == "home":
+                    r = self.move_cartesian_ik(
+                        x=0.4, y=0.0, z=0.3,
+                        roll=3.14159, pitch=0.0, yaw=0.0,
+                        confirmed=True,
+                    )
+
+                elif skill == "wait":
+                    seconds = step.get("seconds", 1.0)
+                    time.sleep(seconds)
+                    r = {"success": True, "waited": seconds}
+
+                else:
+                    r = {"success": False, "error": f"Unknown skill: {skill}"}
+
+                # Update skill log with execution result
+                if _logging:
+                    self._skill_logger.update_last_result(r)
+
+                step_ms = (time.time() - t_step) * 1000
+                results.append({
+                    "step": i + 1,
+                    "skill": skill,
+                    "duration_ms": round(step_ms),
+                    "result": r,
+                })
+
+                # Stop on failure
+                if not r.get("success", True):
+                    logger.warning(f"Plan step {i+1} failed: {r}")
+                    break
+
+            except Exception as e:
+                logger.error(f"Plan step {i+1} exception: {e}")
+                results.append({
+                    "step": i + 1,
+                    "skill": skill,
+                    "error": str(e),
+                })
+                break
+
+        total_ms = (time.time() - t_plan_start) * 1000
+        completed = len(results)
+        all_ok = all(r.get("result", {}).get("success", True) for r in results if "error" not in r)
+
+        # Final position
+        final_pos = None
+        if self._connected:
+            state = self.get_state()
+            final_pos = {
+                "x": round(state.ee_position[0], 4),
+                "y": round(state.ee_position[1], 4),
+                "z": round(state.ee_position[2], 4),
+                "gripper_width": round(state.gripper_width, 4),
+            }
+
+        return {
+            "success": all_ok,
+            "steps_completed": completed,
+            "steps_total": len(steps),
+            "total_duration_ms": round(total_ms),
+            "final_position": final_pos,
+            "results": results,
+        }
 
 
 # Singleton controller

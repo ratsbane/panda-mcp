@@ -51,7 +51,13 @@ async def list_tools() -> list[Tool]:
             ),
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "save_path": {
+                        "type": "string",
+                        "description": "Auto-save scan to this path (default: /tmp/phoxi_scan.npz). Set to empty string to skip saving.",
+                        "default": "/tmp/phoxi_scan.npz",
+                    },
+                },
             },
         ),
         Tool(
@@ -137,6 +143,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "capture_depth":
             result = await client.capture()
+            save_path = arguments.get("save_path", "/tmp/phoxi_scan.npz")
+            if save_path and result.get("success"):
+                save_result = client.save_npz(save_path)
+                result["saved"] = save_path
+                result["save_size_bytes"] = save_result.get("size_bytes", 0)
             return json_response(result)
 
         elif name == "get_depth_at":

@@ -310,6 +310,8 @@ def match_yolo_to_depth(
     usb_homography: np.ndarray,
     table_z: float = 0.013,
     threshold_m: float = MATCH_THRESHOLD_M,
+    camera_matrix: np.ndarray = None,
+    dist_coeffs: np.ndarray = None,
 ) -> list[Object3D]:
     """
     Match YOLO 2D detections to depth 3D clusters by robot XY proximity.
@@ -320,6 +322,8 @@ def match_yolo_to_depth(
         usb_homography: 3x3 homography matrix (pixel -> robot XY)
         table_z: Table height in robot frame (for yolo_only fallback)
         threshold_m: Max XY distance for matching
+        camera_matrix: Optional 3x3 intrinsic matrix for lens undistortion
+        dist_coeffs: Optional distortion coefficients for lens undistortion
 
     Returns:
         List of Object3D (fused, yolo_only, and depth_only)
@@ -330,6 +334,11 @@ def match_yolo_to_depth(
     yolo_robot_xy = []
     for det in yolo_detections:
         cx, cy = det.bbox.center
+        # Apply lens undistortion if available
+        if camera_matrix is not None and dist_coeffs is not None:
+            pts = np.array([[[cx, cy]]], dtype=np.float64)
+            undist = cv2.undistortPoints(pts, camera_matrix, dist_coeffs, P=camera_matrix)
+            cx, cy = float(undist[0, 0, 0]), float(undist[0, 0, 1])
         pt = np.array([[cx, cy]], dtype=np.float32).reshape(-1, 1, 2)
         transformed = cv2.perspectiveTransform(pt, usb_homography)
         rx, ry = float(transformed[0, 0, 0]), float(transformed[0, 0, 1])
@@ -507,6 +516,8 @@ def build_scene_graph(
     usb_cal = np.load(usb_calibration_path, allow_pickle=True)
     homography = usb_cal["H"]
     table_z = float(usb_cal.get("table_z", 0.013))
+    camera_matrix = usb_cal["camera_matrix"] if "camera_matrix" in usb_cal else None
+    dist_coeffs = usb_cal["dist_coeffs"] if "dist_coeffs" in usb_cal else None
 
     depth_cal = np.load(depth_calibration_path)
     transform = depth_cal["transform"]  # 4x4 SE(3)
@@ -534,7 +545,37 @@ def build_scene_graph(
     objects = match_yolo_to_depth(
         yolo_detections, clusters, homography,
         table_z=table_z,
+        camera_matrix=camera_matrix,
+        dist_coeffs=dist_coeffs,
     )
+
+    # Enrich depth-only objects: sample color from USB frame, classify by size
+    H_inv = np.linalg.inv(homography)
+    h, w = frame.shape[:2]
+    for obj in objects:
+        if obj.source == "depth_only" and obj.label == "unknown":
+            # Project robot XY to USB camera pixel
+            rx, ry = obj.position_m[0], obj.position_m[1]
+            pt = np.array([[rx, ry]], dtype=np.float32).reshape(-1, 1, 2)
+            pixel = cv2.perspectiveTransform(pt, H_inv)
+            px, py = int(pixel[0, 0, 0]), int(pixel[0, 0, 1])
+
+            if 0 <= px < w and 0 <= py < h:
+                # Sample color from a small patch around the projected point
+                r = 5
+                patch = frame[max(0, py-r):min(h, py+r), max(0, px-r):min(w, px+r)]
+                if patch.size > 0:
+                    avg_bgr = tuple(int(x) for x in patch.mean(axis=(0, 1)))
+                    obj.color_name = _identify_color(avg_bgr)
+
+            # Classify by dimensions: small cube-shaped → "block"
+            dx, dy, dz = obj.dimensions_m
+            max_dim = max(dx, dy)
+            if max_dim < 0.06 and dz < 0.06 and dz > 0.005:
+                color_str = f"{obj.color_name} " if obj.color_name else ""
+                obj.label = f"{color_str}block"
+            elif obj.color_name:
+                obj.label = f"{obj.color_name} object"
 
     # Generate summary
     summary = _generate_summary(objects)

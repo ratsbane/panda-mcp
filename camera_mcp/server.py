@@ -34,7 +34,7 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="connect",
-            description="Connect to the USB camera. Call this before capturing frames.",
+            description="Connect to the USB camera. Other tools auto-connect, so this is only needed to force a reconnect or change device.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -197,16 +197,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
     controller = get_camera_controller()
     
     try:
+        # Auto-connect for any tool that needs the camera
+        if name != "connect" and not controller.connected:
+            conn_result = controller.connect()
+            if not conn_result.get("connected"):
+                return json_response({"error": f"Auto-connect failed: {conn_result.get('error', 'unknown')}"})
+            logger.info("Camera auto-connected")
+
         if name == "connect":
             device = arguments.get("device", 0)
             controller.config.device = device
+            # Disconnect first to force a fresh connection
+            controller.disconnect()
             result = controller.connect()
             return json_response(result)
-        
+
         elif name == "capture_frame":
-            if not controller.connected:
-                return json_response({"error": "Camera not connected. Call 'connect' first."})
-            
             result = controller.capture_frame(
                 width=arguments.get("width"),
                 height=arguments.get("height"),
@@ -236,9 +242,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
                 return json_response(result)
         
         elif name == "capture_burst":
-            if not controller.connected:
-                return json_response({"error": "Camera not connected. Call 'connect' first."})
-            
             result = controller.capture_burst(
                 count=arguments.get("count", 5),
                 interval_ms=arguments.get("interval_ms", 100),
@@ -270,9 +273,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
                 return json_response(result)
         
         elif name == "get_camera_info":
-            if not controller.connected:
-                return json_response({"error": "Camera not connected"})
-            
             info = controller.get_info()
             return json_response(info.to_dict())
         
@@ -284,9 +284,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
             return json_response(result)
 
         elif name == "describe_scene":
-            if not controller.connected:
-                return json_response({"error": "Camera not connected. Call 'connect' first."})
-
             # Capture raw frame
             frame = controller.capture_raw()
             if frame is None:
@@ -334,9 +331,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
             return responses
 
         elif name == "describe_scene_3d":
-            if not controller.connected:
-                return json_response({"error": "Camera not connected. Call 'connect' first."})
-
             # Capture raw frame from USB camera
             frame = controller.capture_raw()
             if frame is None:

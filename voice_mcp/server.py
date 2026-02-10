@@ -24,7 +24,10 @@ logger = logging.getLogger(__name__)
 server = Server("voice-mcp")
 
 # Configuration via environment variables with sensible defaults
-PIPER_PATH = os.environ.get("PIPER_PATH") or shutil.which("piper") or "piper"
+_venv_piper = Path(__import__("sys").executable).parent / "piper"
+PIPER_PATH = os.environ.get("PIPER_PATH") or (
+    str(_venv_piper) if _venv_piper.exists() else (shutil.which("piper") or "piper")
+)
 VOICES_DIR = Path(os.environ.get("VOICES_DIR", Path.home() / ".local" / "share" / "piper-voices"))
 DEFAULT_VOICE = os.environ.get("PIPER_VOICE", "en_US-lessac-medium")
 AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE", "default")

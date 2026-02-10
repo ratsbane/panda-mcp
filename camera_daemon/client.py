@@ -79,6 +79,9 @@ class CameraClient:
         self.socket = self.context.socket(zmq.SUB)
         self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, "frame")
+        # Limit receive queue to 1 message — drops stale frames
+        # Note: ZMQ_CONFLATE doesn't work with multipart messages (causes SIGABRT)
+        self.socket.setsockopt(zmq.RCVHWM, 1)
 
         # Try primary endpoint first (IPC)
         try:
@@ -102,6 +105,7 @@ class CameraClient:
                 self.socket = self.context.socket(zmq.SUB)
                 self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
                 self.socket.setsockopt_string(zmq.SUBSCRIBE, "frame")
+                self.socket.setsockopt(zmq.RCVHWM, 1)
                 self.socket.connect(self.fallback_endpoint)
 
                 self._receive_frame_internal()
