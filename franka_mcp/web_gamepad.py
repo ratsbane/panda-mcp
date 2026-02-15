@@ -4,17 +4,18 @@ Runs a WebSocket server on a configurable port. Browser clients connect and send
 gamepad state (stick positions, button events). Provides the same get_state()
 interface as GamepadHandler so the jog loop can consume from either source.
 
-Protocol (browser → server):
+Protocol (browser -> server):
   {"type": "state", "dx": 0.01, "dy": 0.0, "dz": 0.0, "speed_name": "medium", ...}
   {"type": "event", "action": "grasp"}
 
-Protocol (server → browser):
+Protocol (server -> browser):
   {"type": "status", "position": {"x": 0.4, "y": 0.0, "z": 0.3}, ...}
 """
 
 import asyncio
 import json
 import logging
+import socket
 import threading
 import time
 
@@ -44,6 +45,8 @@ class WebGamepad:
         self._last_input_time = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._clients: set = set()
+        self._ready = threading.Event()
+        self._start_error: str | None = None
         # Status dict pushed to browser (updated by jog loop via update_status)
         self._status: dict = {}
         self._status_lock = threading.Lock()
@@ -51,10 +54,21 @@ class WebGamepad:
     def start(self) -> dict:
         """Start the WebSocket server in a background thread."""
         self._running = True
+        self._ready.clear()
+        self._start_error = None
         self._thread = threading.Thread(target=self._run_server, daemon=True)
         self._thread.start()
-        # Wait for server to bind
-        time.sleep(0.3)
+
+        # Wait for server to actually bind (or fail)
+        if not self._ready.wait(timeout=5.0):
+            error = self._start_error or "WebSocket server failed to start (timeout)"
+            logger.error(error)
+            self._running = False
+            return {"success": False, "error": error}
+
+        if self._start_error:
+            return {"success": False, "error": self._start_error}
+
         return {
             "success": True,
             "controller": f"WebSocket ws://0.0.0.0:{self.port}",
@@ -63,27 +77,61 @@ class WebGamepad:
 
     def _run_server(self):
         """Run asyncio event loop with WebSocket server."""
+        # Create a fresh event loop for this thread (don't touch the main thread's loop)
         self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
         try:
             self._loop.run_until_complete(self._serve())
         except Exception as e:
-            logger.error(f"WebGamepad server error: {e}")
+            self._start_error = str(e)
+            logger.error(f"WebGamepad server error: {e}", exc_info=True)
+            self._ready.set()  # Unblock start() even on failure
+        finally:
+            try:
+                self._loop.close()
+            except Exception:
+                pass
 
     async def _serve(self):
         """Start WebSocket server and run until stopped."""
         import websockets
 
-        async with websockets.serve(
-            self._handle_client,
-            self.host,
-            self.port,
-            ping_interval=20,
-            ping_timeout=10,
-        ):
-            logger.info(f"WebGamepad listening on ws://{self.host}:{self.port}")
+        # Bind socket manually with SO_REUSEADDR for clean restarts
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((self.host, self.port))
+        except OSError as e:
+            self._start_error = f"Cannot bind port {self.port}: {e}"
+            self._ready.set()
+            sock.close()
+            return
+        sock.listen(8)
+        sock.setblocking(False)
+
+        try:
+            server = await websockets.serve(
+                self._handle_client,
+                sock=sock,
+                ping_interval=20,
+                ping_timeout=10,
+            )
+        except Exception as e:
+            self._start_error = f"websockets.serve failed: {e}"
+            logger.error(self._start_error, exc_info=True)
+            self._ready.set()
+            sock.close()
+            return
+
+        logger.info(f"WebGamepad listening on ws://{self.host}:{self.port}")
+        self._ready.set()  # Signal success to start()
+
+        try:
             while self._running:
                 await asyncio.sleep(0.1)
+        finally:
+            server.close()
+            await server.wait_closed()
+            logger.info("WebGamepad server shut down cleanly")
 
     async def _handle_client(self, websocket):
         """Handle a single WebSocket client."""
@@ -209,11 +257,9 @@ class WebGamepad:
     def stop(self):
         """Stop the WebSocket server."""
         self._running = False
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        # Give the serve loop a moment to see _running=False and clean up
         if self._thread:
-            self._thread.join(timeout=3.0)
-        # Clean up the event loop
+            self._thread.join(timeout=5.0)
         if self._loop and not self._loop.is_closed():
             try:
                 self._loop.close()

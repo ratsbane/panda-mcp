@@ -125,19 +125,22 @@ def _solve_ik(
     """
     Solve analytical IK for a target Cartesian pose.
 
-    Uses a multi-objective cost function to avoid awkward configurations:
-    - Minimize joint travel from current position (smooth motion)
-    - Penalize deviation from reference pose (consistent arm posture)
-    - Penalize joints near their limits (stay away from singularities)
-    - Reject solutions requiring large single-joint jumps
-    - Optionally freeze specific joints to eliminate redundancy
+    Uses guided IK that prefers canonical top-down configurations:
+    - Joint 0 (base) tracks atan2(y, x) to point toward target
+    - Joint 2 (upper arm twist) strongly held near 0
+    - Joints 1, 3 handle reach and height flexibly
+    - Joints 4, 5, 6 maintain gripper orientation
+
+    This prevents contorted configurations by scoring against a
+    target-adaptive reference pose rather than just minimizing
+    travel from the current configuration.
 
     Args:
         position: Target [x, y, z] in meters
         orientation_quat: Target quaternion [x, y, z, w]
         current_joints: Current 7 joint angles (used as seed)
-        max_single_joint_change: Reject solutions where any single joint
-            moves more than this (radians). Default 0.8 (~46 deg).
+        max_single_joint_change: Global max per-joint change (radians).
+            Joint 0 gets 2x this limit, joint 2 gets 0.5x.
         frozen_joints: Dict mapping joint index to desired value.
             Solutions where a frozen joint deviates by more than 0.05 rad
             (~3 deg) are rejected. E.g. {2: 0.0} freezes the elbow swivel.
@@ -148,17 +151,43 @@ def _solve_ik(
     if not PANDA_PY_AVAILABLE:
         return None
 
+    import math
+
+    x, y, z = position
+
     # Build 4x4 SE(3) target pose
     R = quaternion_to_rotation_matrix(orientation_quat)
     T = np.eye(4)
     T[:3, :3] = R
     T[:3, 3] = position
 
+    # --- Guided IK: compute target-adaptive reference ---
+
+    # Desired base rotation: point the arm toward target in XY plane
+    q0_desired = math.atan2(y, x)
+
+    # Adaptive reference: natural top-down reaching configuration
+    # q0 tracks target, q2 stays at 0, others at comfortable defaults
+    reference = np.array([q0_desired, -0.5, 0.0, -2.0, 0.0, 1.8, 0.785])
+
+    # Per-joint max change limits (radians)
+    # q0: lenient — base must swing freely for lateral movement
+    # q2: tight — upper arm twist should barely change
+    per_joint_max = np.array([
+        max_single_joint_change * 2.0,   # q0: base pan — let it move
+        max_single_joint_change,          # q1: shoulder lift
+        max_single_joint_change * 0.5,   # q2: upper arm twist — restrict
+        max_single_joint_change,          # q3: elbow flex
+        max_single_joint_change,          # q4: forearm twist
+        max_single_joint_change,          # q5: wrist flex
+        max_single_joint_change,          # q6: wrist roll
+    ])
+
     best_solution = None
     best_cost = float('inf')
 
-    # Try multiple q_7 values to explore the null space
-    q7_candidates = [0.785, 0.0, -0.785, 1.57]
+    # Broader null-space search with more q7 candidates
+    q7_candidates = [0.785, 0.0, -0.785, 1.57, -1.57, 0.4, -0.4]
 
     for q7 in q7_candidates:
         try:
@@ -185,59 +214,76 @@ def _solve_ik(
             if not in_limits:
                 continue
 
-            # Reject large single-joint jumps (prevents arm reconfiguration)
+            # Per-joint max change filter
             joint_changes = np.abs(sol - current_joints)
-            if np.max(joint_changes) > max_single_joint_change:
+            if np.any(joint_changes > per_joint_max):
+                worst = int(np.argmax(joint_changes))
                 logger.debug(
-                    f"IK: rejected solution, max joint change "
-                    f"{np.max(joint_changes):.2f} rad on joint {np.argmax(joint_changes)}"
+                    f"IK: rejected, joint {worst} change "
+                    f"{joint_changes[worst]:.2f} > limit {per_joint_max[worst]:.2f}"
                 )
                 continue
+
+            # Frozen joints check
+            if frozen_joints:
+                frozen_ok = True
+                for ji, jval in frozen_joints.items():
+                    if abs(sol[ji] - jval) > 0.05:
+                        frozen_ok = False
+                        break
+                if not frozen_ok:
+                    continue
 
             # Verify with FK: position error < 2mm
             try:
                 fk_pose = panda_py.fk(sol)
-                fk_pos = fk_pose[:3, 3]
-                pos_error = np.linalg.norm(fk_pos - position)
+                pos_error = np.linalg.norm(fk_pose[:3, 3] - position)
                 if pos_error > 0.002:
                     continue
             except Exception:
                 continue
 
-            # Cost function — prefer wrist moves over base moves, stay near center
-            #
-            # Per-joint travel weights: base joints expensive, wrist joints cheap
-            # Joint 0 (shoulder pan) through 6 (wrist rotation)
-            joint_travel_weights = np.array([8.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0])
-            travel_cost = np.sum(joint_travel_weights * (sol - current_joints) ** 2)
-            # Joint-center cost — keep all joints near middle of range
+            # --- Cost function: reference + travel + center ---
+
+            # Reference matching: prefer canonical top-down configurations
+            # High weight on q0 (track target) and q2 (no twist)
+            ref_weights = np.array([8.0, 0.5, 15.0, 0.5, 5.0, 0.5, 0.3])
+            ref_cost = np.sum(ref_weights * (sol - reference) ** 2)
+
+            # Travel from current: smooth motion, but q0 moves freely
+            travel_weights = np.array([1.0, 3.0, 8.0, 3.0, 2.0, 2.0, 1.0])
+            travel_cost = np.sum(travel_weights * (sol - current_joints) ** 2)
+
+            # Joint center: stay away from limits
             normalized_pos = (sol - _JOINT_CENTERS) / (_JOINT_RANGES / 2)
-            center_cost = 5.0 * np.sum(normalized_pos ** 2)
-            # Frozen joints — strong preference to keep near desired value
+            center_cost = 3.0 * np.sum(normalized_pos ** 2)
+
+            # Frozen joints penalty
             frozen_cost = 0.0
             if frozen_joints:
                 for ji, jval in frozen_joints.items():
                     frozen_cost += 20.0 * (sol[ji] - jval) ** 2
 
-            cost = travel_cost + center_cost + frozen_cost
+            cost = ref_cost + travel_cost + center_cost + frozen_cost
             if cost < best_cost:
                 best_cost = cost
                 best_solution = sol
 
-    # If max_single_joint_change filtered everything out, retry with relaxed limit
+    # If per-joint limits filtered everything, retry with relaxed limits
     if best_solution is None and max_single_joint_change < 2.0:
-        logger.info("IK: no solution within joint change limit, retrying with relaxed limit")
+        logger.info("Guided IK: retrying with relaxed per-joint limits")
         return _solve_ik(position, orientation_quat, current_joints,
                         max_single_joint_change=2.0, frozen_joints=frozen_joints)
 
     if best_solution is not None:
         max_change = np.max(np.abs(best_solution - current_joints))
         logger.info(
-            f"IK solution found (cost={best_cost:.3f}, q7={best_solution[6]:.3f}, "
-            f"max_joint_change={max_change:.2f} rad)"
+            f"IK solution: cost={best_cost:.1f}, q0={best_solution[0]:.3f} "
+            f"(desired={q0_desired:.3f}), q2={best_solution[2]:.3f}, "
+            f"max_change={max_change:.2f} rad"
         )
     else:
-        logger.warning("No valid IK solution found")
+        logger.warning(f"No valid IK solution for target ({x:.3f}, {y:.3f}, {z:.3f})")
 
     return best_solution
 
@@ -1292,10 +1338,9 @@ class FrankaController:
 
         self._jog_active = True
         self._jog_recording = record
-        # Freeze joint 2 (elbow swivel) at current value to eliminate redundancy
-        current_state = self.get_state()
-        self._jog_frozen_joints = {2: current_state.joint_positions[2]}
-        logger.info(f"Jog: freezing joint 2 at {current_state.joint_positions[2]:.3f} rad")
+        # Guided IK handles q2 preference via reference cost (weight 15.0),
+        # no need for hard frozen_joints filter which was too restrictive (0.05 rad)
+        self._jog_frozen_joints = None
         self._jog_thread = threading.Thread(target=self._jog_loop, daemon=True)
         self._jog_thread.start()
 
@@ -1413,7 +1458,7 @@ class FrankaController:
                                 speed_factor=0.2,
                             )
                             if hasattr(self, '_jog_frozen_joints'):
-                                self._jog_frozen_joints = {2: 0.0}
+                                self._jog_frozen_joints = None
                         except Exception as e:
                             logger.warning(f"Home failed: {e}")
 
@@ -1443,12 +1488,17 @@ class FrankaController:
                         target_y = current.ee_position[1] + state.dy
                         target_z = current.ee_position[2] + state.dz
                         # Use D-pad pitch/yaw from gamepad state
-                        self.move_cartesian_ik(
+                        result = self.move_cartesian_ik(
                             target_x, target_y, target_z,
                             roll=3.141592653589793, pitch=state.pitch, yaw=state.yaw,
                             confirmed=True,
                             frozen_joints=getattr(self, '_jog_frozen_joints', None),
                         )
+                        if not result.get("success"):
+                            logger.warning(
+                                f"Jog IK failed: {result.get('error', 'unknown')} "
+                                f"target=({target_x:.3f},{target_y:.3f},{target_z:.3f})"
+                            )
                         self._jog_last_pitch = state.pitch
                         self._jog_last_yaw = state.yaw
                     except Exception as e:
