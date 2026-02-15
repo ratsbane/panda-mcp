@@ -108,19 +108,34 @@ class SAWMNet(nn.Module):
         return f"{total:,} total, {trainable:,} trainable"
 
 
+class _SAWMNetDenormalized(nn.Module):
+    """Wrapper that bakes denormalization into forward() for ONNX export."""
+
+    def __init__(self, model: SAWMNet):
+        super().__init__()
+        self.model = model
+
+    def forward(self, image: torch.Tensor, crop_scale: torch.Tensor):
+        offset_norm, pred_scale = self.model(image, crop_scale)
+        offset_m = offset_norm * self.model.offset_std + self.model.offset_mean
+        return offset_m, pred_scale
+
+
 def export_onnx(
     model: SAWMNet,
     output_path: str,
     input_size: Tuple[int, int] = (224, 224),
 ):
-    """Export SAWMNet to ONNX for Pi deployment."""
+    """Export SAWMNet to ONNX for Pi deployment. Output is in meters."""
     model.eval()
+    wrapper = _SAWMNetDenormalized(model)
+    wrapper.eval()
 
     dummy_image = torch.randn(1, 3, *input_size)
     dummy_scale = torch.tensor([[0.5]])
 
     torch.onnx.export(
-        model,
+        wrapper,
         (dummy_image, dummy_scale),
         output_path,
         input_names=['image', 'crop_scale'],

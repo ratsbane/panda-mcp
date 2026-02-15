@@ -93,6 +93,7 @@ class ProgressiveCropper:
         frame: np.ndarray,
         target_robot_xy: Tuple[float, float],
         gripper_robot_xy: Tuple[float, float],
+        gripper_z: Optional[float] = None,
     ) -> Tuple[np.ndarray, float]:
         """
         Compute a progressive crop centered between gripper and target.
@@ -101,6 +102,7 @@ class ProgressiveCropper:
             frame: Full camera frame (H, W, 3) BGR
             target_robot_xy: Target position in robot frame (meters)
             gripper_robot_xy: Gripper position in robot frame (meters)
+            gripper_z: Gripper height in meters (used for scale if provided)
 
         Returns:
             (crop_224x224, crop_scale) — the resized crop and its scale value
@@ -110,10 +112,16 @@ class ProgressiveCropper:
         h, w = frame.shape[:2]
         self._frame_shape = (h, w)
 
-        # Distance in robot frame
-        dx = target_robot_xy[0] - gripper_robot_xy[0]
-        dy = target_robot_xy[1] - gripper_robot_xy[1]
-        distance = np.sqrt(dx * dx + dy * dy)
+        # Use Z height for distance if provided (top-down approach),
+        # otherwise fall back to XY distance
+        if gripper_z is not None:
+            # Table is at ~0.013m, so distance = height above table
+            TABLE_Z = 0.013
+            distance = max(0.0, gripper_z - TABLE_Z)
+        else:
+            dx = target_robot_xy[0] - gripper_robot_xy[0]
+            dy = target_robot_xy[1] - gripper_robot_xy[1]
+            distance = np.sqrt(dx * dx + dy * dy)
 
         # Crop scale and fraction
         scale = self.compute_crop_scale(distance)
@@ -167,6 +175,29 @@ class ProgressiveCropper:
         crop = cv2.resize(crop, (self.OUTPUT_SIZE, self.OUTPUT_SIZE))
 
         return crop, scale
+
+    def compute_servo_crop(
+        self,
+        frame: np.ndarray,
+        target_xy_estimate: Tuple[float, float],
+        gripper_xy: Tuple[float, float],
+    ) -> Tuple[np.ndarray, float]:
+        """
+        Crop for servo mode — uses XY distance for scale (no Z height).
+
+        During visual servoing the gripper is tilted forward, so Z height
+        doesn't correspond to distance-to-target. Instead, scale is based
+        on the 2D XY distance between gripper and estimated target.
+
+        Args:
+            frame: Full camera frame (H, W, 3) BGR
+            target_xy_estimate: Estimated target position in robot frame (meters)
+            gripper_xy: Current gripper position in robot frame (meters)
+
+        Returns:
+            (crop_224x224, crop_scale)
+        """
+        return self.compute_crop(frame, target_xy_estimate, gripper_xy, gripper_z=None)
 
     def compute_crop_at_distance(
         self,

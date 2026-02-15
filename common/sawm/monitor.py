@@ -191,10 +191,11 @@ class SAWMMonitor:
 
                 state = controller.get_state()
                 gripper_xy = (state.ee_position[0], state.ee_position[1])
+                gripper_z = state.ee_position[2]
 
-                # Compute progressive crop
+                # Compute progressive crop (use Z height for scale)
                 crop, scale = self._cropper.compute_crop(
-                    frame, self._target_xy, gripper_xy
+                    frame, self._target_xy, gripper_xy, gripper_z=gripper_z
                 )
 
                 # Predict offset + scale

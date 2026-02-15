@@ -221,7 +221,7 @@ async def list_tools() -> list[Tool]:
                     "z": {"type": "number", "description": "Grasp height (meters, default: 0.013 = table)", "default": 0.013},
                     "grasp_width": {"type": "number", "description": "Expected object width (meters, default: 0.03)", "default": 0.03},
                     "grasp_force": {"type": "number", "description": "Grasp force in Newtons (default: 70)", "default": 70},
-                    "x_offset": {"type": "number", "description": "X offset to compensate calibration error (meters, default: 0.04)", "default": 0.04},
+                    "x_offset": {"type": "number", "description": "X offset to compensate calibration error (meters, default: 0.0)", "default": 0.0},
                     "approach_height": {"type": "number", "description": "Height to approach from (meters, default: 0.15)", "default": 0.15},
                 },
                 "required": ["x", "y"],
@@ -328,10 +328,19 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="jog_enable",
-            description="Enable gamepad jog mode. User controls arm with USB gamepad. Left stick=XY, right stick=Z, A=grasp, B=open, X=speed, LB=fine, Back=stop.",
+            description="Enable gamepad jog mode. User controls arm with USB gamepad. Left stick=XY, right stick=Z, A=grasp, B=open, X=speed, LB=fine, Back=stop. Set record=true to capture SAWM training data during jogging — frames captured every 0.5s, grasp (A) ends and labels approach, open (B) starts new approach. Set remote=true for browser-based control via WebSocket (opens port 8766).",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "record": {
+                        "type": "boolean",
+                        "description": "Record frames for SAWM training during jog (default: false)",
+                    },
+                    "remote": {
+                        "type": "boolean",
+                        "description": "Use browser-based WebSocket control instead of USB gamepad (default: false)",
+                    },
+                },
             },
         ),
         Tool(
@@ -459,6 +468,32 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {},
+            },
+        ),
+        Tool(
+            name="servo_pick_at",
+            description="Pick an object using visual servo approach. Gripper tilts forward "
+                       "(visible to camera), iteratively homes in on target using visual feedback, "
+                       "then untilts and grasps. Works in fallback mode (no model) for data collection. "
+                       "Provide rough x,y position hint — servo loop refines from there.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number", "description": "Rough X position hint (meters)"},
+                    "y": {"type": "number", "description": "Rough Y position hint (meters)"},
+                    "grasp_width": {"type": "number", "description": "Expected object width (meters, default: 0.03)", "default": 0.03},
+                    "grasp_force": {"type": "number", "description": "Grasp force in Newtons (default: 70)", "default": 70},
+                    "grasp_z": {"type": "number", "description": "Grasp height (meters, default: 0.013)", "default": 0.013},
+                    "approach_height": {"type": "number", "description": "Lift height after grasp (meters, default: 0.15)", "default": 0.15},
+                    "servo_z": {"type": "number", "description": "Height during servo (meters, default: 0.05)", "default": 0.05},
+                    "servo_pitch": {"type": "number", "description": "Forward tilt angle (radians, default: 0.3)", "default": 0.3},
+                    "gain": {"type": "number", "description": "Fraction of offset to move each step (default: 0.5)", "default": 0.5},
+                    "max_iterations": {"type": "integer", "description": "Maximum servo iterations (default: 20)", "default": 20},
+                    "convergence_threshold": {"type": "number", "description": "Stop when offset below this (meters, default: 0.015)", "default": 0.015},
+                    "model_path": {"type": "string", "description": "Path to SAWM servo ONNX model (omit for fallback/data-collection mode)"},
+                    "collect_data": {"type": "boolean", "description": "Record frames for training (default: true)", "default": True},
+                },
+                "required": ["x", "y"],
             },
         ),
         Tool(
@@ -631,7 +666,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 z=arguments.get("z", 0.013),
                 grasp_width=arguments.get("grasp_width", 0.03),
                 grasp_force=arguments.get("grasp_force", 70),
-                x_offset=arguments.get("x_offset", 0.04),
+                x_offset=arguments.get("x_offset", 0.0),
                 approach_height=arguments.get("approach_height", 0.15),
             )
             return json_response(result)
@@ -679,7 +714,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return json_response(result)
 
         elif name == "jog_enable":
-            result = controller.start_jog()
+            result = controller.start_jog(
+                record=arguments.get("record", False),
+                remote=arguments.get("remote", False),
+            )
             return json_response(result)
 
         elif name == "jog_disable":
@@ -719,6 +757,25 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "skill_episode_list":
             result = controller.list_skill_episodes()
+            return json_response(result)
+
+        elif name == "servo_pick_at":
+            result = controller.servo_pick_at(
+                x=arguments["x"],
+                y=arguments["y"],
+                grasp_width=arguments.get("grasp_width", 0.03),
+                grasp_force=arguments.get("grasp_force", 70),
+                grasp_z=arguments.get("grasp_z", 0.013),
+                approach_height=arguments.get("approach_height", 0.15),
+                servo_z=arguments.get("servo_z", 0.05),
+                servo_pitch=arguments.get("servo_pitch", 0.3),
+                gain=arguments.get("gain", 0.5),
+                max_step=arguments.get("max_step", 0.03),
+                convergence_threshold=arguments.get("convergence_threshold", 0.015),
+                max_iterations=arguments.get("max_iterations", 20),
+                model_path=arguments.get("model_path"),
+                collect_data=arguments.get("collect_data", True),
+            )
             return json_response(result)
 
         elif name == "sawm_enable":
