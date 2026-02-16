@@ -62,6 +62,70 @@ class DepthCluster:
         }
 
 
+GRIPPER_MAX_OPENING_M = 0.08  # Franka gripper max opening
+
+
+def classify_object_pose(
+    dx: float, dy: float, dz: float,
+) -> dict:
+    """
+    Classify object pose (orientation) and graspability from bounding box dimensions.
+
+    Returns dict with:
+        pose: "upright" | "on_side" | "on_side_angled" | "flat" | None
+        graspable: bool (can the Franka gripper pick this up from above?)
+        grasp_width_m: minimum horizontal dimension (what the gripper closes on)
+        grasp_notes: human-readable explanation
+    """
+    if dx == 0 or dy == 0 or dz == 0:
+        return {"pose": None, "graspable": False, "grasp_width_m": None, "grasp_notes": "no dimensions available"}
+
+    max_xy = max(dx, dy)
+    min_xy = min(dx, dy)
+    grasp_width = min_xy  # gripper closes on narrowest horizontal dimension
+
+    # Pose classification
+    # Upright: vertical extent is tallest (block standing on end)
+    if dz >= max_xy * 0.9:
+        pose = "upright"
+    # Flat: very thin vertically (lying on largest face)
+    elif dz < min_xy * 0.6:
+        pose = "flat"
+    # On side with XY aspect ratio elongated: block lying on side, axis-aligned
+    elif max_xy > min_xy * 1.4:
+        pose = "on_side"
+    # On side but square-ish XY footprint: probably rotated at an angle
+    else:
+        pose = "on_side_angled"
+
+    # Graspability from above (top-down grasp, gripper fingers in XY plane)
+    margin = 0.005  # 5mm margin for gripper clearance
+    effective_max = GRIPPER_MAX_OPENING_M - margin
+
+    if grasp_width < effective_max:
+        graspable = True
+        if grasp_width < 0.05:
+            notes = f"easy grasp ({grasp_width*1000:.0f}mm)"
+        elif grasp_width < 0.065:
+            notes = f"graspable but snug ({grasp_width*1000:.0f}mm)"
+        else:
+            notes = f"tight fit ({grasp_width*1000:.0f}mm, max {effective_max*1000:.0f}mm)"
+    else:
+        graspable = False
+        notes = f"too wide ({grasp_width*1000:.0f}mm, gripper max {effective_max*1000:.0f}mm)"
+
+    # Special notes for angled blocks
+    if pose == "on_side_angled" and graspable:
+        notes += "; block is angled, may need yaw rotation for reliable grasp"
+
+    return {
+        "pose": pose,
+        "graspable": graspable,
+        "grasp_width_m": grasp_width,
+        "grasp_notes": notes,
+    }
+
+
 @dataclass
 class Object3D:
     """A detected object with 3D position and class label."""
@@ -73,6 +137,9 @@ class Object3D:
     source: str = "fused"  # "fused", "yolo_only", "depth_only"
     grasp_width_m: float | None = None  # min(dx, dy) for gripper_grasp
     point_count: int = 0
+    pose: str | None = None  # "upright", "on_side", "on_side_angled", "flat"
+    graspable: bool | None = None
+    grasp_notes: str | None = None
 
     def to_dict(self) -> dict:
         d = {
@@ -96,6 +163,12 @@ class Object3D:
             d["grasp_width_m"] = round(self.grasp_width_m, 4)
         if self.point_count > 0:
             d["point_count"] = self.point_count
+        if self.pose is not None:
+            d["pose"] = self.pose
+        if self.graspable is not None:
+            d["graspable"] = self.graspable
+        if self.grasp_notes is not None:
+            d["grasp_notes"] = self.grasp_notes
         return d
 
 
@@ -376,7 +449,7 @@ def match_yolo_to_depth(
             # Fused match
             det = yolo_detections[yi]
             cluster = clusters[di]
-            grasp_w = min(cluster.dimensions_m[0], cluster.dimensions_m[1])
+            pose_info = classify_object_pose(*cluster.dimensions_m)
 
             objects.append(Object3D(
                 label=det.label,
@@ -385,8 +458,11 @@ def match_yolo_to_depth(
                 dimensions_m=cluster.dimensions_m,
                 color_name=_identify_color(det.color_bgr),
                 source="fused",
-                grasp_width_m=grasp_w,
+                grasp_width_m=pose_info["grasp_width_m"],
                 point_count=cluster.point_count,
+                pose=pose_info["pose"],
+                graspable=pose_info["graspable"],
+                grasp_notes=pose_info["grasp_notes"],
             ))
 
             matched_yolo.add(yi)
@@ -413,15 +489,18 @@ def match_yolo_to_depth(
     for j, cluster in enumerate(clusters):
         if j in matched_depth:
             continue
-        grasp_w = min(cluster.dimensions_m[0], cluster.dimensions_m[1])
+        pose_info = classify_object_pose(*cluster.dimensions_m)
         objects.append(Object3D(
             label="unknown",
             confidence=0.0,
             position_m=cluster.center_m,
             dimensions_m=cluster.dimensions_m,
             source="depth_only",
-            grasp_width_m=grasp_w,
+            grasp_width_m=pose_info["grasp_width_m"],
             point_count=cluster.point_count,
+            pose=pose_info["pose"],
+            graspable=pose_info["graspable"],
+            grasp_notes=pose_info["grasp_notes"],
         ))
 
     return objects
@@ -468,7 +547,11 @@ def _generate_summary(objects: list[Object3D]) -> str:
 
         pos_str = f"{nf} {lr}".strip() if nf else lr
         color_str = f"{obj.color_name} " if obj.color_name else ""
-        parts.append(f"{color_str}{obj.label} at {pos_str} (x={x:.2f}, y={y:.2f}, z={z:.3f})")
+        pose_str = f", {obj.pose}" if obj.pose else ""
+        grasp_str = ""
+        if obj.graspable is not None:
+            grasp_str = ", graspable" if obj.graspable else ", NOT graspable"
+        parts.append(f"{color_str}{obj.label} at {pos_str} (x={x:.2f}, y={y:.2f}, z={z:.3f}{pose_str}{grasp_str})")
 
     return " | ".join(parts)
 
