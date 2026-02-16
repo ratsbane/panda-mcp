@@ -8,9 +8,13 @@ import os
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Optional
 from dataclasses import dataclass
 import numpy as np
+
+# Timeout for blocking panda-py motion calls (seconds)
+MOTION_TIMEOUT_S = 15.0
 
 # Check for mock mode (no hardware)
 MOCK_MODE = os.environ.get("FRANKA_MOCK", "0") == "1"
@@ -383,6 +387,33 @@ class FrankaController:
         self._gripper = None
         self._connected = False
 
+    def _move_joints_with_timeout(
+        self, solution, speed_factor: float = 0.15, timeout: float = MOTION_TIMEOUT_S,
+    ) -> bool:
+        """
+        Execute move_to_joint_position with a timeout.
+
+        panda-py's move_to_joint_position blocks until motion completes, but can
+        hang indefinitely if the arm hits a joint reflex or the motion is infeasible.
+        This wraps it with a timeout and attempts recovery on failure.
+
+        Returns True if motion completed, raises TimeoutError or RuntimeError otherwise.
+        """
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                self._robot.move_to_joint_position, solution, speed_factor=speed_factor,
+            )
+            try:
+                result = future.result(timeout=timeout)
+                return result
+            except FuturesTimeoutError:
+                logger.error(f"Motion timed out after {timeout}s — attempting recovery")
+                try:
+                    self._robot.recover()
+                except Exception:
+                    pass
+                raise TimeoutError(f"Joint motion timed out after {timeout}s")
+
     @property
     def connected(self) -> bool:
         return self._connected
@@ -635,10 +666,7 @@ class FrankaController:
 
         # Execute via joint motion
         try:
-            success = self._robot.move_to_joint_position(
-                solution,
-                speed_factor=0.15,
-            )
+            success = self._move_joints_with_timeout(solution, speed_factor=0.15)
 
             new_state = self.get_state()
             return {
@@ -709,9 +737,8 @@ class FrankaController:
             }
 
         try:
-            success = self._robot.move_to_joint_position(
-                np.array(joints),
-                speed_factor=0.2
+            success = self._move_joints_with_timeout(
+                np.array(joints), speed_factor=0.2,
             )
 
             if success:
@@ -872,9 +899,8 @@ class FrankaController:
             # Note: panda-py's move_to_joint_position is per-waypoint,
             # so we execute them in a tight loop for smoothest motion
             for i, joints in enumerate(configurations):
-                success = self._robot.move_to_joint_position(
-                    np.array(joints),
-                    speed_factor=speed_factor,
+                success = self._move_joints_with_timeout(
+                    np.array(joints), speed_factor=speed_factor,
                 )
                 if not success:
                     return {
@@ -1390,7 +1416,7 @@ class FrankaController:
                     elif event.action == "home":
                         try:
                             logger.info("Jog: returning to home position")
-                            self._robot.move_to_joint_position(
+                            self._move_joints_with_timeout(
                                 [0, -0.785, 0, -2.356, 0, 1.571, 0.785],
                                 speed_factor=0.2,
                             )
@@ -1444,8 +1470,8 @@ class FrankaController:
                         )
 
                         if solution is not None:
-                            self._robot.move_to_joint_position(
-                                solution, speed_factor=0.15,
+                            self._move_joints_with_timeout(
+                                solution, speed_factor=0.15, timeout=5.0,
                             )
                             self._jog_ik_fail_count = 0
                         else:
