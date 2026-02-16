@@ -118,10 +118,26 @@ def classify_object_pose(
     if pose == "on_side_angled" and graspable:
         notes += "; block is angled, may need yaw rotation for reliable grasp"
 
+    # Suggest yaw rotation for elongated blocks
+    # At yaw=0, gripper closes roughly along Y. At yaw=pi/2, along X.
+    # Pick the yaw that aligns with the narrower dimension.
+    import math
+    suggested_yaw = 0.0
+    if max_xy > min_xy * 1.3:
+        # Block is elongated — need to align gripper with narrow axis
+        if dx < dy:
+            # Narrow along X → close along X → yaw=pi/2
+            suggested_yaw = math.pi / 2
+            notes += f"; use yaw={suggested_yaw:.2f} to grip {dx*1000:.0f}mm axis"
+        else:
+            # Narrow along Y → close along Y → yaw=0 (default)
+            notes += f"; default yaw grips {dy*1000:.0f}mm axis"
+
     return {
         "pose": pose,
         "graspable": graspable,
         "grasp_width_m": grasp_width,
+        "suggested_yaw": suggested_yaw,
         "grasp_notes": notes,
     }
 
@@ -139,6 +155,7 @@ class Object3D:
     point_count: int = 0
     pose: str | None = None  # "upright", "on_side", "on_side_angled", "flat"
     graspable: bool | None = None
+    suggested_yaw: float | None = None  # wrist rotation for best grasp alignment
     grasp_notes: str | None = None
 
     def to_dict(self) -> dict:
@@ -167,6 +184,8 @@ class Object3D:
             d["pose"] = self.pose
         if self.graspable is not None:
             d["graspable"] = self.graspable
+        if self.suggested_yaw is not None and self.suggested_yaw != 0.0:
+            d["suggested_yaw"] = round(self.suggested_yaw, 4)
         if self.grasp_notes is not None:
             d["grasp_notes"] = self.grasp_notes
         return d
@@ -462,6 +481,7 @@ def match_yolo_to_depth(
                 point_count=cluster.point_count,
                 pose=pose_info["pose"],
                 graspable=pose_info["graspable"],
+                suggested_yaw=pose_info.get("suggested_yaw", 0.0),
                 grasp_notes=pose_info["grasp_notes"],
             ))
 
@@ -500,6 +520,7 @@ def match_yolo_to_depth(
             point_count=cluster.point_count,
             pose=pose_info["pose"],
             graspable=pose_info["graspable"],
+            suggested_yaw=pose_info.get("suggested_yaw", 0.0),
             grasp_notes=pose_info["grasp_notes"],
         ))
 

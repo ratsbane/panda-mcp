@@ -1001,6 +1001,7 @@ class FrankaController:
         grasp_force: float = 70.0,
         x_offset: float = 0.0,
         approach_height: float = 0.15,
+        yaw: float = 0.0,
     ) -> dict:
         """
         Pick an object at the given robot coordinates.
@@ -1014,6 +1015,7 @@ class FrankaController:
             grasp_force: Grasp force in Newtons
             x_offset: Systematic X offset to compensate homography error
             approach_height: Height to approach/retreat from
+            yaw: Wrist rotation in radians (0=default, pi/2=rotated 90 degrees)
         """
         if not self._connected:
             return {"success": False, "error": "Not connected to robot"}
@@ -1021,11 +1023,11 @@ class FrankaController:
         steps = []
         target_x = x + x_offset
 
-        # Standard top-down picking orientation (roll=pi, pitch=0, yaw=0)
+        # Top-down picking orientation (roll=pi, pitch=0, yaw configurable)
         import math
         pick_roll = math.pi
         pick_pitch = 0.0
-        pick_yaw = 0.0
+        pick_yaw = yaw
 
         # SAWM data collection: start approach if collector is active
         sawm_active = hasattr(self, '_sawm_collector') and self._sawm_collector is not None
@@ -1172,6 +1174,7 @@ class FrankaController:
         y: float,
         z: float = 0.08,
         approach_height: float = 0.15,
+        yaw: float = 0.0,
     ) -> dict:
         """
         Place a held object at the given robot coordinates.
@@ -1182,17 +1185,18 @@ class FrankaController:
             x, y: Target position in robot frame (meters)
             z: Place height (default: 0.08 for gentle placement)
             approach_height: Height to approach/retreat from
+            yaw: Wrist rotation in radians (0=default, pi/2=rotated 90 degrees)
         """
         if not self._connected:
             return {"success": False, "error": "Not connected to robot"}
 
         steps = []
 
-        # Standard top-down orientation for placing
+        # Top-down orientation for placing (yaw configurable)
         import math
         place_roll = math.pi
         place_pitch = 0.0
-        place_yaw = 0.0
+        place_yaw = yaw
 
         # Step 1: Move above target (IK with straight-down orientation)
         result = self.move_cartesian_ik(
@@ -1948,6 +1952,7 @@ class FrankaController:
                         grasp_force=step.get("grasp_force", 70.0),
                         x_offset=step.get("x_offset", 0.0),
                         approach_height=step.get("approach_height", 0.15),
+                        yaw=step.get("yaw", 0.0),
                     )
 
                 elif skill == "place":
@@ -1956,6 +1961,7 @@ class FrankaController:
                         y=step["y"],
                         z=step.get("z", 0.08),
                         approach_height=step.get("approach_height", 0.15),
+                        yaw=step.get("yaw", 0.0),
                     )
 
                 elif skill == "move":

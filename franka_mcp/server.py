@@ -223,6 +223,7 @@ async def list_tools() -> list[Tool]:
                     "grasp_force": {"type": "number", "description": "Grasp force in Newtons (default: 70)", "default": 70},
                     "x_offset": {"type": "number", "description": "X offset to compensate calibration error (meters, default: 0.0)", "default": 0.0},
                     "approach_height": {"type": "number", "description": "Height to approach from (meters, default: 0.15)", "default": 0.15},
+                    "yaw": {"type": "number", "description": "Wrist rotation in radians (0=default, pi/2=rotated 90 deg for sideways blocks)", "default": 0.0},
                 },
                 "required": ["x", "y"],
             },
@@ -238,6 +239,7 @@ async def list_tools() -> list[Tool]:
                     "y": {"type": "number", "description": "Y position in robot frame (meters)"},
                     "z": {"type": "number", "description": "Place height (meters, default: 0.08)", "default": 0.08},
                     "approach_height": {"type": "number", "description": "Height to approach/retreat from (meters, default: 0.15)", "default": 0.15},
+                    "yaw": {"type": "number", "description": "Wrist rotation in radians (0=default, must match pick yaw if holding rotated object)", "default": 0.0},
                 },
                 "required": ["x", "y"],
             },
@@ -422,6 +424,7 @@ async def list_tools() -> list[Tool]:
                                 "approach_height": {"type": "number", "description": "Approach height (meters)"},
                                 "width": {"type": "number", "description": "Gripper width (meters)"},
                                 "force": {"type": "number", "description": "Force (N)"},
+                                "yaw": {"type": "number", "description": "Wrist rotation in radians (for pick/place, 0=default, pi/2=rotated 90 deg)"},
                                 "seconds": {"type": "number", "description": "Wait duration"},
                             },
                             "required": ["skill"],
@@ -668,6 +671,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 grasp_force=arguments.get("grasp_force", 70),
                 x_offset=arguments.get("x_offset", 0.0),
                 approach_height=arguments.get("approach_height", 0.15),
+                yaw=arguments.get("yaw", 0.0),
             )
             return json_response(result)
 
@@ -677,6 +681,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 y=arguments["y"],
                 z=arguments.get("z", 0.08),
                 approach_height=arguments.get("approach_height", 0.15),
+                yaw=arguments.get("yaw", 0.0),
             )
             return json_response(result)
 
