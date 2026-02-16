@@ -151,13 +151,17 @@ def _solve_ik(
     x, y, z = position
     margin = 0.10  # ~5.7 degrees from joint limits
 
-    # Build q7 candidates: current q7 first, then nearby, then fixed
+    # Build q7 candidates: current q7 first, then nearby, then reference, then fixed
     current_q7 = float(current_joints[6])
+    ref_q7 = float(_REFERENCE_JOINTS[6])  # 0.785 from canonical home
     q7_candidates = [
         current_q7,
         current_q7 + 0.2, current_q7 - 0.2,
         current_q7 + 0.5, current_q7 - 0.5,
-        0.785, 0.0, -0.785, 1.57,
+        ref_q7,
+        ref_q7 + 0.3, ref_q7 - 0.3,
+        0.0, -0.785, 1.57, -1.57,
+        current_q7 + 1.0, current_q7 - 1.0,
     ]
     # Deduplicate (keep order) and clamp to joint 7 limits
     seen = set()
@@ -196,10 +200,14 @@ def _solve_ik(
         if not in_limits:
             continue
 
-        # Hard reject: max single joint change
+        # Soft penalty for large single-joint changes (was a hard reject, which
+        # caused "no solution found" when the only valid path required a big move)
         joint_changes = np.abs(sol - current_joints)
-        if np.any(joint_changes > max_single_joint_change):
-            continue
+        max_change = np.max(joint_changes)
+        large_change_penalty = 0.0
+        if max_change > max_single_joint_change:
+            # Exponential penalty — strongly discourages but doesn't hard-reject
+            large_change_penalty = 10.0 * (max_change - max_single_joint_change) ** 2
 
         # Verify with FK: position error < 3mm
         try:
@@ -217,7 +225,7 @@ def _solve_ik(
         normalized_pos = (sol - _JOINT_CENTERS) / (_JOINT_RANGES / 2)
         limit_penalty = 0.1 * np.sum(normalized_pos ** 4)  # quartic: only bites near limits
 
-        cost = travel + limit_penalty
+        cost = travel + limit_penalty + large_change_penalty
         if cost < best_cost:
             best_cost = cost
             best_solution = sol
@@ -406,7 +414,16 @@ class FrankaController:
         try:
             return future.result(timeout=timeout)
         except FuturesTimeoutError:
-            logger.error(f"{label} timed out after {timeout}s")
+            logger.error(f"{label} timed out after {timeout}s — stopping controller")
+            # Stop the physical motion first, then recover
+            try:
+                self._robot.stop_controller()
+            except Exception as e:
+                logger.warning(f"stop_controller failed: {e}")
+            try:
+                self._robot.get_robot().stop()
+            except Exception as e:
+                logger.warning(f"libfranka stop failed: {e}")
             if recover:
                 try:
                     self._robot.recover()
@@ -419,10 +436,17 @@ class FrankaController:
     def _move_joints_with_timeout(
         self, solution, speed_factor: float = 0.15, timeout: float = MOTION_TIMEOUT_S,
     ) -> bool:
-        """Execute move_to_joint_position with a timeout and recovery."""
+        """Execute move_to_joint_position with a timeout and recovery.
+
+        Uses relaxed dq_threshold (0.01 vs default 0.001) and success_threshold
+        (0.05 vs default 0.01) to prevent the impedance controller from hanging
+        when it oscillates around the target without fully settling.
+        """
         return self._call_with_timeout(
             self._robot.move_to_joint_position, solution,
             speed_factor=speed_factor,
+            dq_threshold=0.01,        # 10x more tolerant (default 0.001)
+            success_threshold=0.05,    # 5x more tolerant (default 0.01)
             timeout=timeout, label="Joint motion", recover=True,
         )
 
@@ -594,12 +618,18 @@ class FrankaController:
         yaw: Optional[float] = None,
         confirmed: bool = False,
         frozen_joints: Optional[dict] = None,
+        seed_joints: Optional[np.ndarray] = None,
     ) -> dict:
         """
         Move end effector to Cartesian position using analytical IK.
 
         Same interface as move_cartesian but uses IK + move_to_joint_position,
         which can reliably reach table height (z~0.013) unlike the Cartesian planner.
+
+        Args:
+            seed_joints: Optional joint angles to use as IK seed instead of
+                current robot state. Use this to chain IK solutions across
+                a sequence of moves (prevents branch flipping).
         """
         if not self._connected:
             return {"success": False, "error": "Not connected to robot"}
@@ -649,12 +679,12 @@ class FrankaController:
                 "warnings": validation["warnings"],
             }
 
-        # Solve IK
+        # Solve IK — use seed_joints if provided for branch consistency
         target_quat = euler_to_quaternion(roll, pitch, yaw)
         target_pos = np.array([x, y, z])
-        current_joints = np.array(current_state.joint_positions)
+        ik_seed = seed_joints if seed_joints is not None else np.array(current_state.joint_positions)
 
-        solution = _solve_ik(target_pos, target_quat, current_joints,
+        solution = _solve_ik(target_pos, target_quat, ik_seed,
                              frozen_joints=frozen_joints)
 
         if solution is None:
@@ -1001,16 +1031,36 @@ class FrankaController:
             return {"success": False, "error": str(e)}
 
     def stop(self) -> dict:
-        """Stop current motion."""
+        """Stop current motion (both arm and gripper)."""
         if not self._connected:
             return {"success": False, "error": "Not connected"}
 
+        errors = []
+        # Stop arm motion controller
+        try:
+            self._robot.stop_controller()
+        except Exception as e:
+            errors.append(f"stop_controller: {e}")
+        # Stop via libfranka
+        try:
+            self._robot.get_robot().stop()
+        except Exception as e:
+            errors.append(f"libfranka stop: {e}")
+        # Stop gripper
         try:
             if self._gripper:
                 self._gripper.stop()
-            return {"success": True, "message": "Motion stopped"}
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            errors.append(f"gripper stop: {e}")
+        # Recover from any error state
+        try:
+            self._robot.recover()
+        except Exception as e:
+            errors.append(f"recover: {e}")
+
+        if errors:
+            return {"success": True, "message": "Motion stopped", "warnings": errors}
+        return {"success": True, "message": "Motion stopped"}
 
     def recover(self) -> dict:
         """Recover from error state."""
@@ -1070,31 +1120,76 @@ class FrankaController:
         if sawm_monitor:
             self._sawm_monitor.start(target_xy=(x, y))  # use original position, not offset
 
+        # Helper to abort pick on move failure
+        def _abort(msg, steps):
+            logger.error(f"pick_at aborted: {msg}")
+            if sawm_monitor:
+                self._sawm_monitor.stop()
+            state = self.get_state()
+            return {
+                "success": False,
+                "gripper_width": round(state.gripper_width, 4),
+                "final_position": {
+                    "x": round(state.ee_position[0], 4),
+                    "y": round(state.ee_position[1], 4),
+                    "z": round(state.ee_position[2], 4),
+                },
+                "abort_reason": msg,
+                "steps": steps,
+            }
+
         # Step 1: Open gripper
         result = self.gripper_move(0.08)
         steps.append({"action": "open_gripper", "result": result})
 
-        # Step 2: Move above target (IK with straight-down orientation)
+        # Step 2: Approach above target
+        # Break into intermediate waypoints to avoid large diagonal moves
+        # that cause oscillation in the motion controller
+        state = self.get_state()
+        current_z = state.ee_position[2]
+        dist_xy = np.sqrt((target_x - state.ee_position[0])**2 + (y - state.ee_position[1])**2)
+        dist_z = abs(current_z - approach_height)
+
+        if dist_xy > 0.05 and dist_z > 0.15:
+            # Large move: first go to target XY at safe height, then lower
+            safe_z = max(current_z, approach_height + 0.10)
+            result = self.move_cartesian_ik(
+                target_x, y, safe_z,
+                roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True)
+            steps.append({"action": "approach_xy", "method": "ik", "result": result})
+            if not result.get("success"):
+                return _abort(f"approach_xy failed: {result.get('error', 'unknown')}", steps)
+
         result = self.move_cartesian_ik(
             target_x, y, approach_height,
             roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True)
         steps.append({"action": "approach_above", "method": "ik", "result": result})
+        if not result.get("success"):
+            return _abort(f"approach_above failed: {result.get('error', 'unknown')}", steps)
+
+        # Chain IK solutions: use post-move joints as seed for next step
+        # This prevents branch-flipping oscillations during the lowering sequence
+        state = self.get_state()
+        chain_joints = np.array(state.joint_positions)
 
         # SAWM: record frame at approach height
         if sawm_active:
             self._sawm_record_frame()
 
         # Step 3: Lower in increments (avoid large joint changes that trigger reflex)
-        state = self.get_state()
         current_z = state.ee_position[2]
         step_z = 0.04  # 4cm increments
         while current_z - step_z > z:
             intermediate_z = current_z - step_z
             result = self.move_cartesian_ik(
                 target_x, y, intermediate_z,
-                roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True)
+                roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True,
+                seed_joints=chain_joints)
             steps.append({"action": "lower_step", "method": "ik", "target_z": round(intermediate_z, 4), "result": result})
+            if not result.get("success"):
+                return _abort(f"lower_step failed at z={intermediate_z:.3f}: {result.get('error', 'unknown')}", steps)
             state = self.get_state()
+            chain_joints = np.array(state.joint_positions)
             current_z = state.ee_position[2]
 
             # SAWM: record frame at each Z step
@@ -1121,8 +1216,11 @@ class FrankaController:
         # Final lower to grasp height
         result = self.move_cartesian_ik(
             target_x, y, z,
-            roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True)
+            roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True,
+            seed_joints=chain_joints)
         steps.append({"action": "lower_to_grasp", "method": "ik", "result": result})
+        if not result.get("success"):
+            return _abort(f"lower_to_grasp failed: {result.get('error', 'unknown')}", steps)
         state = self.get_state()
         actual_z = state.ee_position[2]
         steps.append({"action": "check_z", "target_z": z, "actual_z": round(actual_z, 4)})
@@ -1229,17 +1327,40 @@ class FrankaController:
         place_pitch = 0.0
         place_yaw = yaw
 
+        def _place_fail(msg, steps):
+            logger.error(f"place_at aborted: {msg}")
+            state = self.get_state()
+            return {
+                "success": False,
+                "abort_reason": msg,
+                "final_position": {
+                    "x": round(state.ee_position[0], 4),
+                    "y": round(state.ee_position[1], 4),
+                    "z": round(state.ee_position[2], 4),
+                },
+                "steps": steps,
+            }
+
         # Step 1: Move above target (IK with straight-down orientation)
         result = self.move_cartesian_ik(
             x, y, approach_height,
             roll=place_roll, pitch=place_pitch, yaw=place_yaw, confirmed=True)
         steps.append({"action": "move_above", "method": "ik", "result": result})
+        if not result.get("success"):
+            return _place_fail(f"move_above failed: {result.get('error', 'unknown')}", steps)
+
+        # Chain IK solutions to prevent branch flipping
+        state = self.get_state()
+        chain_joints = np.array(state.joint_positions)
 
         # Step 2: Lower to place height (IK for reliable low-Z reach)
         result = self.move_cartesian_ik(
             x, y, z,
-            roll=place_roll, pitch=place_pitch, yaw=place_yaw, confirmed=True)
+            roll=place_roll, pitch=place_pitch, yaw=place_yaw, confirmed=True,
+            seed_joints=chain_joints)
         steps.append({"action": "lower_to_place", "method": "ik", "result": result})
+        if not result.get("success"):
+            return _place_fail(f"lower_to_place failed: {result.get('error', 'unknown')}", steps)
 
         # Step 3: Open gripper to release
         result = self.gripper_move(0.08)
