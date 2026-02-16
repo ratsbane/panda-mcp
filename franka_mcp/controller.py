@@ -13,8 +13,10 @@ from typing import Optional
 from dataclasses import dataclass
 import numpy as np
 
-# Timeout for blocking panda-py motion calls (seconds)
+# Timeout for blocking panda-py calls (seconds)
 MOTION_TIMEOUT_S = 15.0
+GRIPPER_TIMEOUT_S = 10.0
+STATE_TIMEOUT_S = 5.0
 
 # Check for mock mode (no hardware)
 MOCK_MODE = os.environ.get("FRANKA_MOCK", "0") == "1"
@@ -387,32 +389,35 @@ class FrankaController:
         self._gripper = None
         self._connected = False
 
+    def _call_with_timeout(self, fn, *args, timeout: float = STATE_TIMEOUT_S, label: str = "call", recover: bool = False, **kwargs):
+        """
+        Call a blocking panda-py/libfranka function with a timeout.
+
+        Many panda-py calls can hang indefinitely if communication drops or
+        the arm enters a bad state. This wraps them with a timeout.
+        """
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(fn, *args, **kwargs)
+            try:
+                return future.result(timeout=timeout)
+            except FuturesTimeoutError:
+                logger.error(f"{label} timed out after {timeout}s")
+                if recover:
+                    try:
+                        self._robot.recover()
+                    except Exception:
+                        pass
+                raise TimeoutError(f"{label} timed out after {timeout}s")
+
     def _move_joints_with_timeout(
         self, solution, speed_factor: float = 0.15, timeout: float = MOTION_TIMEOUT_S,
     ) -> bool:
-        """
-        Execute move_to_joint_position with a timeout.
-
-        panda-py's move_to_joint_position blocks until motion completes, but can
-        hang indefinitely if the arm hits a joint reflex or the motion is infeasible.
-        This wraps it with a timeout and attempts recovery on failure.
-
-        Returns True if motion completed, raises TimeoutError or RuntimeError otherwise.
-        """
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                self._robot.move_to_joint_position, solution, speed_factor=speed_factor,
-            )
-            try:
-                result = future.result(timeout=timeout)
-                return result
-            except FuturesTimeoutError:
-                logger.error(f"Motion timed out after {timeout}s — attempting recovery")
-                try:
-                    self._robot.recover()
-                except Exception:
-                    pass
-                raise TimeoutError(f"Joint motion timed out after {timeout}s")
+        """Execute move_to_joint_position with a timeout and recovery."""
+        return self._call_with_timeout(
+            self._robot.move_to_joint_position, solution,
+            speed_factor=speed_factor,
+            timeout=timeout, label="Joint motion", recover=True,
+        )
 
     @property
     def connected(self) -> bool:
@@ -423,7 +428,8 @@ class FrankaController:
         if not self._connected:
             raise RuntimeError("Not connected to robot")
 
-        state = self._robot.get_state()
+        state = self._call_with_timeout(
+            self._robot.get_state, timeout=STATE_TIMEOUT_S, label="get_state")
         position = self._robot.get_position()
         orientation = self._robot.get_orientation()
 
@@ -437,11 +443,21 @@ class FrankaController:
             has_error = True
             error_msg = str(state.current_errors)
 
+        # Read gripper width with timeout (this is a common hang point)
+        gripper_w = 0.04
+        if self._gripper:
+            try:
+                gripper_state = self._call_with_timeout(
+                    self._gripper.read_once, timeout=STATE_TIMEOUT_S, label="gripper_read")
+                gripper_w = gripper_state.width
+            except (TimeoutError, Exception) as e:
+                logger.warning(f"Gripper read failed: {e}, using cached/default width")
+
         return RobotState(
             joint_positions=list(state.q),
             ee_position=(float(position[0]), float(position[1]), float(position[2])),
             ee_orientation=(roll, pitch, yaw),
-            gripper_width=self._gripper.read_once().width if self._gripper else 0.04,
+            gripper_width=gripper_w,
             is_moving=False,  # panda-py moves are synchronous
             has_error=has_error,
             error_message=error_msg,
@@ -936,8 +952,12 @@ class FrankaController:
             }
 
         try:
-            success = self._gripper.move(width, speed)
+            success = self._call_with_timeout(
+                self._gripper.move, width, speed,
+                timeout=GRIPPER_TIMEOUT_S, label="gripper_move")
             return {"success": success, "width": width}
+        except TimeoutError as e:
+            return {"success": False, "error": str(e)}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -964,8 +984,12 @@ class FrankaController:
             }
 
         try:
-            success = self._gripper.grasp(width, speed, force)
+            success = self._call_with_timeout(
+                self._gripper.grasp, width, speed, force,
+                timeout=GRIPPER_TIMEOUT_S, label="gripper_grasp")
             return {"success": success, "width": width, "force": force}
+        except TimeoutError as e:
+            return {"success": False, "error": str(e)}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -1986,8 +2010,25 @@ class FrankaController:
                     )
 
                 elif skill == "home":
+                    # First move up and unrotate yaw in steps to avoid IK failures
+                    state = self.get_state()
+                    cur_yaw = state.ee_orientation[2]
+                    # If wrist is significantly rotated, step through intermediate yaw
+                    if abs(cur_yaw) > 0.3:
+                        self.move_cartesian_ik(
+                            x=state.ee_position[0], y=state.ee_position[1], z=0.35,
+                            roll=3.14159, pitch=0.0, yaw=cur_yaw,
+                            confirmed=True,
+                        )
+                        # Step to half yaw
+                        half_yaw = cur_yaw / 2
+                        self.move_cartesian_ik(
+                            x=0.4, y=0.0, z=0.35,
+                            roll=3.14159, pitch=0.0, yaw=half_yaw,
+                            confirmed=True,
+                        )
                     r = self.move_cartesian_ik(
-                        x=0.4, y=0.0, z=0.3,
+                        x=0.307, y=0.0, z=0.487,
                         roll=3.14159, pitch=0.0, yaw=0.0,
                         confirmed=True,
                     )
