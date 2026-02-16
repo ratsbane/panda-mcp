@@ -395,19 +395,26 @@ class FrankaController:
 
         Many panda-py calls can hang indefinitely if communication drops or
         the arm enters a bad state. This wraps them with a timeout.
+
+        IMPORTANT: We must NOT use `with ThreadPoolExecutor` because the
+        context manager calls shutdown(wait=True) on exit, which blocks
+        until the zombie thread finishes — completely defeating the timeout.
+        Instead we create the executor, submit, and shutdown(wait=False).
         """
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(fn, *args, **kwargs)
-            try:
-                return future.result(timeout=timeout)
-            except FuturesTimeoutError:
-                logger.error(f"{label} timed out after {timeout}s")
-                if recover:
-                    try:
-                        self._robot.recover()
-                    except Exception:
-                        pass
-                raise TimeoutError(f"{label} timed out after {timeout}s")
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(fn, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout)
+        except FuturesTimeoutError:
+            logger.error(f"{label} timed out after {timeout}s")
+            if recover:
+                try:
+                    self._robot.recover()
+                except Exception:
+                    pass
+            raise TimeoutError(f"{label} timed out after {timeout}s")
+        finally:
+            executor.shutdown(wait=False)
 
     def _move_joints_with_timeout(
         self, solution, speed_factor: float = 0.15, timeout: float = MOTION_TIMEOUT_S,
