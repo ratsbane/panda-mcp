@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 
 # Default paths
 DEFAULT_DEPTH_NPZ = "/tmp/phoxi_scan.npz"
-DEFAULT_USB_CALIBRATION = "/tmp/aruco_calibration.npz"
-DEFAULT_DEPTH_CALIBRATION = "/tmp/depth_calibration.npz"
+DEFAULT_USB_CALIBRATION = "/home/doug/panda-mcp/calibration/aruco_calibration.npz"
+DEFAULT_DEPTH_CALIBRATION = "/home/doug/panda-mcp/calibration/depth_calibration.npz"
 
 # Clustering params
 GRID_CELL_M = 0.02  # 2cm grid cells (finer = better block separation)

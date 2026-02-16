@@ -10,7 +10,7 @@ import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 
-CALIBRATION_PATH = "/tmp/depth_calibration.npz"
+CALIBRATION_PATH = "/home/doug/panda-mcp/calibration/depth_calibration.npz"
 
 
 def compute_rigid_transform(

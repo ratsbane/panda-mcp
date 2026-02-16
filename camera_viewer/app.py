@@ -394,7 +394,7 @@ _SOURCE_COLORS = {
 def _render_fusion_image(
     frame: np.ndarray,
     scene_dict: dict,
-    usb_calibration_path: str = "/tmp/aruco_calibration.npz",
+    usb_calibration_path: str = "/home/doug/panda-mcp/calibration/aruco_calibration.npz",
 ) -> np.ndarray:
     """Draw 3D fusion results on a USB camera frame."""
     annotated = frame.copy()
@@ -539,7 +539,7 @@ JOG_PAGE = """<!DOCTYPE html>
 <title>Remote Arm Control</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; touch-action: none; }
-  html, body { height: 100%; overflow: hidden; }
+  html, body { height: 100%; overflow: auto; }
   body { background: #111; color: #eee; font-family: system-ui, -apple-system, sans-serif; }
 
   .app { display: flex; flex-direction: column; height: 100vh; }
@@ -558,6 +558,11 @@ JOG_PAGE = """<!DOCTYPE html>
   .status-dot.connected { background: #4c4; }
   .status-dot.disconnected { background: #c44; }
   .status-text { font-size: 0.75rem; color: #888; }
+
+  /* Main content row: joint sidebar + camera */
+  .content-row {
+    flex: 1; display: flex; min-height: 0; overflow: hidden;
+  }
 
   /* Camera area */
   .camera-area {
@@ -647,6 +652,50 @@ JOG_PAGE = """<!DOCTYPE html>
     font-size: 0.65rem; color: #555; text-align: center; margin-top: 4px;
   }
 
+  /* Joint sidebar */
+  .joint-panel {
+    flex-shrink: 0; width: 140px; background: #151515; border-right: 1px solid #333;
+    padding: 6px 8px; display: flex; flex-direction: column;
+    font-family: 'SF Mono', 'Consolas', monospace;
+  }
+  .joint-panel-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 4px;
+  }
+  .joint-panel-header h2 { font-size: 0.65rem; color: #555; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 500; }
+  .joint-panel-header .toggle { display: none; }
+  .joint-rows { flex: 1; display: flex; flex-direction: column; gap: 1px; }
+  .joint-row {
+    display: flex; align-items: center; gap: 4px;
+    font-size: 0.6rem;
+  }
+  .joint-label { width: 16px; color: #666; text-align: right; flex-shrink: 0; }
+  .joint-bar-container {
+    flex: 1; height: 8px; background: #222; border-radius: 2px;
+    position: relative; overflow: hidden;
+  }
+  .joint-bar-fill {
+    position: absolute; top: 0; bottom: 0; background: #335; border-radius: 2px;
+    transition: left 0.15s, width 0.15s;
+  }
+  .joint-bar-marker {
+    position: absolute; top: -1px; bottom: -1px; width: 2px;
+    background: #8af; border-radius: 1px;
+    transition: left 0.15s;
+  }
+  .joint-bar-center {
+    position: absolute; top: 2px; bottom: 2px; width: 1px;
+    background: #444; left: 50%;
+  }
+  .joint-bar-container.warn .joint-bar-marker { background: #fa4; }
+  .joint-bar-container.danger .joint-bar-marker { background: #f44; }
+  .joint-value { width: 36px; color: #666; text-align: right; flex-shrink: 0; font-size: 0.55rem; }
+  .joint-limits { display: none; }
+  .orient-row {
+    margin-top: auto; padding-top: 4px; border-top: 1px solid #282828;
+    font-size: 0.55rem; color: #555; line-height: 1.4;
+  }
+
   /* Responsive: smaller screens */
   @media (max-height: 500px) {
     .joystick { width: 90px; height: 90px; }
@@ -666,23 +715,31 @@ JOG_PAGE = """<!DOCTYPE html>
     </span>
   </div>
 
-  <div class="camera-area">
-    <img id="stream" alt="Camera" style="display:none">
-    <div id="stream-ph" class="camera-placeholder">Connecting to camera...</div>
-    <div id="pos-overlay" class="pos-overlay" style="display:none">
-      <div id="pos-text">X: --- Y: --- Z: ---</div>
-      <div id="grip-text">Gripper: ---</div>
+  <div class="content-row">
+    <div class="joint-panel" id="joint-panel">
+      <div class="joint-panel-header"><h2>Joints</h2></div>
+      <div class="joint-rows" id="joint-rows"></div>
+      <div class="orient-row" id="orient-row"></div>
+    </div>
+    <div class="camera-area">
+      <img id="stream" alt="Camera" style="display:none">
+      <div id="stream-ph" class="camera-placeholder">Connecting to camera...</div>
+      <div id="pos-overlay" class="pos-overlay" style="display:none">
+        <div id="pos-text">X: --- Y: --- Z: ---</div>
+        <div id="grip-text">Gripper: ---</div>
+        <div id="ik-warn" style="display:none; color:#f64; margin-top:2px; font-weight:600;">IK BLOCKED</div>
+      </div>
     </div>
   </div>
 
   <div class="controls-area">
     <div class="btn-row">
-      <button class="btn grasp" id="btn-grasp" ontouchstart="sendEvent('grasp')" onmousedown="sendEvent('grasp')">Grasp</button>
-      <button class="btn open" id="btn-open" ontouchstart="sendEvent('open_gripper')" onmousedown="sendEvent('open_gripper')">Open</button>
-      <button class="btn" id="btn-home" ontouchstart="sendEvent('home')" onmousedown="sendEvent('home')">Home</button>
-      <button class="btn" id="btn-speed" ontouchstart="cycleSpeed()" onmousedown="cycleSpeed()">Speed</button>
+      <button class="btn grasp" id="btn-grasp" onpointerdown="sendEvent('grasp')">Grasp</button>
+      <button class="btn open" id="btn-open" onpointerdown="sendEvent('open_gripper')">Open</button>
+      <button class="btn" id="btn-home" onpointerdown="sendEvent('home')">Home</button>
+      <button class="btn" id="btn-speed" onpointerdown="cycleSpeed()">Speed</button>
       <span class="speed-label" id="speed-label">medium</span>
-      <button class="btn danger" id="btn-stop" ontouchstart="sendEvent('stop_jog')" onmousedown="sendEvent('stop_jog')">STOP</button>
+      <button class="btn danger" id="btn-stop" onpointerdown="sendEvent('stop_jog')">STOP</button>
     </div>
     <div class="joy-row">
       <div class="joy-container">
@@ -695,13 +752,13 @@ JOG_PAGE = """<!DOCTYPE html>
         <div class="joy-label">D-Pad</div>
         <div class="dpad">
           <div></div>
-          <button class="btn" ontouchstart="adjustPitch(1)" onmousedown="adjustPitch(1)">&#9650;</button>
+          <button class="btn" onpointerdown="adjustPitch(1)">&#9650;</button>
           <div></div>
-          <button class="btn" ontouchstart="adjustYaw(-1)" onmousedown="adjustYaw(-1)">&#9664;</button>
+          <button class="btn" onpointerdown="adjustYaw(-1)">&#9664;</button>
           <div class="center"></div>
-          <button class="btn" ontouchstart="adjustYaw(1)" onmousedown="adjustYaw(1)">&#9654;</button>
+          <button class="btn" onpointerdown="adjustYaw(1)">&#9654;</button>
           <div></div>
-          <button class="btn" ontouchstart="adjustPitch(-1)" onmousedown="adjustPitch(-1)">&#9660;</button>
+          <button class="btn" onpointerdown="adjustPitch(-1)">&#9660;</button>
           <div></div>
         </div>
       </div>
@@ -714,6 +771,7 @@ JOG_PAGE = """<!DOCTYPE html>
     </div>
     <div class="input-source" id="input-source">Touch or mouse to control</div>
   </div>
+
 </div>
 
 <script>
@@ -735,6 +793,7 @@ let joyZ = {y: 0};
 let sendInterval = null;
 let gamepadActive = false;
 let gamepadId = null;
+let prevButtons = {};  // Edge detection for gamepad buttons
 
 // --- WebSocket ---
 function connectWS() {
@@ -829,6 +888,67 @@ function adjustYaw(dir) {
   yaw = Math.max(-1, Math.min(1, yaw + dir * ANGLE_STEP));
 }
 
+const JOINT_NAMES = ['J1','J2','J3','J4','J5','J6','J7'];
+let jointLimits = null; // cached from first status message
+
+function initJointBars() {
+  const container = document.getElementById('joint-rows');
+  container.innerHTML = '';
+  for (let i = 0; i < 7; i++) {
+    const row = document.createElement('div');
+    row.className = 'joint-row';
+    row.innerHTML =
+      '<span class="joint-label">' + JOINT_NAMES[i] + '</span>' +
+      '<span class="joint-limits" id="jlim-' + i + '"></span>' +
+      '<div class="joint-bar-container" id="jbar-' + i + '">' +
+        '<div class="joint-bar-center"></div>' +
+        '<div class="joint-bar-fill" id="jfill-' + i + '"></div>' +
+        '<div class="joint-bar-marker" id="jmark-' + i + '"></div>' +
+      '</div>' +
+      '<span class="joint-value" id="jval-' + i + '"></span>';
+    container.appendChild(row);
+  }
+}
+
+function updateJointDisplay(joints, limits) {
+  if (!joints || joints.length < 7) return;
+  if (limits && limits.length >= 7 && !jointLimits) jointLimits = limits;
+  const lim = jointLimits;
+  if (!lim) return;
+
+  for (let i = 0; i < 7; i++) {
+    const lo = lim[i][0], hi = lim[i][1];
+    const range = hi - lo;
+    const pct = ((joints[i] - lo) / range) * 100;
+    const margin = 0.10; // same as IK margin
+    const nearLimit = (joints[i] < lo + margin) || (joints[i] > hi - margin);
+    const veryNear = (joints[i] < lo + 0.05) || (joints[i] > hi - 0.05);
+
+    const bar = document.getElementById('jbar-' + i);
+    const marker = document.getElementById('jmark-' + i);
+    const fill = document.getElementById('jfill-' + i);
+    const val = document.getElementById('jval-' + i);
+    const limEl = document.getElementById('jlim-' + i);
+
+    if (marker) marker.style.left = 'calc(' + pct.toFixed(1) + '% - 1.5px)';
+
+    // Fill from center to current position
+    const centerPct = ((0 - lo) / range) * 100; // where 0 is on the bar
+    if (pct > centerPct) {
+      fill.style.left = centerPct + '%';
+      fill.style.width = (pct - centerPct) + '%';
+    } else {
+      fill.style.left = pct + '%';
+      fill.style.width = (centerPct - pct) + '%';
+    }
+
+    bar.className = 'joint-bar-container' + (veryNear ? ' danger' : nearLimit ? ' warn' : '');
+    if (val) val.textContent = joints[i].toFixed(2) + '\u00b0'.replace('\u00b0', '');
+    if (val) val.textContent = (joints[i] * 57.296).toFixed(1) + '\u00b0';
+    if (limEl) limEl.textContent = (lo * 57.296).toFixed(0) + '\u00b0 .. ' + (hi * 57.296).toFixed(0) + '\u00b0';
+  }
+}
+
 function updateStatusDisplay(data) {
   const overlay = document.getElementById('pos-overlay');
   overlay.style.display = '';
@@ -837,6 +957,24 @@ function updateStatusDisplay(data) {
     'X: ' + (p.x || 0).toFixed(3) + '  Y: ' + (p.y || 0).toFixed(3) + '  Z: ' + (p.z || 0).toFixed(3);
   document.getElementById('grip-text').textContent =
     'Gripper: ' + (data.gripper_width || 0).toFixed(3) + 'm';
+
+  // IK blocked indicator
+  const ikWarn = document.getElementById('ik-warn');
+  ikWarn.style.display = data.ik_blocked ? '' : 'none';
+
+  // Update joint display
+  if (data.joints) {
+    updateJointDisplay(data.joints, data.joint_limits);
+  }
+
+  // Update orientation display
+  if (data.orientation) {
+    const o = data.orientation;
+    document.getElementById('orient-row').innerHTML =
+      'R ' + (o.roll * 57.296).toFixed(1) + '\u00b0<br>' +
+      'P ' + (o.pitch * 57.296).toFixed(1) + '\u00b0<br>' +
+      'Y ' + (o.yaw * 57.296).toFixed(1) + '\u00b0';
+  }
 }
 
 // --- Virtual Joystick ---
@@ -942,18 +1080,24 @@ function pollGamepad() {
     document.getElementById('knob-z').style.transform =
       'translate(calc(-50% + 0px), calc(-50% + ' + (joyZ.y * maxZ) + 'px))';
 
-    // Buttons
-    if (gp.buttons[0] && gp.buttons[0].pressed) sendEvent('grasp');
-    if (gp.buttons[1] && gp.buttons[1].pressed) sendEvent('open_gripper');
-    if (gp.buttons[2] && gp.buttons[2].pressed) cycleSpeed();
-    if (gp.buttons[3] && gp.buttons[3].pressed) { pitch = 0; yaw = 0; }
-    if (gp.buttons[6] && gp.buttons[6].pressed) sendEvent('stop_jog');
+    // Buttons (edge-triggered: only fire on press, not while held)
+    function btnPressed(idx) {
+      const now = gp.buttons[idx] && gp.buttons[idx].pressed;
+      const was = prevButtons[idx] || false;
+      prevButtons[idx] = now;
+      return now && !was;
+    }
+    if (btnPressed(0)) sendEvent('grasp');
+    if (btnPressed(1)) sendEvent('open_gripper');
+    if (btnPressed(2)) cycleSpeed();
+    if (btnPressed(3)) { pitch = 0; yaw = 0; }
+    if (btnPressed(6)) sendEvent('stop_jog');
 
-    // D-pad (buttons 12-15 on standard gamepad)
-    if (gp.buttons[12] && gp.buttons[12].pressed) adjustPitch(1);
-    if (gp.buttons[13] && gp.buttons[13].pressed) adjustPitch(-1);
-    if (gp.buttons[14] && gp.buttons[14].pressed) adjustYaw(-1);
-    if (gp.buttons[15] && gp.buttons[15].pressed) adjustYaw(1);
+    // D-pad (edge-triggered)
+    if (btnPressed(12)) adjustPitch(1);
+    if (btnPressed(13)) adjustPitch(-1);
+    if (btnPressed(14)) adjustYaw(-1);
+    if (btnPressed(15)) adjustYaw(1);
   } else if (gamepadActive) {
     gamepadActive = false;
     document.getElementById('input-source').textContent = 'Touch or mouse to control';
@@ -973,6 +1117,9 @@ window.addEventListener('load', function() {
   // Virtual joysticks
   setupJoystick('joy-xy', 'knob-xy', joyXY, 'xy');
   setupJoystick('joy-z', 'knob-z', joyZ, 'y');
+
+  // Joint display
+  initJointBars();
 
   // WebSocket
   connectWS();

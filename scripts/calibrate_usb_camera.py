@@ -35,7 +35,7 @@ MARKER_ROBOT_COORDS = {
 }
 
 # Output paths
-NPZ_PATH = "/tmp/aruco_calibration.npz"
+NPZ_PATH = "/home/doug/panda-mcp/calibration/aruco_calibration.npz"
 JSON_PATH = "/home/doug/panda-mcp/calibration.json"
 INTRINSICS_PATH = "/tmp/camera_intrinsics.npz"
 TABLE_Z = 0.013  # table height in meters

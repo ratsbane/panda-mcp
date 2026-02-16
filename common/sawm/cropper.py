@@ -17,7 +17,7 @@ from typing import Optional, Tuple
 logger = logging.getLogger(__name__)
 
 # Calibration file path
-CALIBRATION_PATH = "/tmp/aruco_calibration.npz"
+CALIBRATION_PATH = "/home/doug/panda-mcp/calibration/aruco_calibration.npz"
 
 
 class ProgressiveCropper:

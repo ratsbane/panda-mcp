@@ -9,6 +9,8 @@ import json
 import logging
 from typing import Any
 
+import numpy as np
+
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ImageContent
@@ -187,6 +189,31 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
+        Tool(
+            name="ground_object",
+            description=(
+                "Find an object in the camera image using natural language. "
+                "Uses Qwen2.5-VL-3B on Spark for visual grounding. "
+                "Returns bounding box in pixel coordinates and approximate robot coordinates "
+                "(via USB camera homography). For precise 3D positioning, use the depth camera. "
+                "Examples: 'the red block', 'the block behind the green one', 'the tiger toy'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language description of the object to find",
+                    },
+                    "server_url": {
+                        "type": "string",
+                        "default": "http://spark:8090",
+                        "description": "URL of the grounding server",
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
     ]
 
 
@@ -329,6 +356,67 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
             ))
 
             return responses
+
+        elif name == "ground_object":
+            query = arguments.get("query", "")
+            if not query:
+                return json_response({"error": "query is required"})
+
+            server_url = arguments.get("server_url", "http://spark:8090")
+
+            # Get JPEG frame from camera
+            if controller._using_daemon and controller._daemon_client:
+                jpeg_data = controller._daemon_client.get_frame_jpeg()
+                if jpeg_data is None:
+                    return json_response({"error": "Failed to capture frame"})
+                info = controller._daemon_client.get_info()
+                img_w, img_h = info.width, info.height
+            else:
+                frame = controller.capture_raw()
+                if frame is None:
+                    return json_response({"error": "Failed to capture frame"})
+                import cv2
+                _, jpeg_buf = cv2.imencode(".jpg", frame)
+                jpeg_data = jpeg_buf.tobytes()
+                img_h, img_w = frame.shape[:2]
+
+            # Call grounding server
+            from common.grounding_client import GroundingClient
+            client = GroundingClient(server_url)
+            result = client.ground(jpeg_data, query, width=img_w, height=img_h)
+
+            if not result.get("success"):
+                return json_response({
+                    "error": result.get("error", "Grounding failed"),
+                    "raw_output": result.get("raw_output", ""),
+                })
+
+            # Convert pixel center to approximate robot coordinates
+            pixel_cx, pixel_cy = result["center"]
+            robot_coords = None
+            try:
+                import cv2
+                cal_path = "/home/doug/panda-mcp/calibration/aruco_calibration.npz"
+                cal_data = np.load(cal_path)
+                H = cal_data["H"]
+                table_z = float(cal_data["table_z"])
+                point = np.array([[[float(pixel_cx), float(pixel_cy)]]], dtype=np.float32)
+                transformed = cv2.perspectiveTransform(point, H)
+                rx, ry = float(transformed[0, 0, 0]), float(transformed[0, 0, 1])
+                robot_coords = {"x": round(rx, 4), "y": round(ry, 4), "z": round(table_z, 4)}
+            except Exception as e:
+                logger.warning(f"Could not convert to robot coords: {e}")
+
+            return json_response({
+                "success": True,
+                "query": query,
+                "bbox": result["bbox"],
+                "center_pixel": result["center"],
+                "robot_coords_approx": robot_coords,
+                "inference_ms": result.get("inference_ms", 0),
+                "image_size": [img_w, img_h],
+                "note": "robot_coords_approx uses USB camera homography (~2-4cm error). Use depth camera for precise positioning.",
+            })
 
         elif name == "describe_scene_3d":
             # Capture raw frame from USB camera
