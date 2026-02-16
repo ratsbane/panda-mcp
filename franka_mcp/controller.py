@@ -125,7 +125,7 @@ def _solve_ik(
     position: np.ndarray,
     orientation_quat: np.ndarray,
     current_joints: np.ndarray,
-    max_single_joint_change: float = 1.5,
+    max_single_joint_change: float = 2.5,
     frozen_joints: Optional[dict] = None,
 ) -> Optional[np.ndarray]:
     """
