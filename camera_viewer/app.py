@@ -394,7 +394,7 @@ _SOURCE_COLORS = {
 def _render_fusion_image(
     frame: np.ndarray,
     scene_dict: dict,
-    usb_calibration_path: str = "/tmp/aruco_calibration.npz",
+    usb_calibration_path: str = "/home/doug/panda-mcp/calibration/aruco_calibration.npz",
 ) -> np.ndarray:
     """Draw 3D fusion results on a USB camera frame."""
     annotated = frame.copy()
@@ -531,10 +531,622 @@ async def fusion_image(request):
         return Response(f"Fusion failed: {e}", status_code=500)
 
 
+JOG_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Remote Arm Control</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; touch-action: none; }
+  html, body { height: 100%; overflow: auto; }
+  body { background: #111; color: #eee; font-family: system-ui, -apple-system, sans-serif; }
+
+  .app { display: flex; flex-direction: column; height: 100vh; }
+
+  /* Top bar */
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 12px; background: #1a1a1a; border-bottom: 1px solid #333;
+    flex-shrink: 0; z-index: 10;
+  }
+  .topbar h1 { font-size: 0.9rem; color: #aaa; font-weight: 500; }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%; display: inline-block;
+    margin-right: 6px; vertical-align: middle;
+  }
+  .status-dot.connected { background: #4c4; }
+  .status-dot.disconnected { background: #c44; }
+  .status-text { font-size: 0.75rem; color: #888; }
+
+  /* Main content row: joint sidebar + camera */
+  .content-row {
+    flex: 1; display: flex; min-height: 0; overflow: hidden;
+  }
+
+  /* Camera area */
+  .camera-area {
+    flex: 1; position: relative; overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    background: #000; min-height: 0;
+  }
+  .camera-area img {
+    max-width: 100%; max-height: 100%; object-fit: contain;
+  }
+  .camera-placeholder {
+    color: #444; font-size: 0.9rem;
+  }
+
+  /* Position overlay on camera */
+  .pos-overlay {
+    position: absolute; top: 8px; left: 8px;
+    background: rgba(0,0,0,0.7); padding: 4px 10px; border-radius: 4px;
+    font-size: 0.75rem; font-family: 'SF Mono', 'Consolas', monospace;
+    color: #aaa; pointer-events: none;
+  }
+
+  /* Controls area */
+  .controls-area {
+    flex-shrink: 0; background: #1a1a1a; border-top: 1px solid #333;
+    padding: 8px 12px;
+  }
+
+  /* Button row */
+  .btn-row {
+    display: flex; gap: 8px; justify-content: center; margin-bottom: 8px;
+    flex-wrap: wrap;
+  }
+  .btn {
+    padding: 10px 16px; border: 1px solid #444; border-radius: 6px;
+    background: #252525; color: #ddd; font-size: 0.8rem; font-weight: 500;
+    cursor: pointer; min-width: 64px; text-align: center;
+    transition: background 0.1s;
+    -webkit-user-select: none; user-select: none;
+  }
+  .btn:active, .btn.active { background: #446; border-color: #668; }
+  .btn.grasp { border-color: #4a4; }
+  .btn.grasp:active, .btn.grasp.active { background: #363; }
+  .btn.open { border-color: #48a; }
+  .btn.open:active, .btn.open.active { background: #346; }
+  .btn.danger { border-color: #a44; }
+  .btn.danger:active { background: #633; }
+  .speed-label { font-size: 0.75rem; color: #888; align-self: center; min-width: 80px; text-align: center; }
+
+  /* Joystick area */
+  .joy-row {
+    display: flex; gap: 12px; justify-content: center; align-items: center;
+    padding: 4px 0;
+  }
+  .joy-container {
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+  }
+  .joy-label { font-size: 0.65rem; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
+
+  .joystick {
+    position: relative; width: 120px; height: 120px;
+    border-radius: 50%; background: #222; border: 2px solid #444;
+    cursor: grab;
+  }
+  .joystick .knob {
+    position: absolute; width: 44px; height: 44px;
+    border-radius: 50%; background: #556; border: 2px solid #778;
+    top: 50%; left: 50%; transform: translate(-50%, -50%);
+    pointer-events: none; transition: background 0.1s;
+  }
+  .joystick.active .knob { background: #668; border-color: #99b; }
+
+  /* Z slider (vertical only) */
+  .joystick.z-only { width: 60px; }
+
+  /* D-pad */
+  .dpad {
+    display: grid; grid-template-columns: 36px 36px 36px; grid-template-rows: 36px 36px 36px;
+    gap: 2px;
+  }
+  .dpad .btn { padding: 0; min-width: 36px; height: 36px; font-size: 0.75rem;
+               display: flex; align-items: center; justify-content: center; }
+  .dpad .center { background: transparent; border: none; cursor: default; }
+
+  /* Input source indicator */
+  .input-source {
+    font-size: 0.65rem; color: #555; text-align: center; margin-top: 4px;
+  }
+
+  /* Joint sidebar */
+  .joint-panel {
+    flex-shrink: 0; width: 140px; background: #151515; border-right: 1px solid #333;
+    padding: 6px 8px; display: flex; flex-direction: column;
+    font-family: 'SF Mono', 'Consolas', monospace;
+  }
+  .joint-panel-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 4px;
+  }
+  .joint-panel-header h2 { font-size: 0.65rem; color: #555; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 500; }
+  .joint-panel-header .toggle { display: none; }
+  .joint-rows { flex: 1; display: flex; flex-direction: column; gap: 1px; }
+  .joint-row {
+    display: flex; align-items: center; gap: 4px;
+    font-size: 0.6rem;
+  }
+  .joint-label { width: 16px; color: #666; text-align: right; flex-shrink: 0; }
+  .joint-bar-container {
+    flex: 1; height: 8px; background: #222; border-radius: 2px;
+    position: relative; overflow: hidden;
+  }
+  .joint-bar-fill {
+    position: absolute; top: 0; bottom: 0; background: #335; border-radius: 2px;
+    transition: left 0.15s, width 0.15s;
+  }
+  .joint-bar-marker {
+    position: absolute; top: -1px; bottom: -1px; width: 2px;
+    background: #8af; border-radius: 1px;
+    transition: left 0.15s;
+  }
+  .joint-bar-center {
+    position: absolute; top: 2px; bottom: 2px; width: 1px;
+    background: #444; left: 50%;
+  }
+  .joint-bar-container.warn .joint-bar-marker { background: #fa4; }
+  .joint-bar-container.danger .joint-bar-marker { background: #f44; }
+  .joint-value { width: 36px; color: #666; text-align: right; flex-shrink: 0; font-size: 0.55rem; }
+  .joint-limits { display: none; }
+  .orient-row {
+    margin-top: auto; padding-top: 4px; border-top: 1px solid #282828;
+    font-size: 0.55rem; color: #555; line-height: 1.4;
+  }
+
+  /* Responsive: smaller screens */
+  @media (max-height: 500px) {
+    .joystick { width: 90px; height: 90px; }
+    .joystick .knob { width: 34px; height: 34px; }
+    .joystick.z-only { width: 50px; }
+    .btn { padding: 8px 12px; font-size: 0.75rem; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="topbar">
+    <h1>Remote Arm Control</h1>
+    <span class="status-text">
+      <span id="ws-dot" class="status-dot disconnected"></span>
+      <span id="ws-status">Connecting...</span>
+    </span>
+  </div>
+
+  <div class="content-row">
+    <div class="joint-panel" id="joint-panel">
+      <div class="joint-panel-header"><h2>Joints</h2></div>
+      <div class="joint-rows" id="joint-rows"></div>
+      <div class="orient-row" id="orient-row"></div>
+    </div>
+    <div class="camera-area">
+      <img id="stream" alt="Camera" style="display:none">
+      <div id="stream-ph" class="camera-placeholder">Connecting to camera...</div>
+      <div id="pos-overlay" class="pos-overlay" style="display:none">
+        <div id="pos-text">X: --- Y: --- Z: ---</div>
+        <div id="grip-text">Gripper: ---</div>
+        <div id="ik-warn" style="display:none; color:#f64; margin-top:2px; font-weight:600;">IK BLOCKED</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="controls-area">
+    <div class="btn-row">
+      <button class="btn grasp" id="btn-grasp" onpointerdown="sendEvent('grasp')">Grasp</button>
+      <button class="btn open" id="btn-open" onpointerdown="sendEvent('open_gripper')">Open</button>
+      <button class="btn" id="btn-home" onpointerdown="sendEvent('home')">Home</button>
+      <button class="btn" id="btn-speed" onpointerdown="cycleSpeed()">Speed</button>
+      <span class="speed-label" id="speed-label">medium</span>
+      <button class="btn danger" id="btn-stop" onpointerdown="sendEvent('stop_jog')">STOP</button>
+    </div>
+    <div class="joy-row">
+      <div class="joy-container">
+        <div class="joy-label">Move XY</div>
+        <div class="joystick" id="joy-xy">
+          <div class="knob" id="knob-xy"></div>
+        </div>
+      </div>
+      <div class="joy-container">
+        <div class="joy-label">D-Pad</div>
+        <div class="dpad">
+          <div></div>
+          <button class="btn" onpointerdown="adjustPitch(1)">&#9650;</button>
+          <div></div>
+          <button class="btn" onpointerdown="adjustYaw(-1)">&#9664;</button>
+          <div class="center"></div>
+          <button class="btn" onpointerdown="adjustYaw(1)">&#9654;</button>
+          <div></div>
+          <button class="btn" onpointerdown="adjustPitch(-1)">&#9660;</button>
+          <div></div>
+        </div>
+      </div>
+      <div class="joy-container">
+        <div class="joy-label">Height Z</div>
+        <div class="joystick z-only" id="joy-z">
+          <div class="knob" id="knob-z"></div>
+        </div>
+      </div>
+    </div>
+    <div class="input-source" id="input-source">Touch or mouse to control</div>
+  </div>
+
+</div>
+
+<script>
+// --- Configuration ---
+const WS_PORT = 8766;
+const SEND_HZ = 20;
+const DEADZONE = 0.15;
+const SPEED_PRESETS = {slow: 0.015, medium: 0.040, fast: 0.070};
+const SPEED_NAMES = ['slow', 'medium', 'fast'];
+const ANGLE_STEP = 0.05;
+
+// --- State ---
+let ws = null;
+let wsConnected = false;
+let speedIdx = 1; // medium
+let pitch = 0, yaw = 0;
+let joyXY = {x: 0, y: 0};
+let joyZ = {y: 0};
+let sendInterval = null;
+let gamepadActive = false;
+let gamepadId = null;
+let prevButtons = {};  // Edge detection for gamepad buttons
+
+// --- WebSocket ---
+function connectWS() {
+  const host = window.location.hostname || 'localhost';
+  const url = 'ws://' + host + ':' + WS_PORT;
+  document.getElementById('ws-status').textContent = 'Connecting...';
+
+  try {
+    ws = new WebSocket(url);
+  } catch(e) {
+    setTimeout(connectWS, 2000);
+    return;
+  }
+
+  ws.onopen = function() {
+    wsConnected = true;
+    document.getElementById('ws-dot').className = 'status-dot connected';
+    document.getElementById('ws-status').textContent = 'Connected';
+  };
+
+  ws.onmessage = function(e) {
+    try {
+      const data = JSON.parse(e.data);
+      if (data.type === 'status') {
+        updateStatusDisplay(data);
+      }
+    } catch(err) {}
+  };
+
+  ws.onclose = function() {
+    wsConnected = false;
+    document.getElementById('ws-dot').className = 'status-dot disconnected';
+    document.getElementById('ws-status').textContent = 'Disconnected';
+    setTimeout(connectWS, 2000);
+  };
+
+  ws.onerror = function() {
+    ws.close();
+  };
+}
+
+function sendState() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const speed = SPEED_NAMES[speedIdx];
+  const step = SPEED_PRESETS[speed];
+
+  // Apply deadzone + quadratic response
+  let dx = applyResponse(joyXY.y) * step;  // stick up = +X (forward)
+  let dy = applyResponse(joyXY.x) * step;  // stick right = +Y
+  let dz = applyResponse(joyZ.y) * step;   // stick up = +Z
+
+  // Negate: stick up is negative in browser coords, but we want +X forward
+  dx = -dx;
+  dz = -dz;
+
+  ws.send(JSON.stringify({
+    type: 'state',
+    dx: dx, dy: dy, dz: dz,
+    pitch: pitch, yaw: yaw,
+    speed_name: speed,
+    step_size: step,
+    fine_mode: false,
+    controller: gamepadActive ? ('Gamepad: ' + (gamepadId || '?')) : 'Browser',
+  }));
+}
+
+function sendEvent(action) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({type: 'event', action: action}));
+  // Visual feedback
+  const btn = document.getElementById('btn-' + action.replace('_', '-').replace('open-gripper','open'));
+  if (btn) { btn.classList.add('active'); setTimeout(() => btn.classList.remove('active'), 200); }
+}
+
+function applyResponse(v) {
+  if (Math.abs(v) < DEADZONE) return 0;
+  const sign = v > 0 ? 1 : -1;
+  const norm = (Math.abs(v) - DEADZONE) / (1 - DEADZONE);
+  return sign * norm * norm;
+}
+
+function cycleSpeed() {
+  speedIdx = (speedIdx + 1) % SPEED_NAMES.length;
+  document.getElementById('speed-label').textContent = SPEED_NAMES[speedIdx];
+}
+
+function adjustPitch(dir) {
+  pitch = Math.max(-1, Math.min(1, pitch + dir * ANGLE_STEP));
+}
+
+function adjustYaw(dir) {
+  yaw = Math.max(-1, Math.min(1, yaw + dir * ANGLE_STEP));
+}
+
+const JOINT_NAMES = ['J1','J2','J3','J4','J5','J6','J7'];
+let jointLimits = null; // cached from first status message
+
+function initJointBars() {
+  const container = document.getElementById('joint-rows');
+  container.innerHTML = '';
+  for (let i = 0; i < 7; i++) {
+    const row = document.createElement('div');
+    row.className = 'joint-row';
+    row.innerHTML =
+      '<span class="joint-label">' + JOINT_NAMES[i] + '</span>' +
+      '<span class="joint-limits" id="jlim-' + i + '"></span>' +
+      '<div class="joint-bar-container" id="jbar-' + i + '">' +
+        '<div class="joint-bar-center"></div>' +
+        '<div class="joint-bar-fill" id="jfill-' + i + '"></div>' +
+        '<div class="joint-bar-marker" id="jmark-' + i + '"></div>' +
+      '</div>' +
+      '<span class="joint-value" id="jval-' + i + '"></span>';
+    container.appendChild(row);
+  }
+}
+
+function updateJointDisplay(joints, limits) {
+  if (!joints || joints.length < 7) return;
+  if (limits && limits.length >= 7 && !jointLimits) jointLimits = limits;
+  const lim = jointLimits;
+  if (!lim) return;
+
+  for (let i = 0; i < 7; i++) {
+    const lo = lim[i][0], hi = lim[i][1];
+    const range = hi - lo;
+    const pct = ((joints[i] - lo) / range) * 100;
+    const margin = 0.10; // same as IK margin
+    const nearLimit = (joints[i] < lo + margin) || (joints[i] > hi - margin);
+    const veryNear = (joints[i] < lo + 0.05) || (joints[i] > hi - 0.05);
+
+    const bar = document.getElementById('jbar-' + i);
+    const marker = document.getElementById('jmark-' + i);
+    const fill = document.getElementById('jfill-' + i);
+    const val = document.getElementById('jval-' + i);
+    const limEl = document.getElementById('jlim-' + i);
+
+    if (marker) marker.style.left = 'calc(' + pct.toFixed(1) + '% - 1.5px)';
+
+    // Fill from center to current position
+    const centerPct = ((0 - lo) / range) * 100; // where 0 is on the bar
+    if (pct > centerPct) {
+      fill.style.left = centerPct + '%';
+      fill.style.width = (pct - centerPct) + '%';
+    } else {
+      fill.style.left = pct + '%';
+      fill.style.width = (centerPct - pct) + '%';
+    }
+
+    bar.className = 'joint-bar-container' + (veryNear ? ' danger' : nearLimit ? ' warn' : '');
+    if (val) val.textContent = joints[i].toFixed(2) + '\u00b0'.replace('\u00b0', '');
+    if (val) val.textContent = (joints[i] * 57.296).toFixed(1) + '\u00b0';
+    if (limEl) limEl.textContent = (lo * 57.296).toFixed(0) + '\u00b0 .. ' + (hi * 57.296).toFixed(0) + '\u00b0';
+  }
+}
+
+function updateStatusDisplay(data) {
+  const overlay = document.getElementById('pos-overlay');
+  overlay.style.display = '';
+  const p = data.position || {};
+  document.getElementById('pos-text').textContent =
+    'X: ' + (p.x || 0).toFixed(3) + '  Y: ' + (p.y || 0).toFixed(3) + '  Z: ' + (p.z || 0).toFixed(3);
+  document.getElementById('grip-text').textContent =
+    'Gripper: ' + (data.gripper_width || 0).toFixed(3) + 'm';
+
+  // IK blocked indicator
+  const ikWarn = document.getElementById('ik-warn');
+  ikWarn.style.display = data.ik_blocked ? '' : 'none';
+
+  // Update joint display
+  if (data.joints) {
+    updateJointDisplay(data.joints, data.joint_limits);
+  }
+
+  // Update orientation display
+  if (data.orientation) {
+    const o = data.orientation;
+    document.getElementById('orient-row').innerHTML =
+      'R ' + (o.roll * 57.296).toFixed(1) + '\u00b0<br>' +
+      'P ' + (o.pitch * 57.296).toFixed(1) + '\u00b0<br>' +
+      'Y ' + (o.yaw * 57.296).toFixed(1) + '\u00b0';
+  }
+}
+
+// --- Virtual Joystick ---
+function setupJoystick(containerId, knobId, stateObj, axes) {
+  const container = document.getElementById(containerId);
+  const knob = document.getElementById(knobId);
+  let active = false;
+  let rect = null;
+
+  function getPos(clientX, clientY) {
+    if (!rect) rect = container.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const maxR = rect.width / 2 - 22; // knob radius
+    let dx = (clientX - cx) / maxR;
+    let dy = (clientY - cy) / maxR;
+    // Clamp to circle
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    if (dist > 1) { dx /= dist; dy /= dist; }
+    return {x: dx, y: dy};
+  }
+
+  function updateKnob(nx, ny) {
+    const maxPx = (rect ? rect.width : 120) / 2 - 22;
+    knob.style.transform = 'translate(calc(-50% + ' + (nx * maxPx) + 'px), calc(-50% + ' + (ny * maxPx) + 'px))';
+  }
+
+  function onStart(clientX, clientY) {
+    active = true;
+    rect = container.getBoundingClientRect();
+    container.classList.add('active');
+    onMove(clientX, clientY);
+  }
+
+  function onMove(clientX, clientY) {
+    if (!active) return;
+    const pos = getPos(clientX, clientY);
+    if (axes === 'xy') { stateObj.x = pos.x; stateObj.y = pos.y; updateKnob(pos.x, pos.y); }
+    else if (axes === 'y') { stateObj.y = pos.y; updateKnob(0, pos.y); }
+  }
+
+  function onEnd() {
+    if (!active) return;
+    active = false;
+    container.classList.remove('active');
+    if (axes === 'xy') { stateObj.x = 0; stateObj.y = 0; }
+    else { stateObj.y = 0; }
+    knob.style.transform = 'translate(-50%, -50%)';
+  }
+
+  // Touch events
+  container.addEventListener('touchstart', function(e) {
+    e.preventDefault();
+    const t = e.touches[0];
+    onStart(t.clientX, t.clientY);
+  });
+  container.addEventListener('touchmove', function(e) {
+    e.preventDefault();
+    const t = e.touches[0];
+    onMove(t.clientX, t.clientY);
+  });
+  container.addEventListener('touchend', function(e) { e.preventDefault(); onEnd(); });
+  container.addEventListener('touchcancel', function(e) { e.preventDefault(); onEnd(); });
+
+  // Mouse events
+  container.addEventListener('mousedown', function(e) {
+    e.preventDefault();
+    onStart(e.clientX, e.clientY);
+    function mm(e2) { onMove(e2.clientX, e2.clientY); }
+    function mu() { onEnd(); document.removeEventListener('mousemove', mm); document.removeEventListener('mouseup', mu); }
+    document.addEventListener('mousemove', mm);
+    document.addEventListener('mouseup', mu);
+  });
+}
+
+// --- Browser Gamepad API ---
+function pollGamepad() {
+  const gamepads = navigator.getGamepads ? navigator.getGamepads() : [];
+  let gp = null;
+  for (let i = 0; i < gamepads.length; i++) {
+    if (gamepads[i] && gamepads[i].connected) { gp = gamepads[i]; break; }
+  }
+
+  if (gp) {
+    if (!gamepadActive) {
+      gamepadActive = true;
+      gamepadId = gp.id;
+      document.getElementById('input-source').textContent = 'Gamepad: ' + gp.id.substring(0, 40);
+    }
+
+    // Map axes (Xbox: 0=LX, 1=LY, 2=RX, 3=RY)
+    joyXY.x = gp.axes[0] || 0;
+    joyXY.y = gp.axes[1] || 0;
+    joyZ.y = gp.axes[3] || 0;  // Right stick Y for Z
+
+    // Update knob visuals
+    const xyRect = document.getElementById('joy-xy').getBoundingClientRect();
+    const maxXY = xyRect.width / 2 - 22;
+    document.getElementById('knob-xy').style.transform =
+      'translate(calc(-50% + ' + (joyXY.x * maxXY) + 'px), calc(-50% + ' + (joyXY.y * maxXY) + 'px))';
+    const zRect = document.getElementById('joy-z').getBoundingClientRect();
+    const maxZ = zRect.width / 2 - 22;
+    document.getElementById('knob-z').style.transform =
+      'translate(calc(-50% + 0px), calc(-50% + ' + (joyZ.y * maxZ) + 'px))';
+
+    // Buttons (edge-triggered: only fire on press, not while held)
+    function btnPressed(idx) {
+      const now = gp.buttons[idx] && gp.buttons[idx].pressed;
+      const was = prevButtons[idx] || false;
+      prevButtons[idx] = now;
+      return now && !was;
+    }
+    if (btnPressed(0)) sendEvent('grasp');
+    if (btnPressed(1)) sendEvent('open_gripper');
+    if (btnPressed(2)) cycleSpeed();
+    if (btnPressed(3)) { pitch = 0; yaw = 0; }
+    if (btnPressed(6)) sendEvent('stop_jog');
+
+    // D-pad (edge-triggered)
+    if (btnPressed(12)) adjustPitch(1);
+    if (btnPressed(13)) adjustPitch(-1);
+    if (btnPressed(14)) adjustYaw(-1);
+    if (btnPressed(15)) adjustYaw(1);
+  } else if (gamepadActive) {
+    gamepadActive = false;
+    document.getElementById('input-source').textContent = 'Touch or mouse to control';
+  }
+
+  requestAnimationFrame(pollGamepad);
+}
+
+// --- Init ---
+window.addEventListener('load', function() {
+  // Camera stream
+  var img = document.getElementById('stream');
+  img.onload = function() { img.style.display = ''; document.getElementById('stream-ph').style.display = 'none'; };
+  img.onerror = function() { document.getElementById('stream-ph').textContent = 'Camera unavailable'; };
+  img.src = '/stream';
+
+  // Virtual joysticks
+  setupJoystick('joy-xy', 'knob-xy', joyXY, 'xy');
+  setupJoystick('joy-z', 'knob-z', joyZ, 'y');
+
+  // Joint display
+  initJointBars();
+
+  // WebSocket
+  connectWS();
+
+  // Send state at fixed rate
+  sendInterval = setInterval(sendState, 1000 / SEND_HZ);
+
+  // Gamepad API polling
+  requestAnimationFrame(pollGamepad);
+});
+
+// Prevent context menu on long press (mobile)
+document.addEventListener('contextmenu', function(e) { e.preventDefault(); });
+</script>
+</body>
+</html>"""
+
+
+async def jog_page(request):
+    return HTMLResponse(JOG_PAGE)
+
+
 app = Starlette(
     routes=[
         Route("/", homepage),
         Route("/stream", mjpeg_stream),
+        Route("/jog", jog_page),
         Route("/fusion", fusion_image),
         Route("/depth/texture", depth_texture),
         Route("/depth/colormap", depth_colormap),

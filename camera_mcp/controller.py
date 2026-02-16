@@ -167,6 +167,12 @@ class CameraController:
     def connected(self) -> bool:
         return self._connected
 
+    def ensure_connected(self) -> dict:
+        """Connect if not already connected. Returns connection result."""
+        if self._connected:
+            return {"connected": True, "already_connected": True}
+        return self.connect()
+
     def get_info(self) -> CameraInfo:
         """Get camera information."""
         if self._mock_mode:

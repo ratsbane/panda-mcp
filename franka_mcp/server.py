@@ -221,7 +221,7 @@ async def list_tools() -> list[Tool]:
                     "z": {"type": "number", "description": "Grasp height (meters, default: 0.013 = table)", "default": 0.013},
                     "grasp_width": {"type": "number", "description": "Expected object width (meters, default: 0.03)", "default": 0.03},
                     "grasp_force": {"type": "number", "description": "Grasp force in Newtons (default: 70)", "default": 70},
-                    "x_offset": {"type": "number", "description": "X offset to compensate calibration error (meters, default: 0.04)", "default": 0.04},
+                    "x_offset": {"type": "number", "description": "X offset to compensate calibration error (meters, default: 0.0)", "default": 0.0},
                     "approach_height": {"type": "number", "description": "Height to approach from (meters, default: 0.15)", "default": 0.15},
                 },
                 "required": ["x", "y"],
@@ -328,10 +328,19 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="jog_enable",
-            description="Enable gamepad jog mode. User controls arm with USB gamepad. Left stick=XY, right stick=Z, A=grasp, B=open, X=speed, LB=fine, Back=stop.",
+            description="Enable gamepad jog mode. User controls arm with USB gamepad. Left stick=XY, right stick=Z, A=grasp, B=open, X=speed, LB=fine, Back=stop. Set record=true to capture SAWM training data during jogging — frames captured every 0.5s, grasp (A) ends and labels approach, open (B) starts new approach. Set remote=true for browser-based control via WebSocket (opens port 8766).",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "record": {
+                        "type": "boolean",
+                        "description": "Record frames for SAWM training during jog (default: false)",
+                    },
+                    "remote": {
+                        "type": "boolean",
+                        "description": "Use browser-based WebSocket control instead of USB gamepad (default: false)",
+                    },
+                },
             },
         ),
         Tool(
@@ -345,6 +354,200 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="jog_status",
             description="Get current gamepad jog status including position, speed mode, and stick state.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="vla_enable",
+            description="Enable VLA autonomous control. Model predicts joint actions from camera + state at ~10Hz. "
+                       "Requires inference server running on Spark.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Task instruction (e.g. 'pick up the red block')",
+                    },
+                    "server_url": {
+                        "type": "string",
+                        "default": "http://spark:8085",
+                        "description": "Inference server URL",
+                    },
+                },
+                "required": ["task"],
+            },
+        ),
+        Tool(
+            name="vla_disable",
+            description="Disable VLA autonomous control and return to normal mode.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="vla_status",
+            description="Get VLA control status including step count, inference rate, and current position.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="execute_plan",
+            description="Execute a sequence of skill commands back-to-back with no inter-step latency. "
+                       "Claude plans the full sequence, robot executes it all at once. "
+                       "Supported skills: pick(x,y), place(x,y), move(x,y,z), open_gripper, grasp, home, wait.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "description": "List of skill commands to execute sequentially",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "skill": {
+                                    "type": "string",
+                                    "enum": ["pick", "place", "move", "open_gripper", "grasp", "home", "wait"],
+                                    "description": "Skill to execute",
+                                },
+                                "x": {"type": "number", "description": "X position (meters)"},
+                                "y": {"type": "number", "description": "Y position (meters)"},
+                                "z": {"type": "number", "description": "Z position (meters)"},
+                                "grasp_width": {"type": "number", "description": "Object width for grasp (meters)"},
+                                "grasp_force": {"type": "number", "description": "Grasp force (N)"},
+                                "approach_height": {"type": "number", "description": "Approach height (meters)"},
+                                "width": {"type": "number", "description": "Gripper width (meters)"},
+                                "force": {"type": "number", "description": "Force (N)"},
+                                "seconds": {"type": "number", "description": "Wait duration"},
+                            },
+                            "required": ["skill"],
+                        },
+                    },
+                },
+                "required": ["steps"],
+            },
+        ),
+        Tool(
+            name="skill_episode_start",
+            description="Start logging skill calls for VLM training data. "
+                       "Captures camera frame before each skill in execute_plan. "
+                       "Call this BEFORE execute_plan, then skill_episode_stop when done.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Natural language task description (e.g. 'clear all blocks from the paper')",
+                    },
+                },
+                "required": ["task"],
+            },
+        ),
+        Tool(
+            name="skill_episode_stop",
+            description="Stop skill episode logging and save to disk. "
+                       "Captures a final 'done' frame showing the end state.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "success": {
+                        "type": "boolean",
+                        "description": "Whether the episode was successful",
+                    },
+                },
+                "required": ["success"],
+            },
+        ),
+        Tool(
+            name="skill_episode_list",
+            description="List all collected skill episodes for VLM training.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="servo_pick_at",
+            description="Pick an object using visual servo approach. Gripper tilts forward "
+                       "(visible to camera), iteratively homes in on target using visual feedback, "
+                       "then untilts and grasps. Works in fallback mode (no model) for data collection. "
+                       "Provide rough x,y position hint — servo loop refines from there.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number", "description": "Rough X position hint (meters)"},
+                    "y": {"type": "number", "description": "Rough Y position hint (meters)"},
+                    "grasp_width": {"type": "number", "description": "Expected object width (meters, default: 0.03)", "default": 0.03},
+                    "grasp_force": {"type": "number", "description": "Grasp force in Newtons (default: 70)", "default": 70},
+                    "grasp_z": {"type": "number", "description": "Grasp height (meters, default: 0.013)", "default": 0.013},
+                    "approach_height": {"type": "number", "description": "Lift height after grasp (meters, default: 0.15)", "default": 0.15},
+                    "servo_z": {"type": "number", "description": "Height during servo (meters, default: 0.05)", "default": 0.05},
+                    "servo_pitch": {"type": "number", "description": "Forward tilt angle (radians, default: 0.3)", "default": 0.3},
+                    "gain": {"type": "number", "description": "Fraction of offset to move each step (default: 0.5)", "default": 0.5},
+                    "max_iterations": {"type": "integer", "description": "Maximum servo iterations (default: 20)", "default": 20},
+                    "convergence_threshold": {"type": "number", "description": "Stop when offset below this (meters, default: 0.015)", "default": 0.015},
+                    "model_path": {"type": "string", "description": "Path to SAWM servo ONNX model (omit for fallback/data-collection mode)"},
+                    "collect_data": {"type": "boolean", "description": "Record frames for training (default: true)", "default": True},
+                },
+                "required": ["x", "y"],
+            },
+        ),
+        Tool(
+            name="sawm_enable",
+            description="Enable SAWM inference monitor for trajectory correction during picks. "
+                       "Loads an ONNX model that predicts gripper-to-target offsets and corrects "
+                       "pick trajectories in real-time. Requires training first.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "model_path": {
+                        "type": "string",
+                        "description": "Path to SAWM ONNX model file",
+                    },
+                },
+                "required": ["model_path"],
+            },
+        ),
+        Tool(
+            name="sawm_disable",
+            description="Disable SAWM inference monitor.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="sawm_status",
+            description="Get SAWM monitor status including prediction count and last correction.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="sawm_collect_enable",
+            description="Enable SAWM data collection. Records progressive crops during pick_at() for self-supervised learning. "
+                       "Each successful grasp generates labeled training data automatically.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="sawm_collect_disable",
+            description="Disable SAWM data collection.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="sawm_collect_stats",
+            description="Get SAWM data collection statistics: total approaches, success rate, frames collected.",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -403,7 +606,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return json_response(state.to_dict())
         
         elif name == "move_cartesian":
-            result = controller.move_cartesian(
+            result = controller.move_cartesian_ik(
                 x=arguments["x"],
                 y=arguments["y"],
                 z=arguments["z"],
@@ -463,7 +666,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 z=arguments.get("z", 0.013),
                 grasp_width=arguments.get("grasp_width", 0.03),
                 grasp_force=arguments.get("grasp_force", 70),
-                x_offset=arguments.get("x_offset", 0.04),
+                x_offset=arguments.get("x_offset", 0.0),
                 approach_height=arguments.get("approach_height", 0.15),
             )
             return json_response(result)
@@ -511,7 +714,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return json_response(result)
 
         elif name == "jog_enable":
-            result = controller.start_jog()
+            result = controller.start_jog(
+                record=arguments.get("record", False),
+                remote=arguments.get("remote", False),
+            )
             return json_response(result)
 
         elif name == "jog_disable":
@@ -520,6 +726,80 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "jog_status":
             result = controller.get_jog_status()
+            return json_response(result)
+
+        elif name == "vla_enable":
+            result = controller.start_vla(
+                server_url=arguments.get("server_url", "http://spark:8085"),
+                task=arguments["task"],
+            )
+            return json_response(result)
+
+        elif name == "vla_disable":
+            result = controller.stop_vla()
+            return json_response(result)
+
+        elif name == "vla_status":
+            result = controller.get_vla_status()
+            return json_response(result)
+
+        elif name == "execute_plan":
+            result = controller.execute_plan(steps=arguments["steps"])
+            return json_response(result)
+
+        elif name == "skill_episode_start":
+            result = controller.start_skill_episode(task=arguments["task"])
+            return json_response(result)
+
+        elif name == "skill_episode_stop":
+            result = controller.stop_skill_episode(success=arguments["success"])
+            return json_response(result)
+
+        elif name == "skill_episode_list":
+            result = controller.list_skill_episodes()
+            return json_response(result)
+
+        elif name == "servo_pick_at":
+            result = controller.servo_pick_at(
+                x=arguments["x"],
+                y=arguments["y"],
+                grasp_width=arguments.get("grasp_width", 0.03),
+                grasp_force=arguments.get("grasp_force", 70),
+                grasp_z=arguments.get("grasp_z", 0.013),
+                approach_height=arguments.get("approach_height", 0.15),
+                servo_z=arguments.get("servo_z", 0.05),
+                servo_pitch=arguments.get("servo_pitch", 0.3),
+                gain=arguments.get("gain", 0.5),
+                max_step=arguments.get("max_step", 0.03),
+                convergence_threshold=arguments.get("convergence_threshold", 0.015),
+                max_iterations=arguments.get("max_iterations", 20),
+                model_path=arguments.get("model_path"),
+                collect_data=arguments.get("collect_data", True),
+            )
+            return json_response(result)
+
+        elif name == "sawm_enable":
+            result = controller.sawm_enable(model_path=arguments["model_path"])
+            return json_response(result)
+
+        elif name == "sawm_disable":
+            result = controller.sawm_disable()
+            return json_response(result)
+
+        elif name == "sawm_status":
+            result = controller.sawm_status()
+            return json_response(result)
+
+        elif name == "sawm_collect_enable":
+            result = controller.sawm_collect_enable()
+            return json_response(result)
+
+        elif name == "sawm_collect_disable":
+            result = controller.sawm_collect_disable()
+            return json_response(result)
+
+        elif name == "sawm_collect_stats":
+            result = controller.sawm_collect_stats()
             return json_response(result)
 
         elif name == "get_safety_limits":

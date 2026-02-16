@@ -1,6 +1,10 @@
 """
 Camera client - subscribes to frames from camera daemon via ZeroMQ.
 
+Uses a fresh ZMQ socket per frame request to guarantee freshness.
+A persistent socket buffers frames between calls, causing staleness
+when calls are seconds/minutes apart (e.g. MCP tool calls).
+
 Usage:
     from camera_daemon import CameraClient, get_camera_client
 
@@ -61,7 +65,6 @@ class CameraClient:
         self.timeout_ms = timeout_ms
 
         self.context: Optional[zmq.Context] = None
-        self.socket: Optional[zmq.Socket] = None
         self.connected = False
         self.active_endpoint = None
 
@@ -71,20 +74,16 @@ class CameraClient:
         self._last_channels = 0
 
     def connect(self) -> bool:
-        """Connect to the camera daemon."""
+        """Connect to the camera daemon (validates endpoint)."""
         if self.connected:
             return True
 
         self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.SUB)
-        self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
-        self.socket.setsockopt_string(zmq.SUBSCRIBE, "frame")
 
         # Try primary endpoint first (IPC)
         try:
-            self.socket.connect(self.endpoint)
-            # Test connection by trying to receive a frame
-            self._receive_frame_internal()
+            parts = self._fresh_recv(self.endpoint)
+            self._parse_metadata(parts)
             self.connected = True
             self.active_endpoint = self.endpoint
             logger.info(f"Connected to camera daemon at {self.endpoint}")
@@ -97,14 +96,8 @@ class CameraClient:
         # Try fallback endpoint (TCP)
         if self.fallback_endpoint:
             try:
-                # Need to recreate socket to change endpoint
-                self.socket.close()
-                self.socket = self.context.socket(zmq.SUB)
-                self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
-                self.socket.setsockopt_string(zmq.SUBSCRIBE, "frame")
-                self.socket.connect(self.fallback_endpoint)
-
-                self._receive_frame_internal()
+                parts = self._fresh_recv(self.fallback_endpoint)
+                self._parse_metadata(parts)
                 self.connected = True
                 self.active_endpoint = self.fallback_endpoint
                 logger.info(f"Connected to camera daemon at {self.fallback_endpoint}")
@@ -121,43 +114,50 @@ class CameraClient:
         self.connected = False
         self.active_endpoint = None
 
-        if self.socket:
-            self.socket.close()
-            self.socket = None
-
         if self.context:
             self.context.term()
             self.context = None
 
-    def _receive_frame_internal(self) -> Tuple[np.ndarray, int, int, int]:
-        """Receive a frame from ZMQ. Raises zmq.Again on timeout."""
-        parts = self.socket.recv_multipart()
+    def _fresh_recv(self, endpoint: str) -> list:
+        """Create a fresh ZMQ socket, receive one frame, close socket.
 
-        if len(parts) != 3:
-            raise ValueError(f"Expected 3 message parts, got {len(parts)}")
+        This guarantees the frame was published AFTER the socket was created,
+        eliminating any stale buffered frames. Same approach as the web
+        viewer's _grab_usb_frame().
 
-        topic, metadata_bytes, jpeg_bytes = parts
+        Args:
+            endpoint: ZMQ endpoint to connect to
 
-        # Parse metadata
-        metadata = np.frombuffer(metadata_bytes, dtype=np.int32)
-        width, height, channels = metadata
+        Returns:
+            Raw multipart message parts
 
-        # Decode JPEG
-        jpeg_array = np.frombuffer(jpeg_bytes, dtype=np.uint8)
-        frame = cv2.imdecode(jpeg_array, cv2.IMREAD_COLOR)
+        Raises:
+            zmq.Again: on timeout
+            zmq.ZMQError: on connection failure
+        """
+        sock = self.context.socket(zmq.SUB)
+        sock.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
+        sock.setsockopt_string(zmq.SUBSCRIBE, "frame")
+        try:
+            sock.connect(endpoint)
+            parts = sock.recv_multipart()
+            return parts
+        finally:
+            sock.close()
 
-        if frame is None:
-            raise ValueError("Failed to decode JPEG frame")
-
-        self._last_width = int(width)
-        self._last_height = int(height)
-        self._last_channels = int(channels)
-
-        return frame, int(width), int(height), int(channels)
+    def _parse_metadata(self, parts: list):
+        """Parse metadata from multipart message and update cache."""
+        if len(parts) >= 3:
+            metadata = np.frombuffer(parts[1], dtype=np.int32)
+            self._last_width = int(metadata[0])
+            self._last_height = int(metadata[1])
+            self._last_channels = int(metadata[2])
 
     def get_frame(self) -> Optional[np.ndarray]:
         """
         Get the latest frame from the camera daemon.
+
+        Creates a fresh ZMQ socket per call to guarantee frame freshness.
 
         Returns:
             numpy array (BGR format) or None if not connected/timeout
@@ -167,7 +167,23 @@ class CameraClient:
                 return None
 
         try:
-            frame, _, _, _ = self._receive_frame_internal()
+            parts = self._fresh_recv(self.active_endpoint)
+
+            if len(parts) != 3:
+                logger.error(f"Expected 3 message parts, got {len(parts)}")
+                return None
+
+            topic, metadata_bytes, jpeg_bytes = parts
+            self._parse_metadata(parts)
+
+            # Decode JPEG
+            jpeg_array = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(jpeg_array, cv2.IMREAD_COLOR)
+
+            if frame is None:
+                logger.error("Failed to decode JPEG frame")
+                return None
+
             return frame
         except zmq.Again:
             logger.warning("Timeout waiting for frame")
@@ -180,6 +196,8 @@ class CameraClient:
         """
         Get the latest frame as JPEG bytes (avoids decode/re-encode).
 
+        Creates a fresh ZMQ socket per call to guarantee frame freshness.
+
         Returns:
             JPEG bytes or None if not connected/timeout
         """
@@ -188,17 +206,13 @@ class CameraClient:
                 return None
 
         try:
-            parts = self.socket.recv_multipart()
+            parts = self._fresh_recv(self.active_endpoint)
+
             if len(parts) != 3:
                 return None
 
             _, metadata_bytes, jpeg_bytes = parts
-
-            # Update cached info
-            metadata = np.frombuffer(metadata_bytes, dtype=np.int32)
-            self._last_width = int(metadata[0])
-            self._last_height = int(metadata[1])
-            self._last_channels = int(metadata[2])
+            self._parse_metadata(parts)
 
             return bytes(jpeg_bytes)
         except zmq.Again:

@@ -94,18 +94,47 @@ def quaternion_to_rotation_matrix(q: np.ndarray) -> np.ndarray:
     ])
 
 
+
+# Good reference pose for tabletop picking (straight down, elbow up)
+# This is close to the home pose but with slight forward reach
+_REFERENCE_JOINTS = np.array([0.0, -0.3, 0.0, -2.2, 0.0, 2.0, 0.785])
+
+# Panda joint limits
+_JOINT_LIMITS = np.array([
+    [-2.8973, 2.8973],
+    [-1.7628, 1.7628],
+    [-2.8973, 2.8973],
+    [-3.0718, -0.0698],
+    [-2.8973, 2.8973],
+    [-0.0175, 3.7525],
+    [-2.8973, 2.8973],
+])
+
+# Joint centers (midpoint of limits)
+_JOINT_CENTERS = (_JOINT_LIMITS[:, 0] + _JOINT_LIMITS[:, 1]) / 2.0
+_JOINT_RANGES = _JOINT_LIMITS[:, 1] - _JOINT_LIMITS[:, 0]
+
+
 def _solve_ik(
     position: np.ndarray,
     orientation_quat: np.ndarray,
     current_joints: np.ndarray,
+    max_single_joint_change: float = 1.5,
+    frozen_joints: Optional[dict] = None,
 ) -> Optional[np.ndarray]:
     """
     Solve analytical IK for a target Cartesian pose.
+
+    Uses panda_py.ik() with current joints as seed to find the nearest
+    valid solution. Tries the current q7 first, then nearby values,
+    to minimize unnecessary joint movement.
 
     Args:
         position: Target [x, y, z] in meters
         orientation_quat: Target quaternion [x, y, z, w]
         current_joints: Current 7 joint angles (used as seed)
+        max_single_joint_change: Max change for any single joint (radians)
+        frozen_joints: Dict mapping joint index to desired value (soft penalty)
 
     Returns:
         Best joint solution (7,) or None if no valid solution found.
@@ -113,74 +142,87 @@ def _solve_ik(
     if not PANDA_PY_AVAILABLE:
         return None
 
-    # Build 4x4 SE(3) target pose
-    R = quaternion_to_rotation_matrix(orientation_quat)
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = position
+    x, y, z = position
+    margin = 0.10  # ~5.7 degrees from joint limits
 
-    # Panda joint limits for filtering
-    joint_limits = np.array([
-        [-2.8973, 2.8973],
-        [-1.7628, 1.7628],
-        [-2.8973, 2.8973],
-        [-3.0718, -0.0698],
-        [-2.8973, 2.8973],
-        [-0.0175, 3.7525],
-        [-2.8973, 2.8973],
-    ])
+    # Build q7 candidates: current q7 first, then nearby, then fixed
+    current_q7 = float(current_joints[6])
+    q7_candidates = [
+        current_q7,
+        current_q7 + 0.2, current_q7 - 0.2,
+        current_q7 + 0.5, current_q7 - 0.5,
+        0.785, 0.0, -0.785, 1.57,
+    ]
+    # Deduplicate (keep order) and clamp to joint 7 limits
+    seen = set()
+    unique_q7 = []
+    for q7 in q7_candidates:
+        q7 = max(_JOINT_LIMITS[6, 0] + margin, min(_JOINT_LIMITS[6, 1] - margin, q7))
+        key = round(q7, 2)
+        if key not in seen:
+            seen.add(key)
+            unique_q7.append(q7)
 
     best_solution = None
     best_cost = float('inf')
 
-    # Try multiple q_7 values to explore the null space
-    q7_candidates = [0.785, 0.0, -0.785, 1.57]
-
-    for q7 in q7_candidates:
+    for q7 in unique_q7:
         try:
-            solutions = panda_py.ik_full(T, current_joints, q7)
+            # panda_py.ik returns the solution closest to current_joints
+            sol = panda_py.ik(position, orientation_quat, current_joints, q7)
         except Exception as e:
-            logger.debug(f"IK failed for q7={q7}: {e}")
+            logger.debug(f"IK failed for q7={q7:.3f}: {e}")
             continue
 
-        if solutions is None or len(solutions) == 0:
+        if sol is None:
             continue
 
-        for sol in solutions:
-            sol = np.array(sol)
-            if sol.shape != (7,):
-                continue
+        sol = np.array(sol).flatten()
+        if sol.shape != (7,):
+            continue
 
-            # Check joint limits (with small margin)
-            margin = 0.01
-            in_limits = True
-            for i in range(7):
-                if sol[i] < joint_limits[i, 0] + margin or sol[i] > joint_limits[i, 1] - margin:
-                    in_limits = False
-                    break
-            if not in_limits:
-                continue
+        # Hard reject: joint limits
+        in_limits = True
+        for i in range(7):
+            if sol[i] < _JOINT_LIMITS[i, 0] + margin or sol[i] > _JOINT_LIMITS[i, 1] - margin:
+                in_limits = False
+                break
+        if not in_limits:
+            continue
 
-            # Verify with FK: position error < 2mm
-            try:
-                fk_pose = panda_py.fk(sol)
-                fk_pos = fk_pose[:3, 3]
-                pos_error = np.linalg.norm(fk_pos - position)
-                if pos_error > 0.002:
-                    continue
-            except Exception:
-                continue
+        # Hard reject: max single joint change
+        joint_changes = np.abs(sol - current_joints)
+        if np.any(joint_changes > max_single_joint_change):
+            continue
 
-            # Cost: minimize joint travel + prefer q7 near 0.785 (good picking orientation)
-            cost = np.sum((sol - current_joints) ** 2) + 2.0 * (sol[6] - 0.785) ** 2
-            if cost < best_cost:
-                best_cost = cost
-                best_solution = sol
+        # Verify with FK: position error < 3mm
+        try:
+            fk_pose = panda_py.fk(sol)
+            pos_error = np.linalg.norm(fk_pose[:3, 3] - position)
+            if pos_error > 0.003:
+                continue
+        except Exception:
+            continue
+
+        # Cost: minimize total joint travel (the only thing that matters)
+        travel = np.sum((sol - current_joints) ** 2)
+
+        # Small penalty for being near joint limits
+        normalized_pos = (sol - _JOINT_CENTERS) / (_JOINT_RANGES / 2)
+        limit_penalty = 0.1 * np.sum(normalized_pos ** 4)  # quartic: only bites near limits
+
+        cost = travel + limit_penalty
+        if cost < best_cost:
+            best_cost = cost
+            best_solution = sol
 
     if best_solution is not None:
-        logger.info(f"IK solution found (cost={best_cost:.3f}, q7={best_solution[6]:.3f})")
+        max_change = np.max(np.abs(best_solution - current_joints))
+        logger.info(
+            f"IK solution: travel={best_cost:.3f}, max_change={max_change:.3f} rad"
+        )
     else:
-        logger.warning("No valid IK solution found")
+        logger.warning(f"No valid IK solution for target ({x:.3f}, {y:.3f}, {z:.3f})")
 
     return best_solution
 
@@ -497,6 +539,7 @@ class FrankaController:
         pitch: Optional[float] = None,
         yaw: Optional[float] = None,
         confirmed: bool = False,
+        frozen_joints: Optional[dict] = None,
     ) -> dict:
         """
         Move end effector to Cartesian position using analytical IK.
@@ -557,7 +600,8 @@ class FrankaController:
         target_pos = np.array([x, y, z])
         current_joints = np.array(current_state.joint_positions)
 
-        solution = _solve_ik(target_pos, target_quat, current_joints)
+        solution = _solve_ik(target_pos, target_quat, current_joints,
+                             frozen_joints=frozen_joints)
 
         if solution is None:
             return {
@@ -578,7 +622,7 @@ class FrankaController:
             R_err = R_target.T @ R_fk
             angle_error = np.arccos(np.clip((np.trace(R_err) - 1) / 2, -1, 1))
 
-            if pos_error > 0.002:
+            if pos_error > 0.003:
                 return {
                     "success": False,
                     "error": f"IK solution position error too large: {pos_error*1000:.1f}mm",
@@ -630,7 +674,7 @@ class FrankaController:
         y = state.ee_position[1] + dy
         z = state.ee_position[2] + dz
 
-        return self.move_cartesian(
+        return self.move_cartesian_ik(
             x, y, z,
             roll=state.ee_orientation[0],
             pitch=state.ee_orientation[1],
@@ -929,7 +973,7 @@ class FrankaController:
         z: float = 0.013,
         grasp_width: float = 0.03,
         grasp_force: float = 70.0,
-        x_offset: float = 0.04,
+        x_offset: float = 0.0,
         approach_height: float = 0.15,
     ) -> dict:
         """
@@ -957,6 +1001,16 @@ class FrankaController:
         pick_pitch = 0.0
         pick_yaw = 0.0
 
+        # SAWM data collection: start approach if collector is active
+        sawm_active = hasattr(self, '_sawm_collector') and self._sawm_collector is not None
+        if sawm_active:
+            self._sawm_collector.start_approach(target_robot_xy=(x, y))  # use original position
+
+        # SAWM monitor: start background inference if monitor is loaded
+        sawm_monitor = hasattr(self, '_sawm_monitor') and self._sawm_monitor is not None
+        if sawm_monitor:
+            self._sawm_monitor.start(target_xy=(x, y))  # use original position, not offset
+
         # Step 1: Open gripper
         result = self.gripper_move(0.08)
         steps.append({"action": "open_gripper", "result": result})
@@ -967,11 +1021,15 @@ class FrankaController:
             roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True)
         steps.append({"action": "approach_above", "method": "ik", "result": result})
 
+        # SAWM: record frame at approach height
+        if sawm_active:
+            self._sawm_record_frame()
+
         # Step 3: Lower in increments (avoid large joint changes that trigger reflex)
         state = self.get_state()
         current_z = state.ee_position[2]
         step_z = 0.04  # 4cm increments
-        while current_z - step_z > z + step_z:
+        while current_z - step_z > z:
             intermediate_z = current_z - step_z
             result = self.move_cartesian_ik(
                 target_x, y, intermediate_z,
@@ -979,6 +1037,27 @@ class FrankaController:
             steps.append({"action": "lower_step", "method": "ik", "target_z": round(intermediate_z, 4), "result": result})
             state = self.get_state()
             current_z = state.ee_position[2]
+
+            # SAWM: record frame at each Z step
+            if sawm_active:
+                self._sawm_record_frame()
+
+            # SAWM monitor: check for correction (clamped to ±15mm)
+            if sawm_monitor:
+                correction = self._sawm_monitor.get_correction()
+                if correction:
+                    cdx, cdy = correction
+                    MAX_CORRECTION = 0.015  # 15mm max per step
+                    cdx = max(-MAX_CORRECTION, min(MAX_CORRECTION, cdx))
+                    cdy = max(-MAX_CORRECTION, min(MAX_CORRECTION, cdy))
+                    target_x += cdx
+                    y += cdy
+                    steps.append({
+                        "action": "sawm_correction",
+                        "dx_mm": round(cdx * 1000, 1),
+                        "dy_mm": round(cdy * 1000, 1),
+                    })
+                    logger.info(f"SAWM correction applied: dx={cdx*1000:.1f}mm dy={cdy*1000:.1f}mm")
 
         # Final lower to grasp height
         result = self.move_cartesian_ik(
@@ -988,6 +1067,10 @@ class FrankaController:
         state = self.get_state()
         actual_z = state.ee_position[2]
         steps.append({"action": "check_z", "target_z": z, "actual_z": round(actual_z, 4)})
+
+        # SAWM: record frame at grasp height (closest frame)
+        if sawm_active:
+            self._sawm_record_frame()
 
         # Step 4: Grasp
         result = self.gripper_grasp(width=grasp_width, force=grasp_force)
@@ -1001,6 +1084,18 @@ class FrankaController:
         min_grip = 0.001  # 1mm - below this means fully closed / empty
         grasped = actual_grip > min_grip and actual_grip < grasp_width + 0.005
         steps.append({"action": "check_grasp", "gripper_width": round(actual_grip, 4), "grasped": grasped})
+
+        # SAWM: end approach with grasp result
+        if sawm_active:
+            ee = self.get_state().ee_position
+            self._sawm_collector.end_approach(
+                success=grasped,
+                final_gripper_xy=(ee[0], ee[1]),
+            )
+
+        # SAWM monitor: stop
+        if sawm_monitor:
+            self._sawm_monitor.stop()
 
         # Step 5: Lift (IK with straight-down orientation)
         state = self.get_state()
@@ -1021,6 +1116,29 @@ class FrankaController:
             },
             "steps": steps,
         }
+
+    def _sawm_record_frame(self):
+        """Capture a camera frame and record it for SAWM data collection."""
+        try:
+            from camera_daemon.client import get_camera_client
+            client = get_camera_client()
+            frame = client.get_frame()
+            if frame is None:
+                logger.warning("SAWM: no camera frame available")
+                return
+
+            state = self.get_state()
+            ee = state.ee_position
+            joints = np.array(state.joint_positions)
+
+            self._sawm_collector.record_frame(
+                frame=frame,
+                gripper_robot_xy=(ee[0], ee[1]),
+                gripper_z=ee[2],
+                joints=joints,
+            )
+        except Exception as e:
+            logger.warning(f"SAWM frame recording failed: {e}")
 
     def place_at(
         self,
@@ -1114,52 +1232,113 @@ class FrankaController:
 
     # --- Gamepad jog mode ---
 
-    def start_jog(self) -> dict:
-        """Start gamepad jog mode. Polls gamepad and executes small moves."""
+    def start_jog(self, record: bool = False, remote: bool = False) -> dict:
+        """Start gamepad jog mode. Polls gamepad and executes small moves.
+
+        Args:
+            record: If True, capture frames during jogging for SAWM training.
+                    Frames are recorded every 0.5s or 10mm of movement.
+                    On successful grasp (A button), the approach is saved
+                    and a new one starts automatically.
+            remote: If True, start a WebSocket server for browser-based control
+                    instead of using a local USB gamepad.
+        """
         if not self._connected:
             return {"success": False, "error": "Not connected"}
 
         if hasattr(self, '_jog_active') and self._jog_active:
             return {"success": False, "error": "Jog already active"}
 
-        try:
-            from .gamepad import GamepadHandler
-        except (ImportError, ModuleNotFoundError):
-            import importlib.util as _ilu
-            _spec = _ilu.spec_from_file_location(
-                "gamepad", __file__.replace("controller.py", "gamepad.py"))
-            _mod = _ilu.module_from_spec(_spec)
-            _spec.loader.exec_module(_mod)
-            GamepadHandler = _mod.GamepadHandler
-        self._gamepad = GamepadHandler()
+        if remote:
+            try:
+                from .web_gamepad import WebGamepad
+            except (ImportError, ModuleNotFoundError):
+                import importlib.util as _ilu
+                _spec = _ilu.spec_from_file_location(
+                    "web_gamepad", __file__.replace("controller.py", "web_gamepad.py"))
+                _mod = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                WebGamepad = _mod.WebGamepad
+            self._gamepad = WebGamepad()
+        else:
+            try:
+                from .gamepad import GamepadHandler
+            except (ImportError, ModuleNotFoundError):
+                import importlib.util as _ilu
+                _spec = _ilu.spec_from_file_location(
+                    "gamepad", __file__.replace("controller.py", "gamepad.py"))
+                _mod = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                GamepadHandler = _mod.GamepadHandler
+            self._gamepad = GamepadHandler()
         result = self._gamepad.start()
         if not result["success"]:
             return result
 
         self._jog_active = True
+        self._jog_recording = record
+        self._jog_frozen_joints = None
+        self._jog_last_pitch = 0.0
+        self._jog_last_yaw = 0.0
+
         self._jog_thread = threading.Thread(target=self._jog_loop, daemon=True)
         self._jog_thread.start()
 
-        return {
+        response = {
             "success": True,
-            "message": "Gamepad jog mode enabled",
+            "message": "Gamepad jog mode enabled" + (" (RECORDING)" if record else ""),
+            "recording": record,
+            "remote": remote,
             "controller": result.get("controller", ""),
             "controls": {
                 "left_stick": "X-Y motion",
                 "right_stick_y": "Z motion (up/down)",
-                "A": "Grasp (30mm, 70N)",
-                "B": "Open gripper",
+                "dpad_up_down": "Pitch (tilt gripper forward/back)",
+                "dpad_left_right": "Yaw (rotate gripper)",
+                "A": "Grasp (30mm, 70N)" + (" — ends approach, labels data" if record else ""),
+                "B": "Open gripper" + (" — starts new approach" if record else ""),
                 "X": "Cycle speed (slow/medium/fast)",
-                "LB_hold": "Fine mode (1mm steps)",
+                "Y": "Reset pitch/yaw to zero (straight down)",
+                "LB_hold": "Fine mode (1mm steps, 0.6° angle steps)",
                 "Back": "Stop jog mode",
             },
             "speed": "medium (5mm/step)",
         }
+        if remote:
+            response["websocket_port"] = result.get("port", 8766)
+            response["message"] += f" — WebSocket on port {result.get('port', 8766)}"
+        return response
 
     def _jog_loop(self):
         """Background thread: read gamepad, execute moves."""
         logger.info("Jog loop started")
         move_interval = 0.05  # ~20Hz max move rate
+
+        # Recording state
+        recording = getattr(self, '_jog_recording', False)
+        collector = None
+        camera = None
+        last_record_time = 0.0
+        last_record_xy = (0.0, 0.0)
+        record_interval = 0.5  # seconds between frame captures
+        record_dist = 0.01    # 10mm minimum movement between captures
+
+        if recording:
+            try:
+                from common.sawm.servo_collector import get_servo_collector
+                from camera_daemon.client import get_camera_client
+                collector = get_servo_collector()
+                camera = get_camera_client()
+                camera.connect()
+                # Start first approach
+                current = self.get_state()
+                collector.start_approach(
+                    target_hint_xy=(current.ee_position[0], current.ee_position[1])
+                )
+                logger.info("Jog recording: started first approach")
+            except Exception as e:
+                logger.error(f"Failed to initialize jog recording: {e}")
+                recording = False
 
         while self._jog_active:
             try:
@@ -1176,34 +1355,180 @@ class FrankaController:
                             self.gripper_grasp(width=0.03, force=70, speed=0.1)
                         except Exception as e:
                             logger.warning(f"Grasp failed: {e}")
+                        # Check if grasp succeeded (for recording)
+                        # Do this even if gripper_grasp threw — end the approach either way
+                        if recording and collector and collector.active:
+                            time.sleep(0.1)  # Let gripper settle
+                            rs = self.get_state()
+                            gw = rs.gripper_width
+                            # Holding something: not fully closed (<2mm) and not fully open (>70mm)
+                            grasped = gw > 0.002 and gw < 0.070
+                            gxy = (rs.ee_position[0], rs.ee_position[1])
+                            result = collector.end_approach(
+                                success=grasped, final_gripper_xy=gxy
+                            )
+                            logger.info(
+                                f"Jog recording: approach ended — "
+                                f"{'SUCCESS' if grasped else 'FAIL'} "
+                                f"(gripper_width={gw:.4f}), "
+                                f"{result.get('frames', 0)} frames"
+                            )
                     elif event.action == "open_gripper":
                         try:
                             self.gripper_move(0.08)
+                            # Start a new approach if recording
+                            if recording and collector and not collector.active:
+                                current = self.get_state()
+                                collector.start_approach(
+                                    target_hint_xy=(current.ee_position[0], current.ee_position[1])
+                                )
+                                last_record_time = 0.0
+                                last_record_xy = (0.0, 0.0)
+                                logger.info("Jog recording: started new approach")
                         except Exception as e:
                             logger.warning(f"Gripper open failed: {e}")
+                    elif event.action == "home":
+                        try:
+                            logger.info("Jog: returning to home position")
+                            self._robot.move_to_joint_position(
+                                [0, -0.785, 0, -2.356, 0, 1.571, 0.785],
+                                speed_factor=0.2,
+                            )
+                            if hasattr(self, '_jog_frozen_joints'):
+                                self._jog_frozen_joints = None
+                        except Exception as e:
+                            logger.warning(f"Home failed: {e}")
 
                 if not self._jog_active:
                     break
 
-                # Execute move if sticks are displaced (IK-based for pure Cartesian motion)
-                if state.dx != 0 or state.dy != 0 or state.dz != 0:
+                # Execute move if sticks or D-pad are displaced
+                has_motion = state.dx != 0 or state.dy != 0 or state.dz != 0
+                # D-pad: detect changes in browser's accumulated pitch/yaw
+                pitch_delta = state.pitch - self._jog_last_pitch
+                yaw_delta = state.yaw - self._jog_last_yaw
+                has_orientation = abs(pitch_delta) > 0.001 or abs(yaw_delta) > 0.001
+
+                if has_motion or has_orientation:
                     try:
+                        # Auto-recover from error state before moving
                         current = self.get_state()
+                        if current.has_error:
+                            logger.warning(f"Jog: auto-recovering from {current.error_message}")
+                            try:
+                                self._robot.recover()
+                                time.sleep(0.2)
+                            except Exception as re:
+                                logger.error(f"Jog: recovery failed: {re}")
+                                time.sleep(1.0)
+                                continue
                         target_x = current.ee_position[0] + state.dx
                         target_y = current.ee_position[1] + state.dy
                         target_z = current.ee_position[2] + state.dz
-                        self.move_cartesian_ik(
-                            target_x, target_y, target_z,
-                            confirmed=True,
+                        # Always use current arm orientation + any d-pad delta
+                        # This prevents drift and avoids fighting accumulated error
+                        target_pitch = current.ee_orientation[1] + pitch_delta
+                        target_yaw = current.ee_orientation[2] + yaw_delta
+
+                        # Solve IK directly with current joints as seed
+                        # (avoids double get_state() and threshold mismatch in move_cartesian_ik)
+                        target_quat = euler_to_quaternion(
+                            current.ee_orientation[0], target_pitch, target_yaw
                         )
+                        target_pos = np.array([target_x, target_y, target_z])
+                        current_joints = np.array(current.joint_positions)
+
+                        solution = _solve_ik(
+                            target_pos, target_quat, current_joints,
+                            frozen_joints=getattr(self, '_jog_frozen_joints', None),
+                        )
+
+                        if solution is not None:
+                            self._robot.move_to_joint_position(
+                                solution, speed_factor=0.15,
+                            )
+                            self._jog_ik_fail_count = 0
+                        else:
+                            self._jog_ik_fail_count = getattr(self, '_jog_ik_fail_count', 0) + 1
+                            logger.warning(
+                                f"Jog IK failed: no solution for "
+                                f"target=({target_x:.3f},{target_y:.3f},{target_z:.3f}) "
+                                f"pitch={target_pitch:.3f} yaw={target_yaw:.3f}"
+                            )
+                        self._jog_last_pitch = state.pitch
+                        self._jog_last_yaw = state.yaw
                     except Exception as e:
                         logger.warning(f"Jog move failed: {e}")
+                        try:
+                            self._robot.recover()
+                        except Exception:
+                            pass
+                else:
+                    # No motion requested — clear IK blocked indicator
+                    self._jog_ik_fail_count = 0
+
+                # Push status to WebSocket clients (if remote gamepad)
+                if hasattr(self._gamepad, 'update_status'):
+                    try:
+                        current_st = self.get_state()
+                        self._gamepad.update_status(
+                            position={
+                                "x": round(current_st.ee_position[0], 4),
+                                "y": round(current_st.ee_position[1], 4),
+                                "z": round(current_st.ee_position[2], 4),
+                            },
+                            gripper_width=current_st.gripper_width,
+                            speed=state.speed_name,
+                            joints=[round(q, 4) for q in current_st.joint_positions],
+                            joint_limits=_JOINT_LIMITS.tolist(),
+                            orientation={
+                                "roll": round(current_st.ee_orientation[0], 4),
+                                "pitch": round(current_st.ee_orientation[1], 4),
+                                "yaw": round(current_st.ee_orientation[2], 4),
+                            },
+                            ik_blocked=getattr(self, '_jog_ik_fail_count', 0) > 0,
+                        )
+                    except Exception:
+                        pass
+
+                # Record frame if enough time/distance has passed
+                if recording and collector and collector.active and camera:
+                    now = time.time()
+                    current = self.get_state()
+                    gx, gy = current.ee_position[0], current.ee_position[1]
+                    dist = ((gx - last_record_xy[0])**2 + (gy - last_record_xy[1])**2) ** 0.5
+                    elapsed = now - last_record_time
+
+                    if elapsed > record_interval or dist > record_dist:
+                        try:
+                            frame = camera.get_frame()
+                            if frame is not None:
+                                gz = current.ee_position[2]
+                                pitch_val = state.pitch
+                                # Use current gripper position as target estimate
+                                # (human is guiding toward the target)
+                                collector.record_frame(
+                                    frame=frame,
+                                    gripper_robot_xy=(gx, gy),
+                                    target_estimate_xy=(gx, gy),
+                                    gripper_z=gz,
+                                    pitch=pitch_val,
+                                )
+                                last_record_time = now
+                                last_record_xy = (gx, gy)
+                        except Exception as e:
+                            logger.warning(f"Jog record frame failed: {e}")
 
                 time.sleep(move_interval)
 
             except Exception as e:
                 logger.error(f"Jog loop error: {e}")
                 time.sleep(0.5)
+
+        # End any active approach on jog stop
+        if recording and collector and collector.active:
+            collector.end_approach(success=False, final_gripper_xy=(0, 0))
+            logger.info("Jog recording: ended active approach (jog stopped)")
 
         # Cleanup
         if hasattr(self, '_gamepad') and self._gamepad:
@@ -1252,6 +1577,12 @@ class FrankaController:
                 "dy": round(state.dy * 1000, 1),
                 "dz": round(state.dz * 1000, 1),
             }
+            result["orientation"] = {
+                "pitch_rad": round(state.pitch, 3),
+                "pitch_deg": round(state.pitch * 57.2958, 1),
+                "yaw_rad": round(state.yaw, 3),
+                "yaw_deg": round(state.yaw * 57.2958, 1),
+            }
 
         if self._connected:
             s = self.get_state()
@@ -1261,6 +1592,72 @@ class FrankaController:
                 "z": round(s.ee_position[2], 4),
             }
             result["gripper_width"] = round(s.gripper_width, 4)
+
+        return result
+
+    # --- VLA autonomous control ---
+
+    def start_vla(self, server_url: str, task: str) -> dict:
+        """Start VLA autonomous control loop."""
+        if not self._connected:
+            return {"success": False, "error": "Not connected"}
+
+        if hasattr(self, '_vla_client') and self._vla_client is not None:
+            status = self._vla_client.get_status()
+            if status.get("active"):
+                return {"success": False, "error": "VLA already active"}
+
+        # Stop jog if active (mutual exclusion)
+        if hasattr(self, '_jog_active') and self._jog_active:
+            self.stop_jog()
+
+        from .vla_client import VLAClient
+        self._vla_client = VLAClient(self, server_url, task)
+        result = self._vla_client.start()
+
+        if result.get("success"):
+            result["controls"] = {
+                "stop": "Call vla_disable to stop",
+                "status": "Call vla_status to check progress",
+            }
+
+        return result
+
+    def stop_vla(self) -> dict:
+        """Stop VLA autonomous control."""
+        if not hasattr(self, '_vla_client') or self._vla_client is None:
+            return {"success": False, "error": "VLA not active"}
+
+        result = self._vla_client.stop()
+
+        # Include final position
+        if self._connected:
+            state = self.get_state()
+            result["final_position"] = {
+                "x": round(state.ee_position[0], 4),
+                "y": round(state.ee_position[1], 4),
+                "z": round(state.ee_position[2], 4),
+            }
+            result["gripper_width"] = round(state.gripper_width, 4)
+
+        self._vla_client = None
+        return result
+
+    def get_vla_status(self) -> dict:
+        """Get current VLA control status."""
+        if not hasattr(self, '_vla_client') or self._vla_client is None:
+            result = {"active": False}
+        else:
+            result = self._vla_client.get_status()
+
+        if self._connected:
+            state = self.get_state()
+            result["position"] = {
+                "x": round(state.ee_position[0], 4),
+                "y": round(state.ee_position[1], 4),
+                "z": round(state.ee_position[2], 4),
+            }
+            result["gripper_width"] = round(state.gripper_width, 4)
 
         return result
 
@@ -1297,6 +1694,329 @@ class FrankaController:
         except Exception as e:
             logger.error(f"Teaching mode failed: {e}")
             return {"success": False, "error": str(e)}
+
+    # --- Skill episode logging ---
+
+    def start_skill_episode(self, task: str) -> dict:
+        """Start logging skill calls for VLM training data collection."""
+        from common.skill_logger import SkillLogger
+        if hasattr(self, '_skill_logger') and self._skill_logger and self._skill_logger.active:
+            return {"success": False, "error": "Skill episode already active"}
+        self._skill_logger = SkillLogger()
+        return self._skill_logger.start_episode(task)
+
+    def stop_skill_episode(self, success: bool) -> dict:
+        """Stop skill episode logging, capture final 'done' frame."""
+        if not hasattr(self, '_skill_logger') or not self._skill_logger or not self._skill_logger.active:
+            return {"success": False, "error": "No active skill episode"}
+        result = self._skill_logger.end_episode(success)
+        return result
+
+    def get_skill_episode_status(self) -> dict:
+        """Get current skill episode logging status."""
+        if not hasattr(self, '_skill_logger') or not self._skill_logger:
+            return {"active": False}
+        return self._skill_logger.get_status()
+
+    def list_skill_episodes(self) -> dict:
+        """List all collected skill episodes."""
+        from common.skill_logger import SkillLogger
+        if not hasattr(self, '_skill_logger') or not self._skill_logger:
+            self._skill_logger = SkillLogger()
+        return self._skill_logger.list_episodes()
+
+    # --- SAWM data collection ---
+
+    def sawm_enable(self, model_path: str) -> dict:
+        """Enable SAWM inference monitor for trajectory correction during picks."""
+        try:
+            from common.sawm.monitor import SAWMMonitor
+            self._sawm_monitor = SAWMMonitor(model_path)
+            return {
+                "success": True,
+                "message": f"SAWM monitor loaded from {model_path}. Will correct pick trajectories.",
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def sawm_disable(self) -> dict:
+        """Disable SAWM inference monitor."""
+        if not hasattr(self, '_sawm_monitor') or self._sawm_monitor is None:
+            return {"success": False, "error": "SAWM monitor not active"}
+
+        if self._sawm_monitor.active:
+            self._sawm_monitor.stop()
+
+        status = self._sawm_monitor.get_status()
+        self._sawm_monitor = None
+        return {
+            "success": True,
+            "message": "SAWM monitor disabled.",
+            "final_status": status,
+        }
+
+    def sawm_status(self) -> dict:
+        """Get SAWM monitor status."""
+        if not hasattr(self, '_sawm_monitor') or self._sawm_monitor is None:
+            return {"active": False, "monitor_loaded": False}
+        result = self._sawm_monitor.get_status()
+        result["monitor_loaded"] = True
+        return result
+
+    def sawm_collect_enable(self) -> dict:
+        """Enable SAWM data collection during pick_at() calls."""
+        from common.sawm.data_collector import get_collector
+        self._sawm_collector = get_collector()
+        return {
+            "success": True,
+            "message": "SAWM data collection enabled. Frames will be recorded during pick_at().",
+            "stats": self._sawm_collector.get_stats(),
+        }
+
+    def sawm_collect_disable(self) -> dict:
+        """Disable SAWM data collection."""
+        if not hasattr(self, '_sawm_collector') or self._sawm_collector is None:
+            return {"success": False, "error": "SAWM collection not active"}
+
+        # End any in-progress approach
+        if self._sawm_collector.active:
+            self._sawm_collector.end_approach(success=False, final_gripper_xy=(0, 0))
+
+        stats = self._sawm_collector.get_stats()
+        self._sawm_collector = None
+        return {
+            "success": True,
+            "message": "SAWM data collection disabled.",
+            "stats": stats,
+        }
+
+    def sawm_collect_stats(self) -> dict:
+        """Get SAWM data collection statistics."""
+        from common.sawm.data_collector import get_collector
+        collector = self._sawm_collector if hasattr(self, '_sawm_collector') and self._sawm_collector else get_collector()
+        return collector.get_stats()
+
+    # --- Visual servo pick ---
+
+    def servo_pick_at(
+        self,
+        x: float,
+        y: float,
+        grasp_width: float = 0.03,
+        grasp_force: float = 70.0,
+        grasp_z: float = 0.013,
+        approach_height: float = 0.15,
+        servo_z: float = 0.05,
+        servo_pitch: float = 0.3,
+        gain: float = 0.5,
+        max_step: float = 0.03,
+        convergence_threshold: float = 0.015,
+        max_iterations: int = 20,
+        model_path: Optional[str] = None,
+        collect_data: bool = True,
+    ) -> dict:
+        """
+        Pick an object using visual servo approach.
+
+        Two-phase pick: (1) coarse visual servo with tilted gripper visible
+        to camera, (2) untilt + vertical descent + grasp.
+
+        In fallback mode (no model), moves toward hint in fractional steps
+        and still generates training data.
+
+        Args:
+            x, y: Rough position hint in robot frame (meters)
+            grasp_width: Expected object width (meters)
+            grasp_force: Grasp force (N)
+            grasp_z: Grasp height (meters)
+            approach_height: Lift height after grasp (meters)
+            servo_z: Height during servo (meters)
+            servo_pitch: Forward tilt during servo (radians)
+            gain: Fraction of predicted offset to move each step
+            max_step: Maximum step size (meters)
+            convergence_threshold: Stop when offset below this (meters)
+            max_iterations: Maximum servo iterations
+            model_path: Path to SAWM ONNX model (None = fallback mode)
+            collect_data: Whether to record frames for training
+        """
+        if not self._connected:
+            return {"success": False, "error": "Not connected to robot"}
+
+        from common.sawm.servo import VisualServoLoop, ServoConfig
+
+        config = ServoConfig(
+            servo_z=servo_z,
+            servo_pitch=servo_pitch,
+            gain=gain,
+            max_step=max_step,
+            convergence_threshold=convergence_threshold,
+            max_iterations=max_iterations,
+        )
+
+        # Use controller-level model_path if set
+        effective_model = model_path
+        if effective_model is None and hasattr(self, '_servo_model_path'):
+            effective_model = self._servo_model_path
+
+        servo = VisualServoLoop(
+            controller=self,
+            config=config,
+            model_path=effective_model,
+        )
+
+        return servo.execute(
+            target_x_hint=x,
+            target_y_hint=y,
+            grasp_width=grasp_width,
+            grasp_force=grasp_force,
+            grasp_z=grasp_z,
+            approach_height=approach_height,
+            collect_data=collect_data,
+        )
+
+    # --- Plan executor ---
+
+    def execute_plan(self, steps: list[dict]) -> dict:
+        """
+        Execute a sequence of skill commands back-to-back with no inter-step
+        latency. Claude plans the full sequence, robot executes it all at once.
+
+        Supported skills:
+            pick  — pick_at(x, y, z?, grasp_width?, grasp_force?, approach_height?)
+            place — place_at(x, y, z?, approach_height?)
+            move  — move_cartesian_ik(x, y, z)
+            open_gripper — gripper_move(width?)
+            grasp — gripper_grasp(width?, force?)
+            home  — move to safe home position above table
+            wait  — pause for seconds
+        """
+        if not self._connected:
+            return {"success": False, "error": "Not connected"}
+
+        if not steps:
+            return {"success": False, "error": "No steps provided"}
+
+        results = []
+        t_plan_start = time.time()
+
+        # Check if skill logging is active
+        _logging = hasattr(self, '_skill_logger') and self._skill_logger and self._skill_logger.active
+
+        for i, step in enumerate(steps):
+            skill = step.get("skill")
+            t_step = time.time()
+            logger.info(f"Plan step {i+1}/{len(steps)}: {skill} {step}")
+
+            # Log skill BEFORE execution (captures pre-action frame)
+            step_params = {k: v for k, v in step.items() if k != "skill"}
+            if _logging:
+                self._skill_logger.log_skill(skill, step_params)
+
+            try:
+                if skill == "pick":
+                    r = self.pick_at(
+                        x=step["x"],
+                        y=step["y"],
+                        z=step.get("z", 0.013),
+                        grasp_width=step.get("grasp_width", 0.03),
+                        grasp_force=step.get("grasp_force", 70.0),
+                        x_offset=step.get("x_offset", 0.0),
+                        approach_height=step.get("approach_height", 0.15),
+                    )
+
+                elif skill == "place":
+                    r = self.place_at(
+                        x=step["x"],
+                        y=step["y"],
+                        z=step.get("z", 0.08),
+                        approach_height=step.get("approach_height", 0.15),
+                    )
+
+                elif skill == "move":
+                    r = self.move_cartesian_ik(
+                        x=step["x"],
+                        y=step["y"],
+                        z=step["z"],
+                        roll=step.get("roll"),
+                        pitch=step.get("pitch"),
+                        yaw=step.get("yaw"),
+                        confirmed=True,
+                    )
+
+                elif skill == "open_gripper":
+                    r = self.gripper_move(width=step.get("width", 0.08))
+
+                elif skill == "grasp":
+                    r = self.gripper_grasp(
+                        width=step.get("width", 0.03),
+                        force=step.get("force", 70.0),
+                        speed=step.get("speed", 0.1),
+                    )
+
+                elif skill == "home":
+                    r = self.move_cartesian_ik(
+                        x=0.4, y=0.0, z=0.3,
+                        roll=3.14159, pitch=0.0, yaw=0.0,
+                        confirmed=True,
+                    )
+
+                elif skill == "wait":
+                    seconds = step.get("seconds", 1.0)
+                    time.sleep(seconds)
+                    r = {"success": True, "waited": seconds}
+
+                else:
+                    r = {"success": False, "error": f"Unknown skill: {skill}"}
+
+                # Update skill log with execution result
+                if _logging:
+                    self._skill_logger.update_last_result(r)
+
+                step_ms = (time.time() - t_step) * 1000
+                results.append({
+                    "step": i + 1,
+                    "skill": skill,
+                    "duration_ms": round(step_ms),
+                    "result": r,
+                })
+
+                # Stop on failure
+                if not r.get("success", True):
+                    logger.warning(f"Plan step {i+1} failed: {r}")
+                    break
+
+            except Exception as e:
+                logger.error(f"Plan step {i+1} exception: {e}")
+                results.append({
+                    "step": i + 1,
+                    "skill": skill,
+                    "error": str(e),
+                })
+                break
+
+        total_ms = (time.time() - t_plan_start) * 1000
+        completed = len(results)
+        all_ok = all(r.get("result", {}).get("success", True) for r in results if "error" not in r)
+
+        # Final position
+        final_pos = None
+        if self._connected:
+            state = self.get_state()
+            final_pos = {
+                "x": round(state.ee_position[0], 4),
+                "y": round(state.ee_position[1], 4),
+                "z": round(state.ee_position[2], 4),
+                "gripper_width": round(state.gripper_width, 4),
+            }
+
+        return {
+            "success": all_ok,
+            "steps_completed": completed,
+            "steps_total": len(steps),
+            "total_duration_ms": round(total_ms),
+            "final_position": final_pos,
+            "results": results,
+        }
 
 
 # Singleton controller
