@@ -438,17 +438,46 @@ class FrankaController:
     ) -> bool:
         """Execute move_to_joint_position with a timeout and recovery.
 
+        For large moves (any joint changing > 0.3 rad), generates intermediate
+        waypoints via linear interpolation so the impedance controller only needs
+        to track small steps (~6 degrees each). This prevents oscillation that
+        occurs when the controller overshoots on large moves.
+
         Uses relaxed dq_threshold (0.01 vs default 0.001) and success_threshold
-        (0.05 vs default 0.01) to prevent the impedance controller from hanging
-        when it oscillates around the target without fully settling.
+        (0.05 vs default 0.01) to prevent hanging when settling is slow.
         """
-        return self._call_with_timeout(
-            self._robot.move_to_joint_position, solution,
-            speed_factor=speed_factor,
-            dq_threshold=0.01,        # 10x more tolerant (default 0.001)
-            success_threshold=0.05,    # 5x more tolerant (default 0.01)
-            timeout=timeout, label="Joint motion", recover=True,
-        )
+        current_q = np.array(self._robot.q)
+        target_q = np.array(solution).flatten()
+        max_joint_change = np.max(np.abs(target_q - current_q))
+
+        # For large moves, generate intermediate waypoints
+        if max_joint_change > 0.3:  # ~17 degrees
+            max_step = 0.15  # ~8.6 degrees per waypoint
+            n_steps = max(2, int(np.ceil(max_joint_change / max_step)))
+            waypoints = []
+            for i in range(1, n_steps + 1):
+                t = i / n_steps
+                wp = current_q * (1 - t) + target_q * t
+                waypoints.append(wp)
+            logger.info(
+                f"Large move ({np.degrees(max_joint_change):.1f}°): "
+                f"using {len(waypoints)} waypoints"
+            )
+            return self._call_with_timeout(
+                self._robot.move_to_joint_position, waypoints,
+                speed_factor=speed_factor,
+                dq_threshold=0.01,
+                success_threshold=0.05,
+                timeout=timeout, label="Joint motion (waypoints)", recover=True,
+            )
+        else:
+            return self._call_with_timeout(
+                self._robot.move_to_joint_position, solution,
+                speed_factor=speed_factor,
+                dq_threshold=0.01,
+                success_threshold=0.05,
+                timeout=timeout, label="Joint motion", recover=True,
+            )
 
     @property
     def connected(self) -> bool:
