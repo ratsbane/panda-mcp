@@ -18,6 +18,12 @@ MOTION_TIMEOUT_S = 15.0
 GRIPPER_TIMEOUT_S = 10.0
 STATE_TIMEOUT_S = 5.0
 
+# Grasp detection thresholds
+GRIP_CLOSED_EMPTY = 0.0015   # Below this width: fully closed, nothing held
+GRIP_STILL_OPEN = 0.075      # Above this width: didn't close meaningfully
+GRIP_SLIP_TOLERANCE = 0.008  # Width change > this during transport = slip
+FORCE_DROP_THRESHOLD = 2.0   # Fz change (N) suggesting object dropped
+
 # Check for mock mode (no hardware)
 MOCK_MODE = os.environ.get("FRANKA_MOCK", "0") == "1"
 
@@ -251,9 +257,11 @@ class RobotState:
     is_moving: bool
     has_error: bool
     error_message: Optional[str]
+    O_F_ext_hat_K: Optional[list[float]] = None  # 6D external F/T at EE [Fx,Fy,Fz,Tx,Ty,Tz] in base frame (N, Nm)
+    tau_ext_hat_filtered: Optional[list[float]] = None  # External joint torques (7 values, Nm)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "joint_positions_rad": self.joint_positions,
             "end_effector": {
                 "position_m": {
@@ -272,6 +280,18 @@ class RobotState:
             "has_error": self.has_error,
             "error_message": self.error_message,
         }
+        if self.O_F_ext_hat_K is not None:
+            d["external_forces"] = {
+                "Fx_N": round(self.O_F_ext_hat_K[0], 2),
+                "Fy_N": round(self.O_F_ext_hat_K[1], 2),
+                "Fz_N": round(self.O_F_ext_hat_K[2], 2),
+                "Tx_Nm": round(self.O_F_ext_hat_K[3], 2),
+                "Ty_Nm": round(self.O_F_ext_hat_K[4], 2),
+                "Tz_Nm": round(self.O_F_ext_hat_K[5], 2),
+            }
+        if self.tau_ext_hat_filtered is not None:
+            d["external_joint_torques_Nm"] = [round(t, 3) for t in self.tau_ext_hat_filtered]
+        return d
 
 
 class MockRobot:
@@ -362,6 +382,10 @@ class FrankaController:
         self._gripper: Optional[Gripper] = None
         self._connected = False
         self._mock_mode = MOCK_MODE
+        # Force/torque baseline for grasp monitoring (set by pick_at)
+        self._grasp_force_baseline: Optional[np.ndarray] = None
+        self._grasp_grip_width: Optional[float] = None
+        self._grasp_is_grasped: Optional[bool] = None  # libfranka flag at grasp time
 
     def connect(self) -> dict:
         """Connect to the robot."""
@@ -397,12 +421,89 @@ class FrankaController:
         self._gripper = None
         self._connected = False
 
-    def _call_with_timeout(self, fn, *args, timeout: float = STATE_TIMEOUT_S, label: str = "call", recover: bool = False, **kwargs):
+    def _read_forces(self) -> Optional[np.ndarray]:
+        """Read O_F_ext_hat_K from cached panda-py state (safe during motion).
+
+        Returns 6D force/torque array [Fx,Fy,Fz,Tx,Ty,Tz] or None on failure.
+        """
+        try:
+            state = self._robot.get_state()
+            return np.array(state.O_F_ext_hat_K)
+        except Exception as e:
+            logger.debug(f"_read_forces failed: {e}")
+            return None
+
+    def _progressive_grasp(self, pre_grip_width: float, force: float) -> dict:
+        """Verify grasp by trying to close the gripper past the object.
+
+        Uses gripper.move() (position-only, no open-close cycle) to command
+        a width well below the object. If the object is between the fingers,
+        the gripper can't close past it and width stays near pre_grip_width.
+        If nothing is held, the gripper closes to empty.
+
+        Does NOT use gripper.grasp() which would open then close, dropping the object.
+
+        Args:
+            pre_grip_width: Gripper width before the verify (expected object width)
+            force: Not used (kept for API compat), move() doesn't apply force
+        """
+        # Command gripper to close well past the expected object width.
+        # If object is there, gripper physically can't close past it.
+        verify_target = max(pre_grip_width - 0.02, 0.001)  # 20mm below current
+        try:
+            self._call_with_timeout(
+                self._gripper.move, verify_target, 0.05,  # slow speed
+                timeout=GRIPPER_TIMEOUT_S, label="pg_verify_move")
+        except Exception:
+            pass
+
+        # Read where the gripper actually ended up
+        try:
+            gs = self._call_with_timeout(
+                self._gripper.read_once, timeout=STATE_TIMEOUT_S, label="pg_verify_read")
+            actual_width = gs.width
+        except Exception as e:
+            return {"success": False, "error": f"Failed to read gripper: {e}"}
+
+        # If gripper couldn't close past the object, it's still held
+        width_held = actual_width > pre_grip_width - GRIP_SLIP_TOLERANCE
+        closed_to_empty = actual_width <= GRIP_CLOSED_EMPTY
+
+        if closed_to_empty:
+            return {
+                "success": False,
+                "held": False,
+                "width": round(actual_width, 4),
+                "pre_width": round(pre_grip_width, 4),
+                "reason": "closed_to_empty",
+            }
+        elif not width_held:
+            return {
+                "success": False,
+                "held": False,
+                "width": round(actual_width, 4),
+                "pre_width": round(pre_grip_width, 4),
+                "reason": f"width_dropped_{pre_grip_width:.4f}_to_{actual_width:.4f}",
+            }
+        else:
+            return {
+                "success": True,
+                "held": True,
+                "width": round(actual_width, 4),
+                "pre_width": round(pre_grip_width, 4),
+            }
+
+    def _call_with_timeout(self, fn, *args, timeout: float = STATE_TIMEOUT_S, label: str = "call", recover: bool = False,
+                           monitor_force: bool = False, force_baseline: Optional[np.ndarray] = None, **kwargs):
         """
         Call a blocking panda-py/libfranka function with a timeout.
 
         Many panda-py calls can hang indefinitely if communication drops or
         the arm enters a bad state. This wraps them with a timeout.
+
+        When monitor_force=True and force_baseline is provided, polls
+        O_F_ext_hat_K in 100ms chunks during motion to detect force drops
+        (e.g. object slipping out of gripper during transport).
 
         IMPORTANT: We must NOT use `with ThreadPoolExecutor` because the
         context manager calls shutdown(wait=True) on exit, which blocks
@@ -411,8 +512,35 @@ class FrankaController:
         """
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(fn, *args, **kwargs)
+        force_events = []
         try:
-            return future.result(timeout=timeout)
+            if monitor_force and force_baseline is not None:
+                # Poll in 100ms chunks, checking force between chunks
+                baseline_fz = float(force_baseline[2])
+                start = time.time()
+                while time.time() - start < timeout:
+                    try:
+                        result = future.result(timeout=0.1)
+                        return result, force_events
+                    except FuturesTimeoutError:
+                        # Motion still running — check force
+                        forces = self._read_forces()
+                        if forces is not None:
+                            fz = float(forces[2])
+                            fz_delta = abs(fz - baseline_fz)
+                            if fz_delta > FORCE_DROP_THRESHOLD:
+                                event = {
+                                    "time": round(time.time() - start, 3),
+                                    "fz_baseline": round(baseline_fz, 2),
+                                    "fz_current": round(fz, 2),
+                                    "fz_delta": round(fz_delta, 2),
+                                }
+                                force_events.append(event)
+                                logger.warning(f"Force drop detected during {label}: {event}")
+                # If we exit the while loop, we timed out
+                raise FuturesTimeoutError()
+            else:
+                return future.result(timeout=timeout)
         except FuturesTimeoutError:
             logger.error(f"{label} timed out after {timeout}s — stopping controller")
             # Stop the physical motion first, then recover
@@ -513,6 +641,17 @@ class FrankaController:
             except (TimeoutError, Exception) as e:
                 logger.warning(f"Gripper read failed: {e}, using cached/default width")
 
+        # Read force/torque data from cached state
+        ft_ext = None
+        tau_ext = None
+        try:
+            if hasattr(state, 'O_F_ext_hat_K'):
+                ft_ext = [float(f) for f in state.O_F_ext_hat_K]
+            if hasattr(state, 'tau_ext_hat_filtered'):
+                tau_ext = [float(t) for t in state.tau_ext_hat_filtered]
+        except Exception as e:
+            logger.debug(f"Failed to read F/T data: {e}")
+
         return RobotState(
             joint_positions=list(state.q),
             ee_position=(float(position[0]), float(position[1]), float(position[2])),
@@ -521,6 +660,8 @@ class FrankaController:
             is_moving=False,  # panda-py moves are synchronous
             has_error=has_error,
             error_message=error_msg,
+            O_F_ext_hat_K=ft_ext,
+            tau_ext_hat_filtered=tau_ext,
         )
 
     def move_cartesian(
@@ -1261,15 +1402,112 @@ class FrankaController:
         # Step 4: Grasp
         result = self.gripper_grasp(width=grasp_width, force=grasp_force)
         steps.append({"action": "grasp", "result": result})
-        # Check actual gripper width
+        # Check grasp using multiple signals (width-independent)
         state = self.get_state()
         actual_grip = state.gripper_width
-        # Grasped if gripper stopped between fully-closed and target+tolerance
-        # If gripper < 1mm, it closed fully (nothing grasped)
-        # If gripper > target + 5mm, object was wider than expected
-        min_grip = 0.001  # 1mm - below this means fully closed / empty
-        grasped = actual_grip > min_grip and actual_grip < grasp_width + 0.005
-        steps.append({"action": "check_grasp", "gripper_width": round(actual_grip, 4), "grasped": grasped})
+        width_ok = actual_grip > GRIP_CLOSED_EMPTY and actual_grip < GRIP_STILL_OPEN
+
+        # Read libfranka grasp detection flag
+        is_grasped_flag = False
+        try:
+            gripper_state = self._call_with_timeout(
+                self._gripper.read_once, timeout=STATE_TIMEOUT_S, label="gripper_read_grasp")
+            is_grasped_flag = gripper_state.is_grasped
+        except Exception as e:
+            logger.warning(f"Gripper is_grasped read failed: {e}")
+
+        # Record force baseline for slip detection during transport
+        force_baseline = self._read_forces()
+
+        # Initial grasp decision: trust is_grasped as primary signal.
+        # width_ok alone is not sufficient — gripper can sit around an object
+        # without actually squeezing (happens when grasp_width is very wrong).
+        # The verify step below will confirm by checking width stability after mini-lift.
+        grasped = is_grasped_flag or width_ok
+        logger.info(
+            f"Grasp check: width={actual_grip:.4f}m width_ok={width_ok} "
+            f"is_grasped={is_grasped_flag} requested_width={grasp_width:.4f}m → grasped={grasped}"
+        )
+        steps.append({
+            "action": "check_grasp",
+            "gripper_width": round(actual_grip, 4),
+            "requested_width": round(grasp_width, 4),
+            "is_grasped": is_grasped_flag,
+            "width_ok": width_ok,
+            "grasped": grasped,
+            "force_baseline": [round(f, 2) for f in force_baseline] if force_baseline is not None else None,
+        })
+
+        # Store force baseline for transport monitoring
+        if grasped and force_baseline is not None:
+            self._grasp_force_baseline = force_baseline
+            self._grasp_grip_width = actual_grip
+            self._grasp_is_grasped = is_grasped_flag
+
+        # Post-grasp verification: mini-lift, settle, recheck
+        if grasped:
+            pre_lift_grip = actual_grip
+            state = self.get_state()
+            verify_z = state.ee_position[2] + 0.02  # 2cm above grasp
+            result = self.move_cartesian_ik(
+                state.ee_position[0], state.ee_position[1], verify_z,
+                roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True)
+            steps.append({"action": "verify_lift", "method": "ik", "result": result})
+
+            time.sleep(0.1)  # 100ms settle
+
+            # Progressive grasp: step down from open width to actual grip width
+            # in small increments that stay within libfranka's detection window.
+            # This applies sustained force without the open-close cycle of gripper.grasp().
+            pg_result = self._progressive_grasp(actual_grip, grasp_force)
+            steps.append({"action": "verify_progressive_grasp", "result": pg_result})
+
+            # Recheck grip width and is_grasped
+            state = self.get_state()
+            verify_grip = state.gripper_width
+            verify_is_grasped = False
+            try:
+                gs = self._call_with_timeout(
+                    self._gripper.read_once, timeout=STATE_TIMEOUT_S, label="gripper_verify")
+                verify_is_grasped = gs.is_grasped
+            except Exception:
+                pass
+
+            # Read forces after lift
+            verify_forces = self._read_forces()
+
+            # Reject if gripper closed to empty
+            if verify_grip <= GRIP_CLOSED_EMPTY:
+                logger.warning(f"Post-grasp verify: gripper closed to {verify_grip:.4f}m — object lost")
+                grasped = False
+            # Reject if gripper opened back to near-full (block fell, gripper released)
+            elif verify_grip >= GRIP_STILL_OPEN:
+                logger.warning(f"Post-grasp verify: gripper opened to {verify_grip:.4f}m — object lost")
+                grasped = False
+            # Reject if width changed significantly in either direction
+            elif abs(pre_lift_grip - verify_grip) > GRIP_SLIP_TOLERANCE:
+                logger.warning(
+                    f"Post-grasp verify: width changed "
+                    f"{pre_lift_grip:.4f}→{verify_grip:.4f}m — object lost")
+                grasped = False
+
+            # Update baselines after lift (now includes object weight)
+            # IMPORTANT: update _grasp_is_grasped too — gripper.move() in
+            # progressive_grasp clears the libfranka is_grasped flag, so the
+            # post-verify state is the correct baseline for slip detection.
+            if grasped and verify_forces is not None:
+                self._grasp_force_baseline = verify_forces
+                self._grasp_grip_width = verify_grip
+                self._grasp_is_grasped = verify_is_grasped
+
+            steps.append({
+                "action": "verify_grasp",
+                "gripper_width": round(verify_grip, 4),
+                "pre_lift_grip": round(pre_lift_grip, 4),
+                "is_grasped": verify_is_grasped,
+                "grasped": grasped,
+                "force": [round(f, 2) for f in verify_forces] if verify_forces is not None else None,
+            })
 
         # SAWM: end approach with grasp result
         if sawm_active:
@@ -1326,6 +1564,74 @@ class FrankaController:
         except Exception as e:
             logger.warning(f"SAWM frame recording failed: {e}")
 
+    def _check_slip(self, label: str) -> dict:
+        """Check for object slip using grip width, is_grasped flag, and force baseline.
+
+        Returns dict with slip detection results.
+        """
+        state = self.get_state()
+        grip_width = state.gripper_width
+        slipped = False
+        slip_reason = None
+
+        # Check gripper width
+        if grip_width <= GRIP_CLOSED_EMPTY:
+            slipped = True
+            slip_reason = f"gripper closed to {grip_width:.4f}m (empty)"
+        elif self._grasp_grip_width is not None:
+            width_change = abs(grip_width - self._grasp_grip_width)
+            if width_change > GRIP_SLIP_TOLERANCE:
+                slipped = True
+                slip_reason = f"grip width changed by {width_change*1000:.1f}mm"
+
+        # Check is_grasped flag
+        is_grasped = False
+        try:
+            gs = self._call_with_timeout(
+                self._gripper.read_once, timeout=STATE_TIMEOUT_S, label=f"gripper_{label}")
+            is_grasped = gs.is_grasped
+        except Exception:
+            pass
+
+        if not is_grasped and not slipped:
+            # Only treat is_grasped=False as a slip signal if it was True at grasp time
+            # (i.e. it transitioned True→False). If it was always False (e.g. width mismatch
+            # in libfranka), it's not informative.
+            was_grasped_at_pick = self._grasp_is_grasped is True
+            if was_grasped_at_pick and self._grasp_force_baseline is not None:
+                forces = self._read_forces()
+                if forces is not None:
+                    fz_delta = abs(forces[2] - self._grasp_force_baseline[2])
+                    if fz_delta > FORCE_DROP_THRESHOLD:
+                        slipped = True
+                        slip_reason = f"is_grasped changed True→False + force drop {fz_delta:.1f}N"
+
+        # Log force data for diagnostics (but don't use force alone as slip signal —
+        # O_F_ext_hat_K varies too much with arm configuration to be a sole decider)
+        force_event = None
+        if self._grasp_force_baseline is not None:
+            forces = self._read_forces()
+            if forces is not None:
+                fz_delta = abs(forces[2] - self._grasp_force_baseline[2])
+                if fz_delta > FORCE_DROP_THRESHOLD:
+                    force_event = {
+                        "fz_baseline": round(float(self._grasp_force_baseline[2]), 2),
+                        "fz_current": round(float(forces[2]), 2),
+                        "fz_delta": round(fz_delta, 2),
+                    }
+
+        result = {
+            "checkpoint": label,
+            "gripper_width": round(grip_width, 4),
+            "is_grasped": is_grasped,
+            "slipped": slipped,
+        }
+        if slip_reason:
+            result["slip_reason"] = slip_reason
+        if force_event:
+            result["force_event"] = force_event
+        return result
+
     def place_at(
         self,
         x: float,
@@ -1338,6 +1644,8 @@ class FrankaController:
         Place a held object at the given robot coordinates.
 
         Executes: move above target -> lower -> release -> retreat up.
+        Checks for object slip at each stage using grip width, is_grasped
+        flag, and force/torque baseline.
 
         Args:
             x, y: Target position in robot frame (meters)
@@ -1349,6 +1657,8 @@ class FrankaController:
             return {"success": False, "error": "Not connected to robot"}
 
         steps = []
+        slipped = False
+        force_events = []
 
         # Top-down orientation for placing (yaw configurable)
         import math
@@ -1370,6 +1680,13 @@ class FrankaController:
                 "steps": steps,
             }
 
+        # Checkpoint 0: Check we're actually holding something
+        slip_check = self._check_slip("place_start")
+        steps.append({"action": "slip_check", **slip_check})
+        if slip_check["slipped"]:
+            slipped = True
+            logger.warning(f"Slip detected at place_start: {slip_check.get('slip_reason')}")
+
         # Step 1: Move above target (IK with straight-down orientation)
         result = self.move_cartesian_ik(
             x, y, approach_height,
@@ -1377,6 +1694,16 @@ class FrankaController:
         steps.append({"action": "move_above", "method": "ik", "result": result})
         if not result.get("success"):
             return _place_fail(f"move_above failed: {result.get('error', 'unknown')}", steps)
+
+        # Checkpoint 1: Check after transport move
+        if not slipped:
+            slip_check = self._check_slip("after_move_above")
+            steps.append({"action": "slip_check", **slip_check})
+            if slip_check["slipped"]:
+                slipped = True
+                logger.warning(f"Slip detected after move_above: {slip_check.get('slip_reason')}")
+                if slip_check.get("force_event"):
+                    force_events.append(slip_check["force_event"])
 
         # Chain IK solutions to prevent branch flipping
         state = self.get_state()
@@ -1391,6 +1718,16 @@ class FrankaController:
         if not result.get("success"):
             return _place_fail(f"lower_to_place failed: {result.get('error', 'unknown')}", steps)
 
+        # Checkpoint 2: Check after lowering
+        if not slipped:
+            slip_check = self._check_slip("after_lower")
+            steps.append({"action": "slip_check", **slip_check})
+            if slip_check["slipped"]:
+                slipped = True
+                logger.warning(f"Slip detected after lower_to_place: {slip_check.get('slip_reason')}")
+                if slip_check.get("force_event"):
+                    force_events.append(slip_check["force_event"])
+
         # Step 3: Open gripper to release
         result = self.gripper_move(0.08)
         steps.append({"action": "release", "result": result})
@@ -1404,8 +1741,13 @@ class FrankaController:
         steps.append({"action": "retreat", "method": "ik", "result": result})
         state = self.get_state()
 
-        return {
-            "success": True,
+        # Clear force baseline after place (no longer holding anything)
+        self._grasp_force_baseline = None
+        self._grasp_grip_width = None
+        self._grasp_is_grasped = None
+
+        result_dict = {
+            "success": not slipped,
             "final_position": {
                 "x": round(state.ee_position[0], 4),
                 "y": round(state.ee_position[1], 4),
@@ -1413,6 +1755,11 @@ class FrankaController:
             },
             "steps": steps,
         }
+        if slipped:
+            result_dict["slipped"] = True
+            if force_events:
+                result_dict["force_events"] = force_events
+        return result_dict
 
     def start_recording(self, language_instruction: str, fps: int = 30) -> dict:
         """Start trajectory recording for current episode."""
@@ -2118,9 +2465,33 @@ class FrankaController:
             t_step = time.time()
             logger.info(f"Plan step {i+1}/{len(steps)}: {skill} {step}")
 
-            # Log skill BEFORE execution (captures pre-action frame)
+            # Log skill BEFORE execution (captures pre-action frame + robot state)
             step_params = {k: v for k, v in step.items() if k != "skill"}
             if _logging:
+                # Capture robot state alongside the pre-action frame
+                robot_state = {}
+                try:
+                    rs = self.get_state()
+                    robot_state["gripper_width"] = round(rs.gripper_width, 4)
+                    robot_state["ee_position"] = {
+                        "x": round(rs.ee_position[0], 4),
+                        "y": round(rs.ee_position[1], 4),
+                        "z": round(rs.ee_position[2], 4),
+                    }
+                    # Read is_grasped flag
+                    try:
+                        gs = self._call_with_timeout(
+                            self._gripper.read_once, timeout=STATE_TIMEOUT_S, label="gripper_skill_log")
+                        robot_state["is_grasped"] = gs.is_grasped
+                    except Exception:
+                        robot_state["is_grasped"] = None
+                    # Read force/torque
+                    forces = self._read_forces()
+                    if forces is not None:
+                        robot_state["O_F_ext_hat_K"] = [round(float(f), 2) for f in forces]
+                except Exception as e:
+                    logger.debug(f"Failed to capture robot state for skill log: {e}")
+                step_params["robot_state"] = robot_state
                 self._skill_logger.log_skill(skill, step_params)
 
             try:

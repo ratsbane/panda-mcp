@@ -1,0 +1,47 @@
+{
+  "camera_device": 0,
+  "camera_width": 1280,
+  "camera_height": 720,
+
+  "color_ranges": {
+    "red": {
+      "lower1": [0, 100, 100],
+      "upper1": [10, 255, 255],
+      "lower2": [160, 100, 100],
+      "upper2": [180, 255, 255]
+    },
+    "green": {
+      "lower1": [35, 80, 80],
+      "upper1": [85, 255, 255]
+    },
+    "blue": {
+      "lower1": [90, 80, 60],
+      "upper1": [130, 255, 255]
+    }
+  },
+
+  "approach_height": 0.12,
+  "grasp_height": 0.025,
+  "servo_gain": 0.3,
+  "convergence_px": 25,
+  "max_iterations": 30,
+  "servo_rate_hz": 3.0,
+
+  "px_to_robot_x": 0.00077,
+  "px_to_robot_y": -0.00045,
+
+  "x_min": 0.25,
+  "x_max": 0.58,
+  "y_min": -0.18,
+  "y_max": 0.20,
+  "z_min": 0.013,
+  "z_max": 0.35,
+
+  "gripper_open_width": 0.08,
+  "grasp_width": 0.03,
+  "grasp_force": 40.0,
+
+  "gripper_ref_px": [801, 493],
+
+  "y_bias": 0.0
+}

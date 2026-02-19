@@ -585,6 +585,30 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
+        Tool(
+            name="learned_pick",
+            description="Pick an object using Claude's learned visual servo approach. Uses color detection + lateral approach strategy. "
+                       "Developed through direct experimentation. Connects to camera daemon for vision.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "color": {
+                        "type": "string",
+                        "description": "Target color (red, green, blue)",
+                        "enum": ["red", "green", "blue"],
+                    },
+                },
+                "required": ["color"],
+            },
+        ),
+        Tool(
+            name="restart",
+            description="Restart the MCP server to pick up code changes. The server process exits cleanly and will be restarted automatically on the next tool call.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
     ]
 
 
@@ -821,7 +845,36 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "success": True,
                 "updated_config": config.to_dict(),
             })
-        
+
+        elif name == "learned_pick":
+            if not controller.connected:
+                return json_response({"error": "Not connected. Call 'connect' first."})
+            color = arguments["color"]
+            try:
+                from learned.visual_servo import VisualServoController, load_config
+                servo_config = load_config()
+                servo = VisualServoController(servo_config)
+                servo.connect_camera()
+                servo.use_controller(controller)
+                success = servo.pick(color)
+                servo.disconnect()
+                return json_response({
+                    "success": success,
+                    "color": color,
+                    "log": servo.log_entries,
+                })
+            except Exception as e:
+                logger.exception(f"learned_pick failed: {e}")
+                return json_response({"error": f"learned_pick failed: {str(e)}"})
+
+        elif name == "restart":
+            import os
+            import signal
+            logger.info("Restart requested — exiting (will auto-restart on next call)")
+            # Schedule exit after returning the response
+            asyncio.get_event_loop().call_later(0.5, os.kill, os.getpid(), signal.SIGTERM)
+            return json_response({"success": True, "message": "Server shutting down, will restart on next tool call"})
+
         else:
             return json_response({"error": f"Unknown tool: {name}"})
     
