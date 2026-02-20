@@ -608,6 +608,27 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="collect_episodes",
+            description="Run autonomous training data collection. Picks random blocks and places them at random positions, "
+                       "recording (image, instruction, robot_coords) at each step for Moondream fine-tuning. "
+                       "Requires Moondream server running on Spark.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "num_episodes": {
+                        "type": "integer",
+                        "description": "Number of pick-place cycles to run (default: 10)",
+                        "default": 10,
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Output directory (default: data/moondream_training)",
+                        "default": "data/moondream_training",
+                    },
+                },
+            },
+        ),
+        Tool(
             name="restart",
             description="Restart the MCP server to pick up code changes. The server process exits cleanly and will be restarted automatically on the next tool call.",
             inputSchema={
@@ -948,6 +969,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             except Exception as e:
                 logger.exception(f"learned_pick failed: {e}")
                 return json_response({"error": f"learned_pick failed: {str(e)}"})
+
+        elif name == "collect_episodes":
+            if not controller.connected:
+                return json_response({"error": "Not connected. Call 'connect' first."})
+            try:
+                from learned.data_collector import run_collection, CollectionConfig
+                config = CollectionConfig(
+                    num_episodes=arguments.get("num_episodes", 10),
+                    output_dir=arguments.get("output_dir", "data/moondream_training"),
+                )
+                result = run_collection(controller, config)
+                return json_response(result)
+            except Exception as e:
+                logger.exception(f"collect_episodes failed: {e}")
+                return json_response({"error": f"collect_episodes failed: {str(e)}"})
 
         elif name == "restart":
             import os
