@@ -851,18 +851,40 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 return json_response({"error": "Not connected. Call 'connect' first."})
             color = arguments["color"]
             try:
-                from learned.visual_servo import VisualServoController, load_config
-                servo_config = load_config()
-                servo = VisualServoController(servo_config)
-                servo.connect_camera()
-                servo.use_controller(controller)
-                success = servo.pick(color)
-                servo.disconnect()
-                return json_response({
-                    "success": success,
-                    "color": color,
-                    "log": servo.log_entries,
-                })
+                from learned.block_detector import load_homography, find_block
+                from camera_daemon.client import CameraClient
+
+                H, workspace = load_homography()
+                cam = CameraClient()
+                cam.connect()
+                frame = cam.get_frame()
+                cam.disconnect()
+
+                if frame is None:
+                    return json_response({"error": "Failed to capture frame"})
+
+                block = find_block(frame, H, color, workspace)
+                if block is None:
+                    return json_response({
+                        "success": False,
+                        "error": f"No {color} block found in workspace",
+                    })
+
+                import math
+                result = controller.pick_at(
+                    x=block.robot_x,
+                    y=block.robot_y,
+                    grasp_width=0.03,
+                    z=0.013,
+                    yaw=block.yaw,
+                )
+                result["detection"] = {
+                    "color": block.color,
+                    "pixel": (block.pixel_x, block.pixel_y),
+                    "robot": (round(block.robot_x, 3), round(block.robot_y, 3)),
+                    "yaw_deg": round(math.degrees(block.yaw), 1),
+                }
+                return json_response(result)
             except Exception as e:
                 logger.exception(f"learned_pick failed: {e}")
                 return json_response({"error": f"learned_pick failed: {str(e)}"})
