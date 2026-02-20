@@ -602,26 +602,6 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
-            name="calibration_sweep",
-            description="Run a calibration sweep: move gripper across a grid of positions, photographing and embedding each one into the spatial memory database. "
-                       "This builds the pixel-to-robot coordinate mapping. Uses DINOv2 on Spark for embeddings.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "nx": {
-                        "type": "integer",
-                        "description": "Number of X grid points (default: 5)",
-                        "default": 5,
-                    },
-                    "ny": {
-                        "type": "integer",
-                        "description": "Number of Y grid points (default: 5)",
-                        "default": 5,
-                    },
-                },
-            },
-        ),
-        Tool(
             name="restart",
             description="Restart the MCP server to pick up code changes. The server process exits cleanly and will be restarted automatically on the next tool call.",
             inputSchema={
@@ -886,51 +866,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             except Exception as e:
                 logger.exception(f"learned_pick failed: {e}")
                 return json_response({"error": f"learned_pick failed: {str(e)}"})
-
-        elif name == "calibration_sweep":
-            if not controller.connected:
-                return json_response({"error": "Not connected. Call 'connect' first."})
-            try:
-                from learned.calibration_sweep import run_sweep
-                from camera_daemon.client import CameraClient
-                import numpy as np
-
-                nx = arguments.get("nx", 5)
-                ny = arguments.get("ny", 5)
-
-                grid = {
-                    "x_values": np.linspace(0.35, 0.55, nx).tolist(),
-                    "y_values": np.linspace(-0.10, 0.18, ny).tolist(),
-                    "z_sweep": 0.025,
-                    "z_travel": 0.15,
-                }
-
-                # Try to connect to embedding server; fall back to no-embed mode
-                db = None
-                do_embed = True
-                try:
-                    import urllib.request
-                    urllib.request.urlopen("http://spark:8091/status", timeout=3)
-                    from learned.embedding_db import SpatialDB
-                    db = SpatialDB()
-                    db.connect()
-                except Exception:
-                    logger.info("Embedding server unavailable, running without embeddings")
-                    do_embed = False
-
-                cam = CameraClient()
-                cam.connect()
-
-                results = run_sweep(controller, cam, db=db, grid=grid, embed=do_embed)
-
-                cam.disconnect()
-                if db:
-                    db.close()
-
-                return json_response(results)
-            except Exception as e:
-                logger.exception(f"calibration_sweep failed: {e}")
-                return json_response({"error": f"calibration_sweep failed: {str(e)}"})
 
         elif name == "restart":
             import os
