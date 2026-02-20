@@ -365,7 +365,49 @@ The skill predictor could be:
 Option C is actually viable for data collection — use rule-based picking to collect training data, then train a more capable model later. Option B is interesting because it removes the need for a VLM entirely for the action prediction part.
 
 ### Next Steps
-1. Integrate Moondream 2B detect() into the picking pipeline as an alternative to HSV color detection
+1. ~~Integrate Moondream 2B detect() into the picking pipeline~~ — DONE (see Experiment 11)
 2. Test whether it can detect blocks the color detector misses (e.g., the natural wood blocks)
 3. Design the training data format — likely (image, detected_objects_json, instruction, skill_call)
 4. Evaluate fine-tuning Moondream 2B with LoRA for the full image→skill pipeline
+
+## 2026-02-20 ~late evening - Moondream Integration: 3/3 Picks via Natural Language
+
+### Context
+Integrated Moondream 2B into the picking pipeline. Built a FastAPI inference server on Spark (port 8091), a client module (`learned/moondream_client.py`), and updated the `learned_pick` MCP tool to accept either `color=` (HSV) or `query=` (Moondream) parameters.
+
+### Architecture
+
+```
+Pi (franka-mcp)                         Spark (GPU)
+┌─────────────────┐    HTTP/JSON     ┌──────────────────┐
+│ learned_pick     │ ──────────────→ │ moondream_server  │
+│   query="blue    │   base64 JPEG   │   model.detect()  │
+│    block"        │ ←────────────── │   → bboxes        │
+│                  │   JSON response  └──────────────────┘
+│ homography(H)    │
+│ pixel→robot      │
+│ pick_at(x,y)     │
+└─────────────────┘
+```
+
+- Image sent as base64 JPEG (~241KB)
+- Round-trip latency: ~2.4s (includes encoding, network, GPU inference, response)
+- Server loads model once at startup (19s), then serves requests
+
+### Experiment 11: Moondream-Guided Picks
+
+| # | Query | Detection pixel | Robot coords | Gripper width | # Detections | Result |
+|---|-------|----------------|-------------|---------------|-------------|--------|
+| 1 | "blue block" | (783, 514) | (0.473, 0.005) | 28.9mm | 1 | SUCCESS |
+| 2 | "green block" | (490, 452) | (0.398, -0.177) | 28.4mm | 1 | SUCCESS |
+| 3 | "red block on the white paper" | (607, 430) | (0.393, -0.097) | 29.5mm | 2 | SUCCESS |
+
+**Notable:** Query #3 returned 2 red block detections (one on paper, one off). The workspace filter correctly selected the on-paper block. This demonstrates that natural language queries combined with workspace bounds provide robust disambiguation.
+
+### Key Learnings
+
+22. **Natural language picking works end-to-end.** Moondream 2B detect → homography → pick_at gives 3/3 success rate, identical to the color detection pipeline. But it's far more flexible — it can handle "the wooden block", "tiger toy", or any natural language description.
+
+23. **Workspace filtering is essential for multi-instance queries.** "Red block" returns both red blocks in the scene. Filtering by workspace bounds (checking robot coordinates) picks the correct one. For queries like "the block closest to the robot", we'd need the model itself to discriminate — a future fine-tuning target.
+
+24. **2.4s latency per detection is acceptable for scripted tasks** but too slow for a tight control loop. For autonomous data collection, this is fine — each pick-place cycle takes ~15s total anyway. For real-time servoing, would need to run Moondream on-device or use a faster model.

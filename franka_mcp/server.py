@@ -587,18 +587,24 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="learned_pick",
-            description="Pick an object using Claude's learned visual servo approach. Uses color detection + lateral approach strategy. "
-                       "Developed through direct experimentation. Connects to camera daemon for vision.",
+            description="Pick an object using Claude's learned visual servo approach. "
+                       "Connects to camera daemon for vision. Two detection modes: "
+                       "1) color= for HSV color detection (red/green/blue/orange), "
+                       "2) query= for Moondream 2B natural language detection (any object description). "
+                       "Moondream requires the inference server running on Spark.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "color": {
                         "type": "string",
-                        "description": "Target color (red, green, blue)",
-                        "enum": ["red", "green", "blue"],
+                        "description": "Target color for HSV detection (red, green, blue, orange)",
+                        "enum": ["red", "green", "blue", "orange"],
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language object description for Moondream detection (e.g. 'the wooden block', 'green block')",
                     },
                 },
-                "required": ["color"],
             },
         ),
         Tool(
@@ -849,9 +855,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "learned_pick":
             if not controller.connected:
                 return json_response({"error": "Not connected. Call 'connect' first."})
-            color = arguments["color"]
+            color = arguments.get("color")
+            query = arguments.get("query")
+            if not color and not query:
+                return json_response({"error": "Provide either 'color' or 'query' parameter"})
             try:
-                from learned.block_detector import load_homography, find_block
+                import math
+                from learned.block_detector import load_homography, pixel_to_robot
                 from camera_daemon.client import CameraClient
 
                 H, workspace = load_homography()
@@ -863,27 +873,77 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 if frame is None:
                     return json_response({"error": "Failed to capture frame"})
 
-                block = find_block(frame, H, color, workspace)
-                if block is None:
-                    return json_response({
-                        "success": False,
-                        "error": f"No {color} block found in workspace",
-                    })
+                detection_info = {}
 
-                import math
+                if query:
+                    # Moondream detection
+                    from learned.moondream_client import detect as md_detect
+                    detections = md_detect(frame, query)
+                    if not detections:
+                        return json_response({
+                            "success": False,
+                            "error": f"Moondream found no objects for query: {query!r}",
+                        })
+                    # Filter to workspace, pick largest
+                    ws = workspace or {"x_min": 0.2, "x_max": 0.6, "y_min": -0.2, "y_max": 0.2}
+                    det = None
+                    for d in detections:
+                        drx, dry = pixel_to_robot(d.center_x, d.center_y, H)
+                        if ws["x_min"] <= drx <= ws["x_max"] and ws["y_min"] <= dry <= ws["y_max"]:
+                            det = d
+                            break
+                    if det is None:
+                        # Fall back to largest detection even if out of workspace
+                        det = detections[0]
+                    px, py = det.center_x, det.center_y
+                    rx, ry = pixel_to_robot(px, py, H)
+                    if not (ws["x_min"] <= rx <= ws["x_max"] and ws["y_min"] <= ry <= ws["y_max"]):
+                        return json_response({
+                            "success": False,
+                            "error": f"Detection at robot ({rx:.3f}, {ry:.3f}) is outside workspace",
+                            "pixel": (px, py),
+                            "robot": (round(rx, 3), round(ry, 3)),
+                        })
+                    detection_info = {
+                        "method": "moondream",
+                        "query": query,
+                        "pixel": (px, py),
+                        "robot": (round(rx, 3), round(ry, 3)),
+                        "bbox": (det.bbox_w, det.bbox_h),
+                        "num_detections": len(detections),
+                    }
+                else:
+                    # HSV color detection
+                    from learned.block_detector import find_block
+                    block = find_block(frame, H, color, workspace)
+                    if block is None:
+                        return json_response({
+                            "success": False,
+                            "error": f"No {color} block found in workspace",
+                        })
+                    px, py = block.pixel_x, block.pixel_y
+                    rx, ry = block.robot_x, block.robot_y
+                    detection_info = {
+                        "method": "color",
+                        "color": block.color,
+                        "pixel": (px, py),
+                        "robot": (round(rx, 3), round(ry, 3)),
+                        "yaw_deg": round(math.degrees(block.yaw), 1),
+                    }
+
+                # Pick at detected position
+                yaw = 0.0
+                if "yaw_deg" in detection_info:
+                    yaw = math.radians(detection_info["yaw_deg"])
+
                 result = controller.pick_at(
-                    x=block.robot_x,
-                    y=block.robot_y,
+                    x=rx,
+                    y=ry,
                     grasp_width=0.03,
                     z=0.013,
-                    yaw=block.yaw,
+                    yaw=yaw,
                 )
-                result["detection"] = {
-                    "color": block.color,
-                    "pixel": (block.pixel_x, block.pixel_y),
-                    "robot": (round(block.robot_x, 3), round(block.robot_y, 3)),
-                    "yaw_deg": round(math.degrees(block.yaw), 1),
-                }
+                result["detection"] = detection_info
                 return json_response(result)
             except Exception as e:
                 logger.exception(f"learned_pick failed: {e}")
