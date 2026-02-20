@@ -240,3 +240,132 @@ Picks spanned nearly the full reachable workspace:
 16. **Re-picking moved objects works.** The same block picked from two very different positions confirms the pipeline doesn't depend on the block being near any particular calibration point. The color detection + homography approach is truly position-independent.
 
 17. **IK reachability is the main constraint, not calibration.** The only failure was an IK limitation (arm can't reach close to its base with straight-down orientation), not a calibration or detection error. The useful workspace for picking is roughly x=0.35–0.55, y=-0.20 to +0.20.
+
+## 2026-02-20 ~evening - VLM Zero-Shot Pointing Benchmark
+
+### Context
+The long-term goal is to replace Claude-in-the-loop with a small local VLM that outputs parameterized skill calls (e.g. `{"skill": "pick", "x": 0.35, "y": -0.10}`). Before collecting training data, we need to choose which VLM to fine-tune. This experiment tests zero-shot spatial understanding — can these models already locate objects in our camera images?
+
+### Experimental Setup
+
+**Test image:** Single frame from the USB camera showing the workspace with 4 colored blocks on/near the white paper, the tiger toy, ArUco calibration markers, and the robot arm raised to z=0.35m.
+
+**Ground truth:** Block positions from HSV color detection + ArUco homography, verified by 6/6 successful physical picks in the previous session.
+
+| Block | Pixel (x, y) | Robot (x, y) m |
+|-------|--------------|----------------|
+| Green | (489, 453) | (0.398, -0.178) |
+| Red | (608, 432) | (0.394, -0.096) |
+| Blue | (783, 515) | (0.473, 0.005) |
+| Orange/wood | (1090, 544) | (0.521, 0.185) |
+
+**Models tested:**
+1. Moondream 2B (1.9B params, 3.9GB VRAM) — built-in point() and detect() APIs
+2. SmolVLM2-500M (500M params, 1.0GB VRAM) — text generation only
+3. Florence-2-base (230M params) — could not run (incompatible with transformers 4.57.6)
+4. Moondream 0.5B — not publicly available as separate model
+
+All models run on DGX Spark (Grace Blackwell GPU, 128GB unified memory).
+
+### Experiment 6: Moondream 2B — Point API
+
+The `model.point(encoded_image, query)` method returns normalized (x, y) coordinates for the queried object. Image is encoded once, then each query runs against the encoding.
+
+| Block | Query | Predicted pixel | GT pixel | Error |
+|-------|-------|----------------|----------|-------|
+| Green | "the green block" | (490, 442) | (489, 453) | 11.0 px |
+| Red | "the red block on the white paper" | (606, 420) | (608, 432) | 12.2 px |
+| Blue | "the blue block" | (782, 505) | (783, 515) | 10.0 px |
+| Orange | "the wooden/tan block near the bottom right ArUco marker" | (1086, 537) | (1090, 544) | 8.1 px |
+
+**Summary:** Mean 10.3 px, Median 10.5 px, Max 12.2 px. Latency: ~60-80ms per query (after image encoding).
+
+### Experiment 7: Moondream 2B — Detect API
+
+The `model.detect(encoded_image, query)` method returns bounding boxes. Error measured from bbox center to ground truth pixel center.
+
+| Block | Query | Predicted center | GT center | Error | # Detections |
+|-------|-------|-----------------|-----------|-------|-------------|
+| Green | "green block" | (492, 452) | (489, 453) | 3.2 px | 1 |
+| Red | "red block" | (607, 431) | (608, 432) | 1.4 px | 2 (found both reds!) |
+| Blue | "blue block" | (783, 513) | (783, 515) | 2.0 px | 1 |
+| Orange | "wooden block" | (1091, 546) | (1090, 544) | 2.2 px | 4 (found all wood blocks) |
+
+**Summary:** Mean 2.2 px, Median 2.1 px, Max 3.2 px. Latency: ~80-250ms per query.
+
+**This is remarkable.** At 2.2px mean error, the detect API is essentially pixel-perfect for our purposes. For reference, our homography has ~0.5mm/pixel sensitivity, so 2.2px ≈ 1.1mm error in robot frame — well within gripper tolerance.
+
+### Experiment 8: Moondream 2B — Query API (free-form text)
+
+When asked "What are the pixel coordinates..." the model returned `(0, 0)` for all blocks. When asked to describe positions, it gave vague answers like "in the middle of the table" for every block. The free-form text API has no spatial precision.
+
+### Experiment 9: SmolVLM2-500M
+
+**Direct coordinate requests:** Returned nonsense values — `(10, 10)` and `(100, 100)` for all blocks.
+
+**Location descriptions:** Incorrect for all blocks — claimed green block was "in the top left corner" when it's actually bottom-left, claimed red block was "in the upper right corner" when it's center.
+
+**Left/right classification:** 2/4 correct (chance level).
+
+**Structured JSON skill output:** Returned identical `{"skill": "pick", "x": -0.3, "y": -0.2}` for ALL four blocks. The model outputs syntactically valid JSON but with no spatial differentiation — it's just pattern-matching the prompt format without understanding the image.
+
+### Experiment 10: Florence-2-base (failed to run)
+
+Florence-2's custom model code (`modeling_florence2.py`) is incompatible with transformers 4.57.6 on two fronts:
+1. `_supports_sdpa` attribute missing (worked around with `attn_implementation="eager"`)
+2. `prepare_inputs_for_generation` expects old-style `past_key_values` format
+
+Would need to pin transformers to an older version (~4.40) to test Florence-2.
+
+### Results Summary
+
+| Model | API | Mean Error (px) | Parse Rate | Latency | Notes |
+|-------|-----|----------------|------------|---------|-------|
+| **Moondream 2B** | **detect** | **2.2 px** | **4/4** | **80-250ms** | **Essentially perfect** |
+| Moondream 2B | point | 10.3 px | 4/4 | 60-80ms | Very good |
+| Moondream 2B | query (text) | N/A | 0/4 | 110-200ms | Cannot output coordinates as text |
+| SmolVLM2-500M | text gen | N/A | 0/4 | 180-830ms | No spatial understanding |
+| Florence-2-base | — | — | — | — | Failed to load |
+
+### Key Learnings
+
+18. **Moondream 2B is the clear winner for zero-shot object localization.** Its detect API achieves 2.2px mean error — essentially perfect for our pick-and-place task. No fine-tuning needed for the perception part.
+
+19. **Dedicated spatial APIs (point/detect) vastly outperform text generation for coordinate output.** The same Moondream 2B model returns `(0, 0)` when asked for coordinates via text, but pixel-perfect results via its built-in point/detect methods. This suggests that for our fine-tuning task, we should keep the perception (object localization) separate from the action prediction (skill parameters).
+
+20. **SmolVLM2-500M has no spatial understanding at this scale.** It cannot even correctly classify left/right for objects in an image. The 500M parameter count is insufficient for grounded spatial reasoning. It can generate syntactically valid JSON but with meaningless coordinate values.
+
+21. **The VLM doesn't need to learn coordinates from scratch.** Moondream 2B already knows where objects are. The fine-tuning task should be: given object positions (from detect API) + scene context + instruction → output the right skill call. This is a much simpler learning problem than training a model to jointly do perception AND action prediction.
+
+### Revised Architecture
+
+Based on these results, the optimal pipeline is:
+
+```
+Camera frame
+    │
+    ▼
+Moondream 2B detect()  ──→  Object positions (pixel + bbox)
+    │
+    ▼
+Homography transform   ──→  Robot-frame positions (x, y)
+    │
+    ▼
+Skill predictor        ──→  {"skill": "pick", "x": ..., "y": ...}
+    │
+    ▼
+execute_plan()         ──→  Robot motion
+```
+
+The skill predictor could be:
+- **Option A:** Fine-tuned VLM (Moondream 2B with LoRA) that takes image + detected objects + instruction → skill call
+- **Option B:** Smaller text-only LLM that takes detected object list + instruction → skill call (no vision needed!)
+- **Option C:** Rule-based system for simple tasks (pick X → find X in detections → pick at its position)
+
+Option C is actually viable for data collection — use rule-based picking to collect training data, then train a more capable model later. Option B is interesting because it removes the need for a VLM entirely for the action prediction part.
+
+### Next Steps
+1. Integrate Moondream 2B detect() into the picking pipeline as an alternative to HSV color detection
+2. Test whether it can detect blocks the color detector misses (e.g., the natural wood blocks)
+3. Design the training data format — likely (image, detected_objects_json, instruction, skill_call)
+4. Evaluate fine-tuning Moondream 2B with LoRA for the full image→skill pipeline
