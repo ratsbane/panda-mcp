@@ -1,0 +1,173 @@
+[
+  {
+    "commanded": {
+      "x": 0.35,
+      "y": -0.1,
+      "z": 0.025
+    },
+    "actual": {
+      "x": 0.348,
+      "y": -0.1,
+      "z": 0.024
+    },
+    "gripper_px": null,
+    "grid_ix": 0,
+    "grid_iy": 0,
+    "frame_path": "/home/doug/panda-mcp/data/sweep_frames/sweep_001_x0.35_y-0.10.jpg",
+    "timestamp": 1771550566.4786937,
+    "embedded": true,
+    "embed_time_ms": 752
+  },
+  {
+    "commanded": {
+      "x": 0.35,
+      "y": 0.04000000000000001,
+      "z": 0.025
+    },
+    "actual": {
+      "x": 0.3496,
+      "y": 0.0388,
+      "z": 0.0253
+    },
+    "gripper_px": null,
+    "grid_ix": 0,
+    "grid_iy": 1,
+    "frame_path": "/home/doug/panda-mcp/data/sweep_frames/sweep_002_x0.35_y0.04.jpg",
+    "timestamp": 1771550574.977365,
+    "embedded": true,
+    "embed_time_ms": 1282
+  },
+  {
+    "commanded": {
+      "x": 0.35,
+      "y": 0.18,
+      "z": 0.025
+    },
+    "actual": {
+      "x": 0.3549,
+      "y": 0.1681,
+      "z": 0.0471
+    },
+    "gripper_px": null,
+    "grid_ix": 0,
+    "grid_iy": 2,
+    "frame_path": "/home/doug/panda-mcp/data/sweep_frames/sweep_003_x0.35_y0.18.jpg",
+    "timestamp": 1771550581.9767036,
+    "embedded": true,
+    "embed_time_ms": 765
+  },
+  {
+    "commanded": {
+      "x": 0.45,
+      "y": -0.1,
+      "z": 0.025
+    },
+    "actual": {
+      "x": 0.4477,
+      "y": -0.0997,
+      "z": 0.0239
+    },
+    "gripper_px": null,
+    "grid_ix": 1,
+    "grid_iy": 0,
+    "frame_path": "/home/doug/panda-mcp/data/sweep_frames/sweep_004_x0.45_y-0.10.jpg",
+    "timestamp": 1771550590.0792656,
+    "embedded": true,
+    "embed_time_ms": 165
+  },
+  {
+    "commanded": {
+      "x": 0.45,
+      "y": 0.04000000000000001,
+      "z": 0.025
+    },
+    "actual": {
+      "x": 0.4479,
+      "y": 0.0393,
+      "z": 0.0239
+    },
+    "gripper_px": null,
+    "grid_ix": 1,
+    "grid_iy": 1,
+    "frame_path": "/home/doug/panda-mcp/data/sweep_frames/sweep_005_x0.45_y0.04.jpg",
+    "timestamp": 1771550595.969477,
+    "embedded": true,
+    "embed_time_ms": 578
+  },
+  {
+    "commanded": {
+      "x": 0.45,
+      "y": 0.18,
+      "z": 0.025
+    },
+    "actual": {
+      "x": 0.448,
+      "y": 0.1788,
+      "z": 0.0236
+    },
+    "gripper_px": null,
+    "grid_ix": 1,
+    "grid_iy": 2,
+    "frame_path": "/home/doug/panda-mcp/data/sweep_frames/sweep_006_x0.45_y0.18.jpg",
+    "timestamp": 1771550602.1712487,
+    "embedded": true,
+    "embed_time_ms": 471
+  },
+  {
+    "commanded": {
+      "x": 0.55,
+      "y": -0.1,
+      "z": 0.025
+    },
+    "actual": {
+      "x": 0.5476,
+      "y": -0.0994,
+      "z": 0.0235
+    },
+    "gripper_px": null,
+    "grid_ix": 2,
+    "grid_iy": 0,
+    "frame_path": "/home/doug/panda-mcp/data/sweep_frames/sweep_007_x0.55_y-0.10.jpg",
+    "timestamp": 1771550609.368618,
+    "embedded": true,
+    "embed_time_ms": 365
+  },
+  {
+    "commanded": {
+      "x": 0.55,
+      "y": 0.04000000000000001,
+      "z": 0.025
+    },
+    "actual": {
+      "x": 0.5478,
+      "y": 0.0401,
+      "z": 0.0239
+    },
+    "gripper_px": null,
+    "grid_ix": 2,
+    "grid_iy": 1,
+    "frame_path": "/home/doug/panda-mcp/data/sweep_frames/sweep_008_x0.55_y0.04.jpg",
+    "timestamp": 1771550614.7665658,
+    "embedded": true,
+    "embed_time_ms": 62
+  },
+  {
+    "commanded": {
+      "x": 0.55,
+      "y": 0.18,
+      "z": 0.025
+    },
+    "actual": {
+      "x": 0.5475,
+      "y": 0.1793,
+      "z": 0.0232
+    },
+    "gripper_px": null,
+    "grid_ix": 2,
+    "grid_iy": 2,
+    "frame_path": "/home/doug/panda-mcp/data/sweep_frames/sweep_009_x0.55_y0.18.jpg",
+    "timestamp": 1771550619.7632978,
+    "embedded": true,
+    "embed_time_ms": 164
+  }
+]

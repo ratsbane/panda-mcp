@@ -127,3 +127,77 @@ Continuing from yesterday's learning session. Built `learned/visual_servo.py` wi
 9. **The pick sequence works:** open gripper → move clear → detect → position horizontally at approach height → descend vertically → grasp → lift. Horizontal-first, vertical-second is essential to avoid pushing the block.
 
 10. **Grasp height matters.** 0.020m was slightly too low, 0.025m worked. The block has nonzero height and the gripper needs to be at the right Z to close around the widest part.
+
+## 2026-02-19 ~evening - ArUco Homography: Reliable Picks Across the Workspace
+
+### Context
+The single-point calibration from earlier today only worked near the calibration point. Picking the green block (340 pixels from calibration) failed completely, with the Y estimate wildly off. The next step was building a proper pixel-to-robot coordinate mapping that generalizes across the workspace.
+
+### Approach 1: Embedding Database (attempted, partially successful)
+Built a DINOv2 embedding server on Spark (NVIDIA DGX, GPU inference) with SQLite-backed spatial memory on the Pi. Ran a 3x3 calibration sweep (9 positions across workspace), embedding each scene image. Verified embeddings encode spatial position: self-query similarity >0.99, neighbors are spatially closest.
+
+However, extracting gripper pixel positions from the sweep images proved unreliable. Tried image differencing (sweep frame minus clean frame) to find the gripper, but the arm body dominated the diff, giving fingertip positions that were off by 50-200 pixels for some positions. Both affine and polynomial fits had 28-93mm mean errors — far too high for picking.
+
+### Approach 2: ArUco Homography (breakthrough)
+The table has 6 ArUco markers (DICT_4X4_50, IDs 0-5) with known robot-frame coordinates from a prior calibration. Detected all 6 markers with OpenCV in the current camera frame and recomputed the homography.
+
+**Key finding:** The camera had shifted only ~5 pixels from the original calibration. The marker positions were nearly identical to the stored values, but the fresh homography was more accurate because it used the exact current pixel positions.
+
+**Homography quality:**
+- ArUco point residuals: 0.2-1.3mm (sub-millimeter)
+- Verified at gamepad point (known ground truth): 8mm error
+- 6 calibration points spanning 0.9m x 0.7m of workspace
+
+### Experiment 4: Color Detection + Homography Picking
+
+**Test 1 — Red block:**
+- Color detection (HSV): pixel center (729, 377)
+- Homography: robot (0.361, -0.003)
+- `pick_at(0.361, -0.003)`: **SUCCESS** — gripper closed to 29.5mm, block held
+
+**Test 2 — Green block:**
+- Color detection (HSV): pixel center (454, 463)
+- Homography: robot (0.402, -0.201)
+- `pick_at(0.402, -0.201)`: **SUCCESS** — gripper closed to 28.4mm, block held
+
+Both blocks were at very different positions in the workspace (180mm apart in X, 200mm apart in Y), confirming the homography generalizes well.
+
+### Why the Embedding Approach Failed (for now)
+
+The embedding database encodes scene-level spatial information, but the bottleneck was extracting accurate gripper pixel positions from the sweep images. Image differencing picks up the entire arm body (shoulder, wrist, gripper), not just the fingertips. The systematic error was always in the same direction: detected pixels were 37-205px to the right of the true fingertip position, because the arm extends rightward from the shoulder.
+
+The ArUco markers bypass this problem entirely — they're designed for precise detection and have known fixed positions in the robot frame.
+
+### Pipeline Summary
+
+```
+                  ┌─────────────┐
+  Camera frame →  │ HSV color   │ → pixel (cx, cy)
+                  │ detection   │
+                  └─────────────┘
+                        │
+                        ▼
+                  ┌─────────────┐
+  pixel (cx,cy) → │ ArUco       │ → robot (x, y)
+                  │ homography  │
+                  └─────────────┘
+                        │
+                        ▼
+                  ┌─────────────┐
+  robot (x,y)  → │ pick_at()   │ → grasp
+                  │ IK + descend│
+                  └─────────────┘
+```
+
+### Embedding Server Thread Issue
+The DINOv2 embedding server on Spark spawned ~50 PyTorch OpenMP/MKL threads (one per CPU core on the 20-core Grace CPU), each showing 1.2GB of shared memory in top. Fixed by setting `OMP_NUM_THREADS=4` and `MKL_NUM_THREADS=4` before torch import, plus `torch.set_num_threads(4)`. Also added port-availability check to prevent multiple server instances.
+
+### Key Learnings
+
+11. **ArUco markers make calibration trivial.** Six markers on the table, detected in one frame, give sub-mm homography accuracy. No need for complex gripper detection or image differencing.
+
+12. **The homography was already good.** The original calibration had correct ArUco positions. The camera shifted only ~5 pixels since the original calibration. The earlier "homography is not trustworthy" conclusion (Learning #1) was wrong — the problem was that I was testing the homography with incorrectly-detected gripper pixel positions, not with properly-detected object positions.
+
+13. **Color detection + homography is a robust pick pipeline.** HSV thresholding finds block centers reliably, the homography maps pixels to robot coordinates accurately, and pick_at handles the motion. Two successful picks at different workspace locations prove generalization.
+
+14. **Image differencing is a poor gripper detector.** The arm body dominates the diff, pushing the detected "center" far from the actual fingertip position. For calibration, use fiducial markers (ArUco) or place objects at known positions instead.
