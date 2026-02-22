@@ -557,6 +557,63 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="nudge_enable",
+            description="Enable NUDGE servo for trajectory correction during picks. "
+                       "Loads an ONNX model that predicts discrete spatial corrections and "
+                       "applies them during the approach. Requires training first.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "model_path": {
+                        "type": "string",
+                        "description": "Path to NUDGE ONNX model file",
+                    },
+                },
+                "required": ["model_path"],
+            },
+        ),
+        Tool(
+            name="nudge_disable",
+            description="Disable NUDGE servo.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="nudge_status",
+            description="Get NUDGE servo status including step count and corrections applied.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="nudge_collect_enable",
+            description="Enable NUDGE data collection. Records full frames + gripper positions during pick_at() "
+                       "for self-supervised learning. Each successful grasp generates discrete direction labels.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="nudge_collect_disable",
+            description="Disable NUDGE data collection.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="nudge_collect_stats",
+            description="Get NUDGE data collection statistics: total approaches, success rate, frames collected.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
             name="get_safety_limits",
             description="Get current safety limits (workspace bounds, velocity limits).",
             inputSchema={
@@ -587,18 +644,61 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="learned_pick",
-            description="Pick an object using Claude's learned visual servo approach. Uses color detection + lateral approach strategy. "
-                       "Developed through direct experimentation. Connects to camera daemon for vision.",
+            description="Pick an object using Claude's learned visual servo approach. "
+                       "Connects to camera daemon for vision. Two detection modes: "
+                       "1) color= for HSV color detection (red/green/blue/orange), "
+                       "2) query= for Moondream 2B natural language detection (any object description). "
+                       "Moondream requires the inference server running on Spark.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "color": {
                         "type": "string",
-                        "description": "Target color (red, green, blue)",
-                        "enum": ["red", "green", "blue"],
+                        "description": "Target color for HSV detection (red, green, blue, orange)",
+                        "enum": ["red", "green", "blue", "orange"],
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language object description for Moondream detection (e.g. 'the wooden block', 'green block')",
                     },
                 },
-                "required": ["color"],
+            },
+        ),
+        Tool(
+            name="collect_episodes",
+            description="Run autonomous training data collection. Picks random blocks and places them at random positions, "
+                       "recording (image, instruction, robot_coords) at each step for Moondream fine-tuning. "
+                       "Requires Moondream server running on Spark.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "num_episodes": {
+                        "type": "integer",
+                        "description": "Number of pick-place cycles to run (default: 10)",
+                        "default": 10,
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Output directory (default: data/moondream_training)",
+                        "default": "data/moondream_training",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="vlm_task",
+            description="Execute a pick-and-place task using the fine-tuned VLM. "
+                       "The VLM decides WHICH object to act on, then Moondream detect() finds WHERE. "
+                       "Requires Moondream server with LoRA running on Spark (port 8091).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "instruction": {
+                        "type": "string",
+                        "description": "Natural language task, e.g. 'Pick up the red block.'",
+                    },
+                },
+                "required": ["instruction"],
             },
         ),
         Tool(
@@ -831,6 +931,30 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = controller.sawm_collect_stats()
             return json_response(result)
 
+        elif name == "nudge_enable":
+            result = controller.nudge_enable(model_path=arguments["model_path"])
+            return json_response(result)
+
+        elif name == "nudge_disable":
+            result = controller.nudge_disable()
+            return json_response(result)
+
+        elif name == "nudge_status":
+            result = controller.nudge_status()
+            return json_response(result)
+
+        elif name == "nudge_collect_enable":
+            result = controller.nudge_collect_enable()
+            return json_response(result)
+
+        elif name == "nudge_collect_disable":
+            result = controller.nudge_collect_disable()
+            return json_response(result)
+
+        elif name == "nudge_collect_stats":
+            result = controller.nudge_collect_stats()
+            return json_response(result)
+
         elif name == "get_safety_limits":
             config = get_safety_config()
             return json_response(config.to_dict())
@@ -849,23 +973,129 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "learned_pick":
             if not controller.connected:
                 return json_response({"error": "Not connected. Call 'connect' first."})
-            color = arguments["color"]
+            color = arguments.get("color")
+            query = arguments.get("query")
+            if not color and not query:
+                return json_response({"error": "Provide either 'color' or 'query' parameter"})
             try:
-                from learned.visual_servo import VisualServoController, load_config
-                servo_config = load_config()
-                servo = VisualServoController(servo_config)
-                servo.connect_camera()
-                servo.use_controller(controller)
-                success = servo.pick(color)
-                servo.disconnect()
-                return json_response({
-                    "success": success,
-                    "color": color,
-                    "log": servo.log_entries,
-                })
+                import math
+                from learned.block_detector import load_homography, pixel_to_robot
+                from camera_daemon.client import CameraClient
+
+                H, workspace = load_homography()
+                cam = CameraClient()
+                cam.connect()
+                frame = cam.get_frame()
+                cam.disconnect()
+
+                if frame is None:
+                    return json_response({"error": "Failed to capture frame"})
+
+                detection_info = {}
+
+                if query:
+                    # Moondream detection
+                    from learned.moondream_client import detect as md_detect
+                    detections = md_detect(frame, query)
+                    if not detections:
+                        return json_response({
+                            "success": False,
+                            "error": f"Moondream found no objects for query: {query!r}",
+                        })
+                    # Filter to workspace, pick largest
+                    ws = workspace or {"x_min": 0.2, "x_max": 0.6, "y_min": -0.2, "y_max": 0.2}
+                    det = None
+                    for d in detections:
+                        drx, dry = pixel_to_robot(d.center_x, d.center_y, H)
+                        if ws["x_min"] <= drx <= ws["x_max"] and ws["y_min"] <= dry <= ws["y_max"]:
+                            det = d
+                            break
+                    if det is None:
+                        # Fall back to largest detection even if out of workspace
+                        det = detections[0]
+                    px, py = det.center_x, det.center_y
+                    rx, ry = pixel_to_robot(px, py, H)
+                    if not (ws["x_min"] <= rx <= ws["x_max"] and ws["y_min"] <= ry <= ws["y_max"]):
+                        return json_response({
+                            "success": False,
+                            "error": f"Detection at robot ({rx:.3f}, {ry:.3f}) is outside workspace",
+                            "pixel": (px, py),
+                            "robot": (round(rx, 3), round(ry, 3)),
+                        })
+                    detection_info = {
+                        "method": "moondream",
+                        "query": query,
+                        "pixel": (px, py),
+                        "robot": (round(rx, 3), round(ry, 3)),
+                        "bbox": (det.bbox_w, det.bbox_h),
+                        "num_detections": len(detections),
+                    }
+                else:
+                    # HSV color detection
+                    from learned.block_detector import find_block
+                    block = find_block(frame, H, color, workspace)
+                    if block is None:
+                        return json_response({
+                            "success": False,
+                            "error": f"No {color} block found in workspace",
+                        })
+                    px, py = block.pixel_x, block.pixel_y
+                    rx, ry = block.robot_x, block.robot_y
+                    detection_info = {
+                        "method": "color",
+                        "color": block.color,
+                        "pixel": (px, py),
+                        "robot": (round(rx, 3), round(ry, 3)),
+                        "yaw_deg": round(math.degrees(block.yaw), 1),
+                    }
+
+                # Pick at detected position
+                yaw = 0.0
+                if "yaw_deg" in detection_info:
+                    yaw = math.radians(detection_info["yaw_deg"])
+
+                result = controller.pick_at(
+                    x=rx,
+                    y=ry,
+                    grasp_width=0.03,
+                    z=0.013,
+                    yaw=yaw,
+                )
+                result["detection"] = detection_info
+                return json_response(result)
             except Exception as e:
                 logger.exception(f"learned_pick failed: {e}")
                 return json_response({"error": f"learned_pick failed: {str(e)}"})
+
+        elif name == "collect_episodes":
+            if not controller.connected:
+                return json_response({"error": "Not connected. Call 'connect' first."})
+            try:
+                from learned.data_collector import run_collection, CollectionConfig
+                config = CollectionConfig(
+                    num_episodes=arguments.get("num_episodes", 10),
+                    output_dir=arguments.get("output_dir", "data/moondream_training"),
+                )
+                result = run_collection(controller, config)
+                return json_response(result)
+            except Exception as e:
+                logger.exception(f"collect_episodes failed: {e}")
+                return json_response({"error": f"collect_episodes failed: {str(e)}"})
+
+        elif name == "vlm_task":
+            if not controller.connected:
+                return json_response({"error": "Not connected. Call 'connect' first."})
+            try:
+                from learned.objsel_orchestrator import run_task, OrchestratorConfig
+                instruction = arguments.get("instruction", "")
+                if not instruction:
+                    return json_response({"error": "instruction is required"})
+                config = OrchestratorConfig()
+                result = run_task(controller, instruction, config)
+                return json_response(result)
+            except Exception as e:
+                logger.exception(f"vlm_task failed: {e}")
+                return json_response({"error": f"vlm_task failed: {str(e)}"})
 
         elif name == "restart":
             import os

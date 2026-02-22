@@ -1290,11 +1290,55 @@ class FrankaController:
         if sawm_monitor:
             self._sawm_monitor.start(target_xy=(x, y))  # use original position, not offset
 
+        # NUDGE data collection: detect target bbox and start approach
+        nudge_active = hasattr(self, '_nudge_collector') and self._nudge_collector is not None
+        nudge_bbox = None
+        nudge_perturb_dx = 0.0
+        nudge_perturb_dy = 0.0
+        if nudge_active:
+            nudge_bbox = self._nudge_detect_target_bbox()
+            if nudge_bbox is not None:
+                self._nudge_collector.start_approach(
+                    target_bbox_pixels=nudge_bbox,
+                    target_type="block",
+                )
+                # Apply random XY perturbation for training data diversity
+                nudge_perturb_dx = np.random.uniform(-0.020, 0.020)  # ±20mm
+                nudge_perturb_dy = np.random.uniform(-0.020, 0.020)
+                # Clamp to stay within safe workspace
+                px = target_x + nudge_perturb_dx
+                py = y + nudge_perturb_dy
+                px = max(0.30, min(0.60, px))
+                py = max(-0.20, min(0.20, py))
+                nudge_perturb_dx = px - target_x
+                nudge_perturb_dy = py - y
+                if abs(nudge_perturb_dx) > 0.001 or abs(nudge_perturb_dy) > 0.001:
+                    target_x += nudge_perturb_dx
+                    y += nudge_perturb_dy
+                    logger.info(
+                        f"NUDGE perturbation: dx={nudge_perturb_dx*1000:.1f}mm "
+                        f"dy={nudge_perturb_dy*1000:.1f}mm -> approach at "
+                        f"({target_x:.3f}, {y:.3f})"
+                    )
+            else:
+                nudge_active = False  # can't collect without bbox
+
+        # NUDGE servo: start if model loaded
+        nudge_servo = hasattr(self, '_nudge_servo') and self._nudge_servo is not None
+        if nudge_servo:
+            servo_bbox = nudge_bbox or self._nudge_detect_target_bbox()
+            if servo_bbox is not None:
+                self._nudge_servo.start(target_bbox_pixels=servo_bbox)
+            else:
+                nudge_servo = False
+
         # Helper to abort pick on move failure
         def _abort(msg, steps):
             logger.error(f"pick_at aborted: {msg}")
             if sawm_monitor:
                 self._sawm_monitor.stop()
+            if nudge_servo:
+                self._nudge_servo.stop()
             state = self.get_state()
             return {
                 "success": False,
@@ -1346,6 +1390,10 @@ class FrankaController:
         if sawm_active:
             self._sawm_record_frame()
 
+        # NUDGE: record frame at approach height
+        if nudge_active:
+            self._nudge_record_frame()
+
         # Step 3: Lower in increments (avoid large joint changes that trigger reflex)
         current_z = state.ee_position[2]
         step_z = 0.04  # 4cm increments
@@ -1366,6 +1414,26 @@ class FrankaController:
             if sawm_active:
                 self._sawm_record_frame()
 
+            # NUDGE: record frame at each Z step
+            if nudge_active:
+                self._nudge_record_frame()
+
+            # NUDGE servo: apply correction
+            if nudge_servo:
+                nudge_correction = self._nudge_get_correction()
+                if nudge_correction is not None:
+                    ndx, ndy, ndz = nudge_correction
+                    target_x += ndx
+                    y += ndy
+                    # dz not applied (Z is controlled by incremental lowering)
+                    steps.append({
+                        "action": "nudge_correction",
+                        "dx_mm": round(ndx * 1000, 1),
+                        "dy_mm": round(ndy * 1000, 1),
+                        "dz_mm": round(ndz * 1000, 1),
+                    })
+                    logger.info(f"NUDGE correction: dx={ndx*1000:.1f}mm dy={ndy*1000:.1f}mm")
+
             # SAWM monitor: check for correction (clamped to ±15mm)
             if sawm_monitor:
                 correction = self._sawm_monitor.get_correction()
@@ -1383,6 +1451,15 @@ class FrankaController:
                     })
                     logger.info(f"SAWM correction applied: dx={cdx*1000:.1f}mm dy={cdy*1000:.1f}mm")
 
+        # Remove NUDGE perturbation before final grasp (accurate positioning)
+        if nudge_active and (abs(nudge_perturb_dx) > 0.001 or abs(nudge_perturb_dy) > 0.001):
+            target_x -= nudge_perturb_dx
+            y -= nudge_perturb_dy
+            logger.info(
+                f"NUDGE perturbation removed for grasp: "
+                f"target=({target_x:.3f}, {y:.3f})"
+            )
+
         # Final lower to grasp height
         result = self.move_cartesian_ik(
             target_x, y, z,
@@ -1398,6 +1475,10 @@ class FrankaController:
         # SAWM: record frame at grasp height (closest frame)
         if sawm_active:
             self._sawm_record_frame()
+
+        # NUDGE: record frame at grasp height
+        if nudge_active:
+            self._nudge_record_frame()
 
         # Step 4: Grasp
         result = self.gripper_grasp(width=grasp_width, force=grasp_force)
@@ -1521,6 +1602,18 @@ class FrankaController:
         if sawm_monitor:
             self._sawm_monitor.stop()
 
+        # NUDGE: end approach with grasp result
+        if nudge_active:
+            ee = self.get_state().ee_position
+            self._nudge_collector.end_approach(
+                success=grasped,
+                final_gripper_xyz=(ee[0], ee[1], ee[2]),
+            )
+
+        # NUDGE servo: stop
+        if nudge_servo:
+            self._nudge_servo.stop()
+
         # Step 5: Lift (IK with straight-down orientation)
         state = self.get_state()
         result = self.move_cartesian_ik(
@@ -1563,6 +1656,61 @@ class FrankaController:
             )
         except Exception as e:
             logger.warning(f"SAWM frame recording failed: {e}")
+
+    def _nudge_detect_target_bbox(self) -> Optional[list]:
+        """Detect target bbox in current camera frame using color detection."""
+        try:
+            from camera_daemon.client import get_camera_client
+            from learned.block_detector import detect_blocks, load_homography
+            client = get_camera_client()
+            frame = client.get_frame()
+            if frame is None:
+                return None
+            H, workspace = load_homography()
+            blocks = detect_blocks(frame, H, workspace)
+            if not blocks:
+                return None
+            # Return bbox of largest block: [x1, y1, x2, y2] in pixel coords
+            b = blocks[0]
+            cx, cy = b.pixel_x, b.pixel_y
+            hw, hh = b.bbox_w // 2, b.bbox_h // 2
+            return [cx - hw, cy - hh, cx + hw, cy + hh]
+        except Exception as e:
+            logger.warning(f"NUDGE target detection failed: {e}")
+            return None
+
+    def _nudge_record_frame(self):
+        """Capture a camera frame and record it for NUDGE data collection."""
+        try:
+            from camera_daemon.client import get_camera_client
+            client = get_camera_client()
+            frame = client.get_frame()
+            if frame is None:
+                logger.warning("NUDGE: no camera frame available")
+                return
+
+            state = self.get_state()
+            ee = state.ee_position
+
+            self._nudge_collector.record_frame(
+                frame=frame,
+                gripper_xyz=(ee[0], ee[1], ee[2]),
+            )
+        except Exception as e:
+            logger.warning(f"NUDGE frame recording failed: {e}")
+
+    def _nudge_get_correction(self) -> Optional[tuple]:
+        """Run NUDGE servo prediction on current camera frame."""
+        try:
+            from camera_daemon.client import get_camera_client
+            client = get_camera_client()
+            frame = client.get_frame()
+            if frame is None:
+                return None
+            return self._nudge_servo.predict(frame)
+        except Exception as e:
+            logger.warning(f"NUDGE servo prediction failed: {e}")
+            return None
 
     def _check_slip(self, label: str) -> dict:
         """Check for object slip using grip width, is_grasped flag, and force baseline.
@@ -2618,6 +2766,77 @@ class FrankaController:
             "final_position": final_pos,
             "results": results,
         }
+
+
+    # --- NUDGE methods ---
+
+    def nudge_enable(self, model_path: str) -> dict:
+        """Enable NUDGE servo for trajectory correction during picks."""
+        try:
+            from common.nudge.servo import NUDGEServoLoop
+            self._nudge_servo = NUDGEServoLoop(model_path)
+            return {
+                "success": True,
+                "message": f"NUDGE servo loaded from {model_path}. Will correct pick trajectories.",
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def nudge_disable(self) -> dict:
+        """Disable NUDGE servo."""
+        if not hasattr(self, '_nudge_servo') or self._nudge_servo is None:
+            return {"success": False, "error": "NUDGE servo not active"}
+
+        if self._nudge_servo.active:
+            self._nudge_servo.stop()
+
+        status = self._nudge_servo.get_status()
+        self._nudge_servo = None
+        return {
+            "success": True,
+            "message": "NUDGE servo disabled.",
+            "final_status": status,
+        }
+
+    def nudge_status(self) -> dict:
+        """Get NUDGE servo status."""
+        if not hasattr(self, '_nudge_servo') or self._nudge_servo is None:
+            return {"active": False, "servo_loaded": False}
+        result = self._nudge_servo.get_status()
+        result["servo_loaded"] = True
+        return result
+
+    def nudge_collect_enable(self) -> dict:
+        """Enable NUDGE data collection during pick_at() calls."""
+        from common.nudge.collector import get_nudge_collector
+        self._nudge_collector = get_nudge_collector()
+        return {
+            "success": True,
+            "message": "NUDGE data collection enabled. Frames will be recorded during pick_at().",
+            "stats": self._nudge_collector.get_stats(),
+        }
+
+    def nudge_collect_disable(self) -> dict:
+        """Disable NUDGE data collection."""
+        if not hasattr(self, '_nudge_collector') or self._nudge_collector is None:
+            return {"success": False, "error": "NUDGE collection not active"}
+
+        if self._nudge_collector.active:
+            self._nudge_collector.end_approach(success=False, final_gripper_xyz=(0, 0, 0))
+
+        stats = self._nudge_collector.get_stats()
+        self._nudge_collector = None
+        return {
+            "success": True,
+            "message": "NUDGE data collection disabled.",
+            "stats": stats,
+        }
+
+    def nudge_collect_stats(self) -> dict:
+        """Get NUDGE data collection statistics."""
+        from common.nudge.collector import get_nudge_collector
+        collector = self._nudge_collector if hasattr(self, '_nudge_collector') and self._nudge_collector else get_nudge_collector()
+        return collector.get_stats()
 
 
 # Singleton controller
