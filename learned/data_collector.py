@@ -57,6 +57,14 @@ PLACE_BOUNDS = {
     "y_max": 0.18,
 }
 
+# Safe pick workspace (tighter than calibration.json — x<0.35 causes IK issues at table height)
+PICK_WORKSPACE = {
+    "x_min": 0.35,
+    "x_max": 0.55,
+    "y_min": -0.20,
+    "y_max": 0.20,
+}
+
 # Minimum distance between blocks for placement (meters)
 MIN_BLOCK_SPACING = 0.06
 
@@ -67,7 +75,7 @@ class CollectionConfig:
     output_dir: str = "data/moondream_training"
     num_episodes: int = 10
     grasp_width: float = 0.03
-    grasp_z: float = 0.013
+    grasp_z: float = 0.018
     place_z: float = 0.015
     moondream_url: str = "http://spark:8091"
     block_queries: list = None  # defaults to BLOCK_QUERIES
@@ -114,19 +122,20 @@ def _detect_all_blocks(frame, H, workspace, config):
             seen_positions.add(key)
 
             rx, ry = pixel_to_robot(det.center_x, det.center_y, H)
-            in_ws = (
+            rx, ry = float(rx), float(ry)
+            in_ws = bool(
                 workspace["x_min"] <= rx <= workspace["x_max"]
                 and workspace["y_min"] <= ry <= workspace["y_max"]
             )
 
             all_objects.append(DetectedObject(
                 query=query,
-                pixel_x=det.center_x,
-                pixel_y=det.center_y,
+                pixel_x=int(det.center_x),
+                pixel_y=int(det.center_y),
                 robot_x=rx,
                 robot_y=ry,
-                bbox_w=det.bbox_w,
-                bbox_h=det.bbox_h,
+                bbox_w=int(det.bbox_w),
+                bbox_h=int(det.bbox_h),
                 in_workspace=in_ws,
             ))
 
@@ -170,6 +179,40 @@ def _save_step(episode_dir, step_name, frame, metadata):
         json.dump(metadata, f, indent=2)
 
 
+def _check_and_recover(controller, stats):
+    """Check robot error state and attempt recovery. Returns True if ok/recovered."""
+    try:
+        state = controller.get_state()
+        if not state.has_error:
+            # No error, just move home
+            try:
+                controller.open_gripper()
+                controller.move_cartesian_ik(x=0.4, y=0, z=0.3)
+            except Exception:
+                pass
+            return True
+
+        logger.warning(f"Robot in error state: {state.error_message}")
+        stats.setdefault("robot_errors", 0)
+        stats["robot_errors"] += 1
+
+        # Attempt automatic recovery
+        result = controller.recover()
+        if result.get("success"):
+            logger.info("Robot recovered from error")
+            try:
+                controller.move_cartesian_ik(x=0.4, y=0, z=0.3)
+            except Exception:
+                pass
+            return True
+        else:
+            logger.error(f"Recovery failed: {result.get('error')}")
+            return False
+    except Exception as e:
+        logger.error(f"Error checking robot state: {e}")
+        return False
+
+
 def run_collection(controller, config: Optional[CollectionConfig] = None):
     """Run the autonomous data collection loop.
 
@@ -186,8 +229,9 @@ def run_collection(controller, config: Optional[CollectionConfig] = None):
     from learned.block_detector import load_homography
     from camera_daemon.client import CameraClient
 
-    # Setup
-    H, workspace = load_homography()
+    # Setup — use safe pick workspace, not calibration.json bounds
+    H, _cal_workspace = load_homography()
+    workspace = PICK_WORKSPACE
     cam = CameraClient()
     if not cam.connect():
         return {"error": "Failed to connect to camera"}
@@ -240,8 +284,27 @@ def run_collection(controller, config: Optional[CollectionConfig] = None):
                 })
                 continue
 
-            # Step 2: Choose a random block to pick
-            target = random.choice(ws_objects)
+            # Step 2: Choose a random block to pick (skip blocks too close to neighbors)
+            MIN_NEIGHBOR_DIST = 0.05  # 5cm — gripper is ~8cm wide
+            safe_targets = []
+            for candidate in ws_objects:
+                too_close = False
+                for other in ws_objects:
+                    if other is candidate:
+                        continue
+                    dist = math.sqrt((candidate.robot_x - other.robot_x)**2 +
+                                     (candidate.robot_y - other.robot_y)**2)
+                    if dist < MIN_NEIGHBOR_DIST:
+                        too_close = True
+                        break
+                if not too_close:
+                    safe_targets.append(candidate)
+
+            if not safe_targets:
+                logger.warning("All blocks too close to neighbors, picking random anyway")
+                safe_targets = ws_objects
+
+            target = random.choice(safe_targets)
             instruction = random.choice(PICK_TEMPLATES).format(query=target.query)
 
             logger.info(f"  Target: {target.query} at robot ({target.robot_x:.3f}, {target.robot_y:.3f})")
@@ -273,14 +336,15 @@ def run_collection(controller, config: Optional[CollectionConfig] = None):
                 _save_step(episode_dir, "pick_result", frame, {
                     "success": False, "error": str(e),
                 })
-                # Try to recover
-                try:
-                    controller.move_cartesian_ik(x=0.4, y=0, z=0.3)
-                except Exception:
-                    pass
-                continue
+                # Check if robot is in error state
+                if _check_and_recover(controller, stats):
+                    continue  # recovered, try next episode
+                else:
+                    logger.error("Robot in unrecoverable error state, aborting collection")
+                    stats["abort_reason"] = "unrecoverable_robot_error"
+                    break
 
-            pick_success = pick_result.get("gripper_width", 0.08) < 0.05
+            pick_success = bool(pick_result.get("gripper_width", 0.08) < 0.05)
             logger.info(f"  Pick: {'SUCCESS' if pick_success else 'FAIL'} "
                        f"(width={pick_result.get('gripper_width', '?')})")
 
@@ -290,12 +354,10 @@ def run_collection(controller, config: Optional[CollectionConfig] = None):
 
             if not pick_success:
                 stats["pick_failures"] += 1
-                # Open gripper and go home
-                try:
-                    controller.open_gripper()
-                    controller.move_cartesian_ik(x=0.4, y=0, z=0.3)
-                except Exception:
-                    pass
+                if not _check_and_recover(controller, stats):
+                    logger.error("Robot in unrecoverable error state, aborting collection")
+                    stats["abort_reason"] = "unrecoverable_robot_error"
+                    break
                 continue
 
             stats["pick_successes"] += 1
@@ -327,11 +389,10 @@ def run_collection(controller, config: Optional[CollectionConfig] = None):
                 )
             except Exception as e:
                 logger.error(f"  Place failed: {e}")
-                try:
-                    controller.open_gripper()
-                    controller.move_cartesian_ik(x=0.4, y=0, z=0.3)
-                except Exception:
-                    pass
+                if not _check_and_recover(controller, stats):
+                    logger.error("Robot in unrecoverable error state, aborting collection")
+                    stats["abort_reason"] = "unrecoverable_robot_error"
+                    break
                 continue
 
             # Step 8: Record completion

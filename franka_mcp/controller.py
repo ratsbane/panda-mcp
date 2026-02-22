@@ -1293,6 +1293,8 @@ class FrankaController:
         # NUDGE data collection: detect target bbox and start approach
         nudge_active = hasattr(self, '_nudge_collector') and self._nudge_collector is not None
         nudge_bbox = None
+        nudge_perturb_dx = 0.0
+        nudge_perturb_dy = 0.0
         if nudge_active:
             nudge_bbox = self._nudge_detect_target_bbox()
             if nudge_bbox is not None:
@@ -1300,6 +1302,24 @@ class FrankaController:
                     target_bbox_pixels=nudge_bbox,
                     target_type="block",
                 )
+                # Apply random XY perturbation for training data diversity
+                nudge_perturb_dx = np.random.uniform(-0.020, 0.020)  # ±20mm
+                nudge_perturb_dy = np.random.uniform(-0.020, 0.020)
+                # Clamp to stay within safe workspace
+                px = target_x + nudge_perturb_dx
+                py = y + nudge_perturb_dy
+                px = max(0.30, min(0.60, px))
+                py = max(-0.20, min(0.20, py))
+                nudge_perturb_dx = px - target_x
+                nudge_perturb_dy = py - y
+                if abs(nudge_perturb_dx) > 0.001 or abs(nudge_perturb_dy) > 0.001:
+                    target_x += nudge_perturb_dx
+                    y += nudge_perturb_dy
+                    logger.info(
+                        f"NUDGE perturbation: dx={nudge_perturb_dx*1000:.1f}mm "
+                        f"dy={nudge_perturb_dy*1000:.1f}mm -> approach at "
+                        f"({target_x:.3f}, {y:.3f})"
+                    )
             else:
                 nudge_active = False  # can't collect without bbox
 
@@ -1430,6 +1450,15 @@ class FrankaController:
                         "dy_mm": round(cdy * 1000, 1),
                     })
                     logger.info(f"SAWM correction applied: dx={cdx*1000:.1f}mm dy={cdy*1000:.1f}mm")
+
+        # Remove NUDGE perturbation before final grasp (accurate positioning)
+        if nudge_active and (abs(nudge_perturb_dx) > 0.001 or abs(nudge_perturb_dy) > 0.001):
+            target_x -= nudge_perturb_dx
+            y -= nudge_perturb_dy
+            logger.info(
+                f"NUDGE perturbation removed for grasp: "
+                f"target=({target_x:.3f}, {y:.3f})"
+            )
 
         # Final lower to grasp height
         result = self.move_cartesian_ik(

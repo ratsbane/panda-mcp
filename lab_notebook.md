@@ -661,7 +661,63 @@ SAWM used a crop-and-zoom approach centered on the target. NUDGE takes the full 
 SAWM used MobileNetV3-Small (pretrained on ImageNet). NUDGE uses a simple 5-block CNN trained from scratch. The visual features needed (block edges, gripper position, spatial relationships) are domain-specific and simple enough to learn from ~5K frames. Avoids ImageNet normalization stats and reduces model size.
 
 ### Next Steps
-- Collect ~100-200 successful approaches using `scripts/collect_nudge_data.py`
+- ~~Collect ~100-200 successful approaches using `scripts/collect_nudge_data.py`~~ → Done (see 2026-02-22)
 - Train on Spark, evaluate per-axis accuracy
 - Run servo loop live, measure pick accuracy improvement
 - Phase 4: Use NUDGE for place-approach (stacking) — same model, different target detection
+
+## 2026-02-22 ~afternoon - NUDGE Data Collection & Threshold Tuning
+
+### Context
+Continued from previous session that collected 101 successful approaches (588 frames). Discovered severe class imbalance: dx was 89% "aligned" (class 3), dy was 97% "aligned" — because `pick_at()` is already accurate to ~2-5mm XY, so virtually all frames have tiny XY offsets under the 3mm threshold.
+
+### Problem: Class Imbalance
+Analysis of continuous offset distributions revealed:
+- **dx**: 90th percentile = 3.0mm, max = 14.9mm — almost everything inside the 3mm "aligned" bucket
+- **dy**: 90th percentile = 2.1mm, max = 10.3mm — even tighter
+- **dz**: Good spread (8mm to 117mm) — natural diversity from different heights during approach
+
+A model trained on this data would learn to always predict "aligned" for XY (89-97% accuracy by just predicting class 3) — useless for correction.
+
+### Solution 1: Per-Axis Exponential Thresholds
+Compared 5 threshold schemes (Fibonacci, 3 exponential variants, golden ratio) with simulated ±25mm perturbation data. **Per-axis exponential base-3** won:
+
+| Axis | Thresholds (mm) | Representatives (mm) | Rationale |
+|------|-----------------|---------------------|-----------|
+| XY   | 2, 6, 18        | 0, 4, 12, 25       | Finer resolution needed for precise XY alignment |
+| Z    | 8, 24, 72       | 0, 16, 48, 100     | Larger scale — Z has huge range during descent |
+
+Updated `common/nudge/discretize.py` — `DiscretizeConfig` now has `thresholds_xy` and `thresholds_z`, `continuous_to_class()` takes `axis` parameter. Re-labeled all 588 existing frames in place with `scripts/relabel_nudge_data.py` — changed 428 of 588 labels. Z distribution improved dramatically from 60% in one class to ~30% spread across classes.
+
+### Solution 2: XY Perturbation During Collection
+Added random ±20mm XY offset during pick approach descent (in `controller.py` `pick_at()`). Perturbation is applied at approach start and removed before final grasp. This creates genuine XY offset diversity in training data while still completing successful picks.
+
+Clamped to workspace bounds: x∈[0.30, 0.60], y∈[-0.20, 0.20].
+
+### Data Collection Results
+Ran perturbed collection cycling green block:
+- **115 successful approaches, 658 frames total** (101 original + 14 perturbed)
+- 86.5% success rate (18 failures from detection issues, IK limits, cartesian reflex)
+- Collection stopped when green block landed at x=0.55, y=-0.06 and rolled off/to edge of table
+- Red block also out of workspace bounds (y=-0.30)
+
+Fewer perturbed approaches than hoped (14 vs target 100), but the combination of:
+1. Re-labeled existing data (Z now well-distributed)
+2. Some perturbed approaches (XY diversity)
+3. 658 total frames across 115 approaches
+
+...should be sufficient for a first training run. Can always collect more.
+
+### Key Design Decisions
+
+**36. Per-axis thresholds**
+XY and Z have fundamentally different scales. XY corrections are ~1-20mm precision alignment. Z offsets range from 0 to 140mm (full approach height). A single threshold scheme cannot serve both well. Base-3 exponential (each bucket 3x wider) gives good logarithmic coverage.
+
+**37. XY perturbation for data diversity**
+Rather than relying on natural pick error (which is tiny at 2-5mm), deliberately add random offsets during approach. The perturbation is removed before final grasp so the pick still succeeds, and the offset between perturbed position and final grasp position provides diverse training labels.
+
+### Next Steps
+- Train NUDGE on combined dataset (115 approaches, 658 frames) on Spark
+- Evaluate per-axis accuracy and class distribution
+- If XY accuracy is poor, collect more perturbed data (need blocks back on table)
+- Test servo loop with trained model

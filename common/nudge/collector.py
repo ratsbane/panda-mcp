@@ -173,9 +173,9 @@ class NUDGECollector:
                 "dx_m": round(float(dx_m), 5),
                 "dy_m": round(float(dy_m), 5),
                 "dz_m": round(float(dz_m), 5),
-                "dx_class": continuous_to_class(dx_m),
-                "dy_class": continuous_to_class(dy_m),
-                "dz_class": continuous_to_class(dz_m),
+                "dx_class": continuous_to_class(dx_m, axis="x"),
+                "dy_class": continuous_to_class(dy_m, axis="y"),
+                "dz_class": continuous_to_class(dz_m, axis="z"),
             })
 
         # Save labels

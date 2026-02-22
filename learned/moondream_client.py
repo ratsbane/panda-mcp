@@ -1,8 +1,8 @@
 """
 Client for the Moondream 2B inference server running on Spark.
 
-Sends camera frames to the server and receives object detections
-or point localizations. Used by the learned_pick pipeline.
+Sends camera frames to the server and receives object detections,
+point localizations, or VLM skill queries. Used by the learned_pick pipeline.
 """
 
 import base64
@@ -44,13 +44,20 @@ class MoondreamPoint:
     y: float
 
 
+@dataclass
+class MoondreamQueryResult:
+    """A VLM query result from the fine-tuned model."""
+    answer: str
+    latency_ms: float
+
+
 def _encode_frame(frame: np.ndarray) -> str:
     """Encode BGR frame as base64 JPEG."""
     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
-def _post_json(url: str, data: dict, timeout: float = 10.0) -> dict:
+def _post_json(url: str, data: dict, timeout: float = 30.0) -> dict:
     """POST JSON and return response dict."""
     body = json.dumps(data).encode("utf-8")
     req = Request(url, data=body, headers={"Content-Type": "application/json"})
@@ -144,3 +151,46 @@ def point(
         x=pt["x"],
         y=pt["y"],
     )
+
+
+def query(
+    frame: np.ndarray,
+    question: str,
+    server_url: str = DEFAULT_SERVER_URL,
+) -> Optional[MoondreamQueryResult]:
+    """Query the VLM with a question about an image.
+
+    Used with the fine-tuned object-selection model to get skill predictions.
+
+    Args:
+        frame: BGR camera frame
+        question: e.g. "Visible objects: red block, blue block. Pick up the red block."
+        server_url: Moondream server URL
+
+    Returns:
+        MoondreamQueryResult or None if server unreachable
+    """
+    url = f"{server_url}/query"
+    b64 = _encode_frame(frame)
+
+    try:
+        result = _post_json(url, {"image_base64": b64, "question": question})
+    except (URLError, OSError) as e:
+        logger.error(f"Moondream server unreachable at {server_url}: {e}")
+        return None
+
+    answer = result.get("answer", "")
+    latency = result.get("latency_ms", 0)
+    logger.info(f"Moondream query: {answer!r} ({latency:.0f}ms)")
+    return MoondreamQueryResult(answer=answer, latency_ms=latency)
+
+
+def health(server_url: str = DEFAULT_SERVER_URL) -> Optional[dict]:
+    """Check server health and LoRA status."""
+    import json
+    from urllib.request import urlopen
+    try:
+        resp = urlopen(f"{server_url}/health", timeout=5)
+        return json.loads(resp.read())
+    except Exception:
+        return None
