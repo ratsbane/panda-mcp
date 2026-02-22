@@ -1,5 +1,7 @@
 # Lab Notebook - panda-mcp
 
+> **Research philosophy:** Try new ideas as quickly as possible and keep the hardware busy. The DGX Spark, Franka Panda, cameras, and tuppy should be running experiments constantly — testing ideas, rejecting ones that don't work, accepting those that do, and iterating. Claude is the engine driving this cycle. Take good notes; this notebook is a valuable resource.
+
 ## 2026-02-18 ~afternoon - First Learning Session
 
 ### Context
@@ -411,3 +413,255 @@ Pi (franka-mcp)                         Spark (GPU)
 23. **Workspace filtering is essential for multi-instance queries.** "Red block" returns both red blocks in the scene. Filtering by workspace bounds (checking robot coordinates) picks the correct one. For queries like "the block closest to the robot", we'd need the model itself to discriminate — a future fine-tuning target.
 
 24. **2.4s latency per detection is acceptable for scripted tasks** but too slow for a tight control loop. For autonomous data collection, this is fine — each pick-place cycle takes ~15s total anyway. For real-time servoing, would need to run Moondream on-device or use a faster model.
+
+## 2026-02-21 - Autonomous Data Collection + Moondream Fine-tuning
+
+### Context
+Built an autonomous data collection pipeline (`learned/data_collector.py`) that runs Moondream-guided pick-place-shuffle cycles, recording (image, instruction, robot_coords) for VLM training. Then attempted fine-tuning Moondream 2B on the collected data.
+
+### Experiment 12: Autonomous Data Collection
+
+**Pipeline:** Moondream detects blocks → homography → pick_at → place at random location → repeat. Each cycle captures image + instruction + coordinates as a training example.
+
+**Results over ~6 hours of collection:**
+- 126 episodes attempted, **67 successful** (53% success rate)
+- Each episode = 1 pick + 1 place = 2 training examples
+- **Total: 134 training examples** (67 pick + 67 place)
+
+**Failure modes:**
+- `cartesian_reflex` (robot hits table/blocks): Fixed by raising grasp_z from 0.013→0.018m
+- Gripper hits adjacent block: Fixed by adding MIN_NEIGHBOR_DIST=0.05m proximity filter
+- Blocks detected outside reachable workspace: Fixed by adding PICK_WORKSPACE bounds (x=0.35-0.55)
+- Robot error state after crash: Fixed by adding `_check_and_recover()` to abort batch early
+
+**Camera angle diversity attempt:** Moved USB camera to a new oblique angle, recalibrated ArUco homography (5 markers, 2.2mm LOO error). However, blocks detected by Moondream mapped to wrong robot coordinates from this angle — the homography is only accurate within the calibration marker convex hull, and the oblique perspective made the sensitivity too high. Reverted to original angle.
+
+### Experiment 13: Moondream 2B Fine-tuning — Full Parameters
+
+**Goal:** Train Moondream 2B to output `{"skill": "pick", "x": 0.43, "y": -0.08}` from camera images + instructions.
+
+**Technical challenges solved:**
+1. transformers 5.0 incompatible with HfMoondream → used transformers 4.44.0 in dedicated venv
+2. Moondream's `ops["prefill"]` returns hidden states for all positions but `lm_head()` only returns last-position logits → manually apply `logits = hidden @ lm_head.weight.T`
+3. fp16 cross-entropy on 51200-class vocab overflows → cast logits to float32 before CE
+4. fp16 gradient updates corrupt weights after 1 step → **FP32 master weights optimizer** (copy grads to fp32, step, copy back to fp16)
+5. Vision encoder must stay fp16 (encode_image creates fp16 tensors internally)
+
+**Training runs (all on DGX Spark GPU):**
+
+| Run | Method | LR | Epochs | Train Loss | Val Loss | Notes |
+|-----|--------|-----|--------|-----------|----------|-------|
+| 1 | Full FT | 5e-6 | 3 | 1.13 | 1.23 | Mode collapse (all predict same coord) |
+| 2 | Full FT | 1e-5 cosine | 5 | 1.84 | 2.47 | Correct format, mean coords, some variation |
+| 3 | Full FT | 2e-5 | 1 | — | — | Diverged immediately |
+
+### Experiment 14: Moondream 2B Fine-tuning — LoRA
+
+**Rationale:** 134 examples is far too few for full fine-tuning of 1.5B parameters. LoRA adapters reduce trainable params to ~6.7M (0.69%).
+
+**Custom LoRA implementation:** Injected LoRA adapters into all 24 transformer blocks (attn.qkv, attn.proj, mlp.fc1, mlp.fc2) + lm_head = 97 layers. Required adding `.bias` and `.weight` properties to the LoRALinear wrapper for compatibility with Moondream's internal code.
+
+| Run | Rank | LR | Epochs | Train Loss | Val Loss | Notes |
+|-----|------|-----|--------|-----------|----------|-------|
+| 4 | 16 | 1e-4 | 1+ES | 3.45 | 1.77 | Diverged after epoch 1 |
+| 5 | 8 | 3e-5 cosine | 4+ES | 0.71 | **0.75** | Best loss, early stopped epoch 7 |
+
+**Best model predictions (LoRA r8, val=0.75):**
+```
+Q: "Pick the red block up."    Expected: {"skill":"pick","x":0.502,"y":-0.173}  Got: {"skill":"pick","x":0.35,"y":-0.06}
+Q: "Set the block down."       Expected: {"skill":"place","x":0.351,"y":-0.144}  Got: {"skill":"place","x":0.35,"y":-0.06}
+Q: "Pick up the blue block."   Expected: {"skill":"pick","x":0.429,"y":0.091}   Got: {"skill":"pick","x":0.35,"y":-0.06}
+```
+
+**What the model learned:**
+- ✅ Valid JSON output format (100% parse rate)
+- ✅ Correct pick vs place skill selection from instruction text
+- ❌ Image-conditioned coordinates (collapses to dataset mean)
+
+### Key Learnings
+
+25. **134 examples is insufficient for visual grounding in a 1.9B VLM.** The model memorizes the output format and learns to distinguish skill types from instructions, but cannot learn the image→coordinate mapping. This is fundamentally a data quantity problem — the coordinate prediction task requires learning camera geometry from pixels, which needs hundreds or thousands of examples.
+
+26. **FP32 master weights are essential for fp16 model training.** Moondream stores all weights in fp16 regardless of `torch_dtype`. A single gradient update with lr=1e-5 corrupts fp16 weights, producing NaN on the next forward pass. Maintaining fp32 copies for the optimizer and casting back to fp16 after each step solves this completely.
+
+27. **LoRA outperforms full fine-tuning on small datasets** — lower loss (0.75 vs 1.23) with 0.69% of the parameters. But both approaches produce mode collapse on 134 examples.
+
+28. **The model should NOT predict coordinates.** Learning pixel→robot coordinate regression from images is the hardest possible task and breaks whenever the camera moves. Instead, the VLM should predict WHAT to act on (e.g., `{"skill": "pick", "object": "red block"}`), and the existing detection pipeline (Moondream detect API + homography) handles WHERE. This separates language understanding (easy, small data) from spatial perception (already solved by detect API).
+
+### Revised Architecture (v3)
+
+```
+Camera frame + "Pick up the red block"
+    │
+    ▼
+Fine-tuned VLM         ──→  {"skill": "pick", "object": "red block"}
+    │
+    ▼
+Moondream detect()      ──→  Find "red block" → pixel (607, 430)
+    │
+    ▼
+ArUco homography        ──→  Robot coords (0.393, -0.097)
+    │
+    ▼
+pick_at(0.393, -0.097)  ──→  Physical execution
+    │
+    ▼
+Camera frame + "What next?"  ──→  Loop back to VLM
+```
+
+### Experiment 15: Object-Selection VLM — Training (2026-02-21)
+**Goal:** Train VLM to predict WHICH object to act on, not WHERE.
+
+**Dataset:** 134 examples (67 pick + 67 place) from existing episodes.
+- Pick answer: `{"skill": "pick", "object": "red block"}`
+- Place answer: `{"skill": "place"}`
+- Scene context in prompts: "Visible objects: blue block, red block. Pick the red block up."
+
+**Training:** LoRA rank=8, lr=3e-5, cosine schedule, 6 epochs (early stopped at 3).
+- val_loss: **0.0004** (vs 0.75 for coordinate prediction — 1875x improvement)
+- 5/5 predictions PERFECT: correct skill + correct object identification
+
+**Key Learning 29:** Object selection is vastly easier than coordinate regression for VLMs. With only 134 examples, the model perfectly learns to select which object to act on. Coordinates are left to the detection pipeline (Moondream detect()) which already works well.
+
+**Key Learning 30:** LoRA adapters interfere with Moondream's detect/point APIs (bounding boxes collapse to full-frame). Solution: class-level `LoRALinear.enabled` flag, disabled for detect/point, enabled for query.
+
+### Experiment 16: VLM→Detect→Pick Inference Loop (2026-02-21)
+**Goal:** Chain fine-tuned VLM with detection pipeline for autonomous pick-and-place.
+
+**Architecture:**
+```
+Camera frame
+    │
+    ├──→ Moondream detect() [LoRA OFF]  ──→  Scene objects + pixel coords
+    │
+    ├──→ Build scene prompt: "You see: red block, green block. Pick up the red block."
+    │
+    └──→ Moondream query() [LoRA ON]  ──→  {"skill": "pick", "object": "red block"}
+                                                │
+                                                ▼
+                                     Moondream detect("red block") [LoRA OFF]
+                                                │
+                                                ▼
+                                     ArUco homography → robot coords
+                                                │
+                                                ▼
+                                     pick_at(x, y) → physical execution
+                                                │
+                                                ▼
+                                     Re-capture → VLM query → next skill
+```
+
+**Components built:**
+1. `scripts/moondream_server.py` — Updated with `/query` endpoint, LoRA loading, LoRA enable/disable toggle
+2. `learned/moondream_client.py` — Added `query()` and `health()` client functions
+3. `learned/objsel_orchestrator.py` — Full inference loop: `run_task()` and `run_continuous()`
+4. `franka_mcp/server.py` — Added `vlm_task` MCP tool
+
+**End-to-end test (no robot motion):**
+- Scene detection: 4 objects found (red, green, 2x wooden)
+- VLM query: correctly predicted `{"skill": "pick", "object": "red block"}` (1.4s latency)
+- Localization: red block at robot (0.374, 0.203)
+- Pipeline complete in ~10s total
+
+**Status:** Ready for live robot testing (Task #4).
+
+### Experiment 17: First Complete VLM-Guided Pick-and-Place (2026-02-21)
+
+**Goal:** Complete an end-to-end autonomous pick-and-place using only the VLM pipeline — no Claude in the loop for skill decisions.
+
+**Setup:**
+- Moondream server on Spark with object-selection LoRA loaded (port 8091)
+- Green block on white paper at robot coords (0.447, -0.264)
+- Workspace bounds widened from ±0.22 to ±0.28 on Y (still well within robot safety limits of ±0.50)
+
+**Pipeline execution (56.4s total):**
+
+| Step | Action | Time | Result |
+|------|--------|------|--------|
+| 1 | Move arm home (clear camera view) | 0.4s | OK |
+| 2 | Scene detection (5 Moondream detect queries) | 10.6s | 1 object in workspace: green block |
+| 3 | VLM pick query | 1.4s | `{"skill": "pick", "object": "green block"}` — correct |
+| 4 | Localize green block → robot (0.447, -0.264) | 0s | Used cached scene detection |
+| 5 | Pick execution (IK, 4cm steps, grasp) | ~27s | gripper_width=0.0283m — **SUCCESSFUL GRASP** |
+| 6 | VLM place query | 0.8s | `{"skill": "place"}` — correct |
+| 7 | Place execution at random (0.410, 0.049) | ~17s | Cartesian reflex during lowering, auto-recovered — **SUCCESS** |
+
+**Key observations:**
+- VLM skill selection: **100% correct** (tested across 10+ queries this session — never wrong)
+- VLM latency: ~1.4s for pick decisions, ~0.8s for place decisions
+- Place without scene context (matching training data): fast and reliable — no more timeouts
+- Cartesian reflex during place recovered automatically — the place_at recovery logic works
+- Block moved from (0.447, -0.264) to (0.410, 0.049) — clearly visible in camera comparison
+
+**Architecture proven:**
+```
+Camera → Moondream detect [LoRA OFF] → scene description
+                                            ↓
+Instruction + scene → Moondream VLM [LoRA ON] → {"skill":"pick","object":"green block"}
+                                            ↓
+"green block" → Moondream detect [LoRA OFF] → pixel coords → homography → robot coords
+                                            ↓
+pick_at(0.447, -0.264) → IK → incremental lowering → grasp (width=0.0283m)
+                                            ↓
+Re-capture → VLM [LoRA ON] → {"skill":"place"} → place_at(0.410, 0.049)
+```
+
+**This is the milestone:** A 2B parameter VLM (Moondream) fine-tuned with only 134 LoRA examples autonomously decides what to pick and when to place. The detect API provides localization. The whole pipeline runs: Spark (VLM) + Pi (orchestration) + Franka (execution).
+
+### Key Learnings 31-32
+
+**31. Place queries must NOT have scene context**
+Training data had bare place instructions ("Put the block down."). Adding scene context ("You see: red block. Put the block down.") caused VLM to generate very slowly or timeout. Simple fix: skip scene scan when holding an object.
+
+**32. Workspace bounds are conservative — widen safely**
+Data collection used x=[0.35,0.55] y=[-0.18,0.18]. Initial orchestrator used ±0.22. Widened to y=±0.28 (still well within robot safety limit of ±0.50) to accommodate blocks at table edges. No issues.
+
+---
+
+## Session 2026-02-21: NUDGE — Neural Unified Direction and Gap Estimation
+
+### Motivation
+
+Current perception (homography, depth camera) gives 4–10cm position error — far too imprecise for block stacking (~1cm tolerance). Insight: as a gripper approaches a target, the relative offset becomes increasingly observable in camera images. A CNN that predicts discrete correction directions from camera frames + target bounding box mask could close this gap in a servo loop.
+
+### Architecture
+
+NUDGE is an ab initio CNN (~300K params) — no pretrained backbone needed since the visual features (edges, spatial relationships) are simple. Takes 4-channel input: RGB [0,1] + binary target bbox mask, all 224×224. Five conv blocks (stride-2) → global avg pool → 128-dim → FC trunk → 3 classification heads, each outputting 7 classes: {-3, -2, -1, 0, +1, +2, +3} representing correction magnitudes per axis.
+
+Discretization bins: aligned (<3mm), nudge (3–8mm), shift (8–18mm), jump (>18mm). Class 0 on all axes = "done, release". Training is fully self-supervised: ground truth = discretized vector from current position to final successful grasp position.
+
+### What was built
+
+**Phase 1 — Core (no hardware needed):**
+- `common/nudge/model.py` — NUDGENet CNN, ONNX export with argmax wrapper
+- `common/nudge/discretize.py` — continuous↔class mapping, verified with round-trip tests
+- `common/nudge/dataset.py` — PyTorch Dataset with augmentation (hflip+Y-label flip, color jitter, bbox jitter), approach-level train/val split, inverse-frequency class weights
+- `scripts/train_nudge.py` — CrossEntropyLoss × 3 heads, AdamW, CosineAnnealingLR, per-axis accuracy + within-1 accuracy metrics
+
+**Phase 2 — Data Collection:**
+- `common/nudge/collector.py` — NUDGECollector records 224×224 frames + gripper xyz during pick approaches, computes discrete labels from final grasp position
+- `scripts/collect_nudge_data.py` — Autonomous loop: detect blocks → pick → place randomly → repeat
+
+**Phase 3 — Servo Loop:**
+- `common/nudge/servo.py` — ONNX inference, constructs 4ch input, applies gain + safety clamp (±15mm max correction per step)
+
+**Integration:**
+- `franka_mcp/controller.py` — Hooked NUDGE into `pick_at()` at all Z-step points (alongside existing SAWM hooks). Added `_nudge_detect_target_bbox()` (via color detection), `_nudge_record_frame()`, `_nudge_get_correction()`. Six public methods: `nudge_enable/disable/status`, `nudge_collect_enable/disable/stats`.
+- `franka_mcp/server.py` — 6 new MCP tools mirroring the SAWM pattern.
+
+### Key Design Decisions
+
+**33. Discrete classification over continuous regression**
+SAWM used continuous regression (MSE on dx/dy in meters) and struggled to generalize with <200 frames. NUDGE uses 7-class classification per axis — easier to learn (just direction + magnitude bucket), works with weighted CrossEntropyLoss for imbalanced classes, and the discrete output naturally defines a "done" signal (all zeros).
+
+**34. Full frame + mask instead of progressive crops**
+SAWM used a crop-and-zoom approach centered on the target. NUDGE takes the full 224×224 frame with a binary mask channel indicating the target bbox. This preserves spatial context (where is the gripper relative to the whole scene?) and avoids the fragile crop-scale computation.
+
+**35. Ab initio CNN — no pretrained backbone**
+SAWM used MobileNetV3-Small (pretrained on ImageNet). NUDGE uses a simple 5-block CNN trained from scratch. The visual features needed (block edges, gripper position, spatial relationships) are domain-specific and simple enough to learn from ~5K frames. Avoids ImageNet normalization stats and reduces model size.
+
+### Next Steps
+- Collect ~100-200 successful approaches using `scripts/collect_nudge_data.py`
+- Train on Spark, evaluate per-axis accuracy
+- Run servo loop live, measure pick accuracy improvement
+- Phase 4: Use NUDGE for place-approach (stacking) — same model, different target detection

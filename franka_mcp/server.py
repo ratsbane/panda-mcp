@@ -557,6 +557,63 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="nudge_enable",
+            description="Enable NUDGE servo for trajectory correction during picks. "
+                       "Loads an ONNX model that predicts discrete spatial corrections and "
+                       "applies them during the approach. Requires training first.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "model_path": {
+                        "type": "string",
+                        "description": "Path to NUDGE ONNX model file",
+                    },
+                },
+                "required": ["model_path"],
+            },
+        ),
+        Tool(
+            name="nudge_disable",
+            description="Disable NUDGE servo.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="nudge_status",
+            description="Get NUDGE servo status including step count and corrections applied.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="nudge_collect_enable",
+            description="Enable NUDGE data collection. Records full frames + gripper positions during pick_at() "
+                       "for self-supervised learning. Each successful grasp generates discrete direction labels.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="nudge_collect_disable",
+            description="Disable NUDGE data collection.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="nudge_collect_stats",
+            description="Get NUDGE data collection statistics: total approaches, success rate, frames collected.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
             name="get_safety_limits",
             description="Get current safety limits (workspace bounds, velocity limits).",
             inputSchema={
@@ -626,6 +683,22 @@ async def list_tools() -> list[Tool]:
                         "default": "data/moondream_training",
                     },
                 },
+            },
+        ),
+        Tool(
+            name="vlm_task",
+            description="Execute a pick-and-place task using the fine-tuned VLM. "
+                       "The VLM decides WHICH object to act on, then Moondream detect() finds WHERE. "
+                       "Requires Moondream server with LoRA running on Spark (port 8091).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "instruction": {
+                        "type": "string",
+                        "description": "Natural language task, e.g. 'Pick up the red block.'",
+                    },
+                },
+                "required": ["instruction"],
             },
         ),
         Tool(
@@ -858,6 +931,30 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = controller.sawm_collect_stats()
             return json_response(result)
 
+        elif name == "nudge_enable":
+            result = controller.nudge_enable(model_path=arguments["model_path"])
+            return json_response(result)
+
+        elif name == "nudge_disable":
+            result = controller.nudge_disable()
+            return json_response(result)
+
+        elif name == "nudge_status":
+            result = controller.nudge_status()
+            return json_response(result)
+
+        elif name == "nudge_collect_enable":
+            result = controller.nudge_collect_enable()
+            return json_response(result)
+
+        elif name == "nudge_collect_disable":
+            result = controller.nudge_collect_disable()
+            return json_response(result)
+
+        elif name == "nudge_collect_stats":
+            result = controller.nudge_collect_stats()
+            return json_response(result)
+
         elif name == "get_safety_limits":
             config = get_safety_config()
             return json_response(config.to_dict())
@@ -984,6 +1081,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             except Exception as e:
                 logger.exception(f"collect_episodes failed: {e}")
                 return json_response({"error": f"collect_episodes failed: {str(e)}"})
+
+        elif name == "vlm_task":
+            if not controller.connected:
+                return json_response({"error": "Not connected. Call 'connect' first."})
+            try:
+                from learned.objsel_orchestrator import run_task, OrchestratorConfig
+                instruction = arguments.get("instruction", "")
+                if not instruction:
+                    return json_response({"error": "instruction is required"})
+                config = OrchestratorConfig()
+                result = run_task(controller, instruction, config)
+                return json_response(result)
+            except Exception as e:
+                logger.exception(f"vlm_task failed: {e}")
+                return json_response({"error": f"vlm_task failed: {str(e)}"})
 
         elif name == "restart":
             import os
