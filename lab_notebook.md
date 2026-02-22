@@ -716,8 +716,49 @@ XY and Z have fundamentally different scales. XY corrections are ~1-20mm precisi
 **37. XY perturbation for data diversity**
 Rather than relying on natural pick error (which is tiny at 2-5mm), deliberately add random offsets during approach. The perturbation is removed before final grasp so the pick still succeeds, and the offset between perturbed position and final grasp position provides diverse training labels.
 
+### Continued Collection (Session 2)
+
+Resumed collection, reaching **132 successful approaches / 758 frames** (153 total, 86.3% success).
+Blocks kept falling off table edges during random placement — automated collection is limited by
+workspace bounds and detection reliability.
+
+### Training Results
+
+**v1 (115 approaches, 575 samples):**
+- Train: 490, Val: 85
+- Best epoch 75: mean_acc=66.4% (x=46.5%, y=73.7%, z=74.4%)
+- Within-1 accuracy ~90%
+- Train loss 5.6 → 0.15, val loss increased (overfitting)
+
+**v2 (132 approaches, 660 samples):**
+- Train: 565, Val: 95
+- Best epoch 93: mean_acc=61.2% (slightly worse — more diverse data makes XY harder)
+- Heavy Z class imbalance (class 2 weight=80.7)
+- ONNX export: 35KB model + 1MB weights, 17.4ms inference on Pi 5 CPU
+
+### Servo Loop Test
+
+Bug fix: `class_to_continuous()` in servo.py wasn't passing per-axis parameter — was sending
+DiscretizeConfig object as the `axis` string argument. Fixed to use `axis="x"/"y"/"z"` kwargs.
+
+**Live test with v1 model:**
+- Red block pick: XY corrections = 0 (correctly predicted "aligned"), Z corrections transitioned
+  from dz=-15mm ("go down") at z=0.11m to dz=+11.2mm ("slow down") at z=0.03m. Pick succeeded.
+- Blue block pick: Same pattern — model learned the Z approach profile well.
+- The servo doesn't interfere with accurate picks (no false corrections).
+- XY corrections would activate when detection error is large — serves as safety net.
+
+Models saved to `models/nudge.onnx` (v1, 66.4%) and `models/nudge_v2.onnx` (v2, 61.2%).
+
+### Key Design Decisions
+
+**38. Servo as safety net, not primary correction**
+With accurate color detection (2-5mm error), the model correctly predicts "aligned" for XY.
+The servo's value comes when detection is poor — depth camera noise, homography error,
+or natural language grounding. The Z corrections are always useful, guiding descent rate.
+
 ### Next Steps
-- Train NUDGE on combined dataset (115 approaches, 658 frames) on Spark
-- Evaluate per-axis accuracy and class distribution
-- If XY accuracy is poor, collect more perturbed data (need blocks back on table)
-- Test servo loop with trained model
+- Test with intentional XY offset to verify lateral corrections activate
+- Collect more data if XY accuracy needs improvement (currently 46% for v1)
+- Integrate NUDGE into stacking workflow (Phase 4 from plan)
+- Consider training with more aggressive augmentation for XY robustness

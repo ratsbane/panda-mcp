@@ -128,10 +128,10 @@ class NUDGEServoLoop:
 
         cls_x, cls_y, cls_z = int(outputs[0][0]), int(outputs[1][0]), int(outputs[2][0])
 
-        # Convert classes to meters
-        dx = class_to_continuous(cls_x, self.config.discretize)
-        dy = class_to_continuous(cls_y, self.config.discretize)
-        dz = class_to_continuous(cls_z, self.config.discretize)
+        # Convert classes to meters (per-axis thresholds)
+        dx = class_to_continuous(cls_x, axis="x", config=self.config.discretize)
+        dy = class_to_continuous(cls_y, axis="y", config=self.config.discretize)
+        dz = class_to_continuous(cls_z, axis="z", config=self.config.discretize)
 
         # Apply gain
         dx *= self.config.gain
