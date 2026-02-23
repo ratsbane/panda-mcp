@@ -111,6 +111,17 @@ async def main():
     for mid, (cx, cy) in sorted(markers.items()):
         print(f"  ID {mid}: pixel ({cx}, {cy})")
 
+    # Check for texture/pointcloud resolution mismatch
+    tex_h, tex_w = client.texture.shape[:2]
+    pc_h, pc_w = client.pointcloud.shape[:2]
+    if (tex_w, tex_h) != (pc_w, pc_h):
+        sx = pc_w / tex_w
+        sy = pc_h / tex_h
+        print(f"\n  NOTE: Texture ({tex_w}x{tex_h}) != pointcloud ({pc_w}x{pc_h})")
+        print(f"  Scaling marker pixels by ({sx:.4f}, {sy:.4f})")
+    else:
+        sx, sy = 1.0, 1.0
+
     # Look up 3D positions from pointcloud
     print("\nLooking up 3D positions from pointcloud...")
     camera_pts = []
@@ -123,8 +134,11 @@ async def main():
             continue
 
         cx, cy = markers[mid]
+        # Scale from texture resolution to pointcloud resolution
+        pcx = int(round(cx * sx))
+        pcy = int(round(cy * sy))
         # Use median patch for robustness
-        patch_result = client.get_depth_patch(cx, cy, radius=5)
+        patch_result = client.get_depth_patch(pcx, pcy, radius=5)
         if not patch_result.get("valid"):
             print(f"  ID {mid}: SKIPPED (no depth data at pixel)")
             continue
@@ -137,7 +151,8 @@ async def main():
         robot_pts.append(robot_pt)
         used_ids.append(mid)
 
-        print(f"  ID {mid}: camera ({pos['x']:.1f}, {pos['y']:.1f}, {pos['z']:.1f}) mm "
+        print(f"  ID {mid}: tex_px ({cx}, {cy}) -> pc_px ({pcx}, {pcy}) -> "
+              f"camera ({pos['x']:.1f}, {pos['y']:.1f}, {pos['z']:.1f}) mm "
               f"-> robot ({robot_pt[0]:.3f}, {robot_pt[1]:.3f}, {robot_pt[2]:.3f}) m")
 
     if len(camera_pts) < 3:
