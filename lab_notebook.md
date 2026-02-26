@@ -762,3 +762,142 @@ or natural language grounding. The Z corrections are always useful, guiding desc
 - Collect more data if XY accuracy needs improvement (currently 46% for v1)
 - Integrate NUDGE into stacking workflow (Phase 4 from plan)
 - Consider training with more aggressive augmentation for XY robustness
+
+## 2026-02-25 - Technique Assessment: What Works and What Doesn't
+
+### Context
+After multiple sessions of testing different perception and picking approaches, it's time to consolidate learnings and deprecate methods that don't work. This assessment is based on empirical evidence from all experiments above.
+
+### Perception Methods — What Works
+
+| Method | Evidence | Accuracy | Notes |
+|--------|----------|----------|-------|
+| **Moondream 2B detect() + homography** | 3/3 picks (Exp 11), 67 autonomous (Exp 12), 2.2px mean error (Exp 7) | ~1mm robot-frame | Best overall. Natural language queries, multi-object detection. ~2.4s latency via Spark. |
+| **HSV color detection + homography** | 6/6 picks (Exp 5), ~53% autonomous success (Exp 12) | Sub-mm at calibration points | Good for known colors. Limited to red/green/blue/orange. Workspace bounds filter can reject edge blocks. |
+| **NUDGE servo corrections** | Correct Z guidance during descent, no false XY corrections (Exp 22) | Safety net role | Does not improve already-accurate picks, but prevents misses when detection error is large. 17ms inference on Pi CPU. |
+
+### Perception Methods — What Doesn't Work
+
+| Method | Evidence | Issue | Decision |
+|--------|----------|-------|----------|
+| **Depth camera (describe_scene_3d)** | 0-3 objects found with 43% coverage, can't separate clustered blocks | Low coverage, poor clustering on real scenes | **Deprecate for picking.** Keep for calibration and scene overview only. |
+| **Manual homography estimation** | 3 consecutive misses (2026-02-25), ~4cm systematic error on left side of image | Condition number 1665, sensitivity ~0.9mm/pixel amplifies small pixel errors | **Never guess positions.** Always use a detector (Moondream or HSV). |
+| **SmolVLM2-500M** | 0/4 spatial accuracy, chance-level left/right (Exp 9) | No spatial understanding at 500M params | **Deprecated.** Model too small for grounded spatial reasoning. |
+| **VLM coordinate regression** | Mode collapse to dataset mean on 134 examples (Exp 13-14) | Needs 1000+ examples minimum; camera geometry too hard to learn from pixels | **Deprecated.** Use detect API for perception, VLM for skill selection only. |
+| **Qwen VL ground_object for robot coords** | 9cm X + 17cm Y error (Exp 2) | Homography amplifies any pixel error; cold-start timeouts | **Unreliable.** Moondream detect is strictly better. May revisit with wrist camera. |
+
+### Motion Methods — All Working
+
+| Method | Evidence | Accuracy | Notes |
+|--------|----------|----------|-------|
+| **pick_at() (IK-based)** | All sessions, dozens of successful picks | 1-4mm | Rock solid. Incremental 4cm Z steps prevent joint reflex. |
+| **place_at() (IK-based)** | All sessions | 1-4mm | Reliable with auto-recovery for cartesian_reflex. |
+| **execute_plan()** | 3 blocks in 96s (zero inter-step latency) | Same as pick_at/place_at | Best for multi-step sequences. |
+
+### Planning/Reasoning — What Works
+
+| Method | Evidence | Notes |
+|--------|----------|-------|
+| **VLM object selection (LoRA)** | 100% skill accuracy across 10+ queries (Exp 16-17) | LoRA r=8, 134 examples. Predicts which object + which skill. |
+| **Claude-in-the-loop planning** | Multiple sessions | Effective but slow (~5-10s per decision). Target: replace with local VLM. |
+
+### Recommended Pipeline (current best)
+
+```
+Camera frame + instruction
+    │
+    ├──→ Moondream detect() [LoRA OFF]  ──→  Object positions (pixel + bbox)
+    │
+    ├──→ ArUco homography               ──→  Robot-frame positions (x, y)
+    │
+    ├──→ VLM skill selection [LoRA ON]   ──→  {"skill": "pick", "object": "red block"}
+    │
+    └──→ pick_at(x, y) with NUDGE servo  ──→  Physical execution
+                                                │
+                                                ▼
+                                         Re-capture → loop
+```
+
+### Key Learning
+
+**39. Assess and prune regularly.** Five months of incremental development accumulated multiple overlapping approaches (depth fusion, homography estimation, Qwen grounding, SmolVLM, etc.). Most don't work reliably. The winning stack is narrow: Moondream detect + homography + IK pick_at. Everything else is either deprecated or a supporting role (NUDGE servo, color detection as fallback).
+
+## 2026-02-25 ~evening - Online Adaptation + Competition Research
+
+### Context
+Block collision problem from earlier sessions (gripper finger tips hitting adjacent blocks at z~0.043m during approach) motivated research into online learning — adjusting in the same control loop rather than batch collect+train. Also surveyed the competitive landscape and identified ICRA 2026 RGMC as a concrete target.
+
+### Research: Competitive Landscape
+Surveyed 25 projects/labs working on visual servoing, VLAs, and manipulation. Full details in `research/competitive_landscape.md` (gitignored — repo is public). Key findings:
+
+- **Wrist cameras are standard** — DROID, UMI, SERL, Diffusion Policy, ACT all use them. D405 arriving next week.
+- **Foundation model features vs custom CNN** — ViT-VS (DINOv2) and DINOBot achieve zero-shot servoing with pretrained features. Worth considering as alternative to NUDGE's ab initio approach.
+- **SERL achieves perfect success in 25-50 min** of real interaction via online RL. Shows datasets don't need to be huge if RL closes the loop.
+- **Our gap:** Most work is either end-to-end VLA (big, slow) or classical IBVS (brittle). NUDGE's discrete correction + explicit parameterized skills is a middle ground few explore.
+
+### Research: Online Learning Survey
+Comprehensive survey in `research/online_learning.md`. Key papers:
+
+| Paper | Key Idea | Relevance |
+|-------|----------|-----------|
+| **EVOLVE-VLA** | Test-time training for robotic VLAs via learned critic | +22% on 1-shot, emergent retry strategies |
+| **TTRL** | Test-time RL — majority voting for pseudo-labels, 211% improvement | Robotics parallel: success detection → policy update |
+| **Residual RL** | Frozen BC policy + lightweight residual correction | 80-100% on precision assembly, directly applicable |
+| **SC-VLA** | System 1 (fast VLM) + System 2 (slow reasoning) | Maps to our Claude + VLM architecture |
+| **DINOBot** | One-shot retrieval via DINO features, no training, CPU only | 15 tasks from single demos |
+
+**Recommended layered approach:**
+1. **Layer 1 (no learning):** Visual servo / NUDGE — handles ~80% of errors
+2. **Layer 2 (fast learning):** Residual correction from pick outcomes (EMA offset)
+3. **Layer 3 (slow learning):** Claude reasons about systematic failures
+
+### Experiment 18: Online Adaptation — EMA Position Correction
+
+**Goal:** Learn systematic position bias from pick outcomes in real time. No model training — just a rolling exponential moving average of (target - actual) error vectors.
+
+**Implementation:**
+- `common/nudge/online_adapt.py` — OnlineAdapter class with EMA correction
+- Hooked into `pick_at()`: applies correction before approach, records outcome after grasp
+- Config: buffer_size=10, ema_alpha=0.7, min_samples=3, max_correction=±25mm, success_only=true
+- 4 MCP tools: `online_adapt_enable/disable/status/reset`
+
+**Live test — 5 picks with online adaptation enabled:**
+
+| # | Block | Detection | Correction Applied | Gripper Width | Result |
+|---|-------|-----------|-------------------|---------------|--------|
+| 1 | Large red | Moondream (0.362, -0.205) | None (< 3 samples) | 29.3mm | SUCCESS |
+| 2 | Green | Moondream (0.500, -0.208) | None (< 3 samples) | 28.3mm | SUCCESS |
+| 3 | Blue | Moondream (0.450, -0.214) | None (< 3 samples) | 65.3mm | SUCCESS |
+| 4 | Small red | Moondream (0.391, -0.270) | **dx=-1.3mm** | 59.1mm | SUCCESS |
+| 5 | Wooden | Moondream (0.341, -0.320) | Applied (small) | 28.7mm | SUCCESS |
+
+**Adaptation convergence:**
+- After 3 picks: Mean error X=+1.7mm, Y=-0.1mm → correction dx=-1.3mm, dy=0.0mm
+- After 5 picks: Mean error X=+1.0mm, Y=-0.5mm → correction dx=-0.7mm, dy=+0.5mm (std: X=1.2mm, Y=0.8mm)
+- Corrections are tiny because IK accuracy is already ~1mm — the adapter correctly learns "almost no correction needed"
+
+**Key observation:** The adapter would show more value when there IS a systematic bias — e.g., from the USB camera homography at certain workspace regions, or after a calibration drift. It's working correctly as a background safety layer that activates only when needed.
+
+### Key Learnings
+
+**40. IK accuracy is excellent — ~1mm mean error.** The online adapter confirms what we suspected: `pick_at()` with analytical IK is already very accurate. Mean position error across 5 picks was X=+1.0mm, Y=-0.5mm with std ~1mm. The adaptation layer is a safety net for when calibration drifts.
+
+**41. Online adaptation works end-to-end.** The EMA correction system successfully records outcomes, builds corrections, and applies them — all transparent to the user. First correction applied on pick #4 (after 3 successful samples). The architecture is proven; the value grows with systematic error.
+
+### Competition Target: ICRA 2026 RGMC
+
+**Event:** 11th Robotic Grasping and Manipulation Competition, ICRA 2026, Vienna, June 1-5
+**Track:** Picking from Clutter — pick known + unknown objects from cluttered transparent box, follow commanded grasp sequence via ROS topic/service
+**Application deadline:** Feb 23, 2026 (passed, but late apps accepted based on availability)
+**Contact:** bcalli@wpi.edu
+
+**Notable:** Tsinghua University won back-to-back (THU-bot 2024, Team JVD 2025). Competition involves ordered picking with pushing/decluttering strategies.
+
+**What we'd need:**
+- ROS integration for commanded grasp sequence
+- Robust clutter perception (D405 wrist camera + NUDGE servo)
+- Ship Panda to Vienna or use provided arm
+- 14 weeks to prepare
+
+### Hardware Update
+Intel RealSense D405 wrist camera shipped from Stem, NC via USPS — expected early next week. This will be transformative: direct gripper-to-target view, built-in stereo depth, 7-50cm optimal range. Enables proper eye-in-hand visual servoing.

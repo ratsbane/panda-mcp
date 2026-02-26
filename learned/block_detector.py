@@ -114,7 +114,7 @@ def detect_blocks(
         List of DetectedBlock sorted by area (largest first)
     """
     if workspace is None:
-        workspace = {"x_min": 0.2, "x_max": 0.6, "y_min": -0.2, "y_max": 0.2}
+        workspace = {"x_min": 0.2, "x_max": 0.6, "y_min": -0.3, "y_max": 0.3}
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     kernel = np.ones((5, 5), np.uint8)

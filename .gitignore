@@ -27,6 +27,9 @@ models/*.onnx
 .DS_Store
 Thumbs.db
 
+# Research notes (private - not for public repo)
+research/
+
 # Logs
 *.log
 

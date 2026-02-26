@@ -614,6 +614,40 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="online_adapt_enable",
+            description="Enable online adaptation — learns position correction offsets from pick outcomes. "
+                       "After each pick, records error between target and actual position. Applies EMA-based "
+                       "correction to future picks. Catches calibration drift and systematic biases.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="online_adapt_disable",
+            description="Disable online adaptation. Corrections will no longer be applied.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="online_adapt_status",
+            description="Get online adaptation status: current correction offset, pick history, error stats.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="online_adapt_reset",
+            description="Reset online adaptation — clears history buffer and zeroes the correction offset.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
             name="get_safety_limits",
             description="Get current safety limits (workspace bounds, velocity limits).",
             inputSchema={
@@ -955,6 +989,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = controller.nudge_collect_stats()
             return json_response(result)
 
+        elif name == "online_adapt_enable":
+            result = controller.online_adapt_enable()
+            return json_response(result)
+
+        elif name == "online_adapt_disable":
+            result = controller.online_adapt_disable()
+            return json_response(result)
+
+        elif name == "online_adapt_status":
+            result = controller.online_adapt_status()
+            return json_response(result)
+
+        elif name == "online_adapt_reset":
+            result = controller.online_adapt_reset()
+            return json_response(result)
+
         elif name == "get_safety_limits":
             config = get_safety_config()
             return json_response(config.to_dict())
@@ -1003,7 +1053,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                             "error": f"Moondream found no objects for query: {query!r}",
                         })
                     # Filter to workspace, pick largest
-                    ws = workspace or {"x_min": 0.2, "x_max": 0.6, "y_min": -0.2, "y_max": 0.2}
+                    ws = workspace or {"x_min": 0.2, "x_max": 0.6, "y_min": -0.3, "y_max": 0.3}
                     det = None
                     for d in detections:
                         drx, dry = pixel_to_robot(d.center_x, d.center_y, H)

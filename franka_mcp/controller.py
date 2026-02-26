@@ -1274,6 +1274,22 @@ class FrankaController:
         steps = []
         target_x = x + x_offset
 
+        # Online adaptation: apply learned correction offset
+        online_adapt = hasattr(self, '_online_adapter') and self._online_adapter is not None
+        adapt_dx, adapt_dy = 0.0, 0.0
+        original_target_x, original_y = target_x, y
+        if online_adapt and self._online_adapter.enabled:
+            adapt_dx, adapt_dy = self._online_adapter.get_correction(target_x, y)
+            if abs(adapt_dx) > 0.001 or abs(adapt_dy) > 0.001:
+                target_x += adapt_dx
+                y += adapt_dy
+                steps.append({
+                    "action": "online_adapt_correction",
+                    "dx_mm": round(adapt_dx * 1000, 1),
+                    "dy_mm": round(adapt_dy * 1000, 1),
+                    "adjusted_target": (round(target_x, 4), round(y, 4)),
+                })
+
         # Top-down picking orientation (roll=pi, pitch=0, yaw configurable)
         import math
         pick_roll = math.pi
@@ -1613,6 +1629,20 @@ class FrankaController:
         # NUDGE servo: stop
         if nudge_servo:
             self._nudge_servo.stop()
+
+        # Online adaptation: record outcome
+        if online_adapt and self._online_adapter.enabled:
+            ee = self.get_state().ee_position
+            self._online_adapter.record_outcome(
+                target_x=original_target_x,
+                target_y=original_y,
+                actual_x=ee[0],
+                actual_y=ee[1],
+                success=grasped,
+                gripper_width=actual_grip,
+                target_z=z,
+                actual_z=ee[2],
+            )
 
         # Step 5: Lift (IK with straight-down orientation)
         state = self.get_state()
@@ -2837,6 +2867,33 @@ class FrankaController:
         from common.nudge.collector import get_nudge_collector
         collector = self._nudge_collector if hasattr(self, '_nudge_collector') and self._nudge_collector else get_nudge_collector()
         return collector.get_stats()
+
+    # --- Online adaptation methods ---
+
+    def online_adapt_enable(self) -> dict:
+        """Enable online adaptation — learns position corrections from pick outcomes."""
+        from common.nudge.online_adapt import get_online_adapter
+        self._online_adapter = get_online_adapter()
+        return self._online_adapter.enable()
+
+    def online_adapt_disable(self) -> dict:
+        """Disable online adaptation."""
+        if not hasattr(self, '_online_adapter') or self._online_adapter is None:
+            return {"enabled": False, "error": "Online adaptation not initialized"}
+        return self._online_adapter.disable()
+
+    def online_adapt_status(self) -> dict:
+        """Get online adaptation status."""
+        if not hasattr(self, '_online_adapter') or self._online_adapter is None:
+            return {"enabled": False, "initialized": False}
+        return self._online_adapter.get_status()
+
+    def online_adapt_reset(self) -> dict:
+        """Reset online adaptation — clears history and correction offset."""
+        if not hasattr(self, '_online_adapter') or self._online_adapter is None:
+            return {"success": False, "error": "Online adaptation not initialized"}
+        self._online_adapter.reset()
+        return {"success": True, "message": "Online adaptation reset. History cleared, correction zeroed."}
 
 
 # Singleton controller
