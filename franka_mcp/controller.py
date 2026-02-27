@@ -8,15 +8,9 @@ import os
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Optional
 from dataclasses import dataclass
 import numpy as np
-
-# Timeout for blocking panda-py calls (seconds)
-MOTION_TIMEOUT_S = 15.0
-GRIPPER_TIMEOUT_S = 10.0
-STATE_TIMEOUT_S = 5.0
 
 # Grasp detection thresholds
 GRIP_CLOSED_EMPTY = 0.0015   # Below this width: fully closed, nothing held
@@ -30,8 +24,6 @@ MOCK_MODE = os.environ.get("FRANKA_MOCK", "0") == "1"
 if not MOCK_MODE:
     try:
         import panda_py
-        from panda_py import Panda
-        from panda_py.libfranka import Gripper, RobotState as LibfrankaRobotState
         PANDA_PY_AVAILABLE = True
     except ImportError:
         PANDA_PY_AVAILABLE = False
@@ -294,78 +286,6 @@ class RobotState:
         return d
 
 
-class MockRobot:
-    """Mock robot for testing without hardware."""
-
-    def __init__(self):
-        # Start in a reasonable home position
-        self._joints = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
-        self._ee_pos = np.array([0.4, 0.0, 0.3])
-        self._ee_quat = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion
-        self._has_error = False
-        self._error_msg = None
-
-    def get_state(self):
-        """Mock state with q attribute."""
-        class MockState:
-            def __init__(self, joints):
-                self.q = joints
-                self.current_errors = None
-        return MockState(self._joints)
-
-    def get_position(self):
-        return self._ee_pos.copy()
-
-    def get_orientation(self):
-        return self._ee_quat.copy()
-
-    def move_to_joint_position(self, positions, speed_factor=0.2):
-        self._joints = np.array(positions)
-        logger.info(f"Mock joint move to {positions}")
-        return True
-
-    def move_to_pose(self, positions, orientations, speed_factor=0.2):
-        # Handle sequences - move to final position
-        if positions:
-            self._ee_pos = np.array(positions[-1])
-            self._ee_quat = np.array(orientations[-1])
-            logger.info(f"Mock pose sequence: {len(positions)} waypoints, final={positions[-1]}")
-        return True
-
-    def get_robot(self):
-        return self
-
-    def recover_from_errors(self):
-        self._has_error = False
-        self._error_msg = None
-
-
-class MockGripper:
-    """Mock gripper for testing."""
-
-    def __init__(self):
-        self._width = 0.04
-
-    def read_once(self):
-        class MockGripperState:
-            def __init__(self, width):
-                self.width = width
-        return MockGripperState(self._width)
-
-    def move(self, width: float, speed: float = 0.1):
-        self._width = np.clip(width, 0.0, 0.08)
-        logger.info(f"Mock gripper move to {self._width}")
-        return True
-
-    def grasp(self, width: float, speed: float, force: float, epsilon_inner: float = 0.005, epsilon_outer: float = 0.005):
-        self._width = width
-        logger.info(f"Mock gripper grasp: width={width}, force={force}")
-        return True
-
-    def stop(self):
-        return True
-
-
 class FrankaController:
     """
     High-level controller for Franka Panda arm.
@@ -377,9 +297,8 @@ class FrankaController:
 
     def __init__(self, robot_ip: Optional[str] = None):
         self.robot_ip = robot_ip or self.ROBOT_IP
-        self.validator = SafetyValidator()
-        self._robot: Optional[Panda] = None
-        self._gripper: Optional[Gripper] = None
+        self.validator = SafetyValidator(config=get_safety_config())
+        self._rt_client = None  # FrankaRTClient (ZMQ connection to franka-rt)
         self._connected = False
         self._mock_mode = MOCK_MODE
         # Force/torque baseline for grasp monitoring (set by pick_at)
@@ -388,47 +307,49 @@ class FrankaController:
         self._grasp_is_grasped: Optional[bool] = None  # libfranka flag at grasp time
 
     def connect(self) -> dict:
-        """Connect to the robot."""
+        """Connect to the robot via franka-rt ZMQ server."""
         if self._mock_mode:
             logger.info("Running in MOCK mode - no hardware connection")
-            self._robot = MockRobot()
-            self._gripper = MockGripper()
-            self._connected = True
-            return {"connected": True, "mock": True}
+            # In mock mode, franka-rt runs with FRANKA_MOCK=1 too
+            # We still go through ZMQ for consistency
+            pass
 
         try:
-            self._robot = Panda(self.robot_ip)
+            from franka_mcp.rt_client import FrankaRTClient
+            self._rt_client = FrankaRTClient()
+            self._rt_client.connect_to_server()
 
-            # Try to recover from any existing errors (may fail if robot not in right mode)
-            try:
-                self._robot.recover()
-            except Exception as recovery_error:
-                logger.warning(f"Auto-recovery skipped: {recovery_error}")
-
-            self._gripper = Gripper(self.robot_ip)
-            self._connected = True
-
-            logger.info(f"Connected to Franka at {self.robot_ip}")
-            return {"connected": True, "mock": False}
+            # Tell franka-rt to connect to the robot hardware
+            result = self._rt_client.connect(self.robot_ip)
+            if result.get("connected"):
+                self._connected = True
+                logger.info(f"Connected to Franka via franka-rt (mock={result.get('mock', False)})")
+                return result
+            else:
+                return result
 
         except Exception as e:
-            logger.error(f"Failed to connect: {e}")
+            logger.error(f"Failed to connect via franka-rt: {e}")
             return {"connected": False, "error": str(e)}
 
     def disconnect(self):
         """Disconnect from robot."""
-        self._robot = None
-        self._gripper = None
+        if self._rt_client:
+            self._rt_client.close()
+            self._rt_client = None
         self._connected = False
 
     def _read_forces(self) -> Optional[np.ndarray]:
-        """Read O_F_ext_hat_K from cached panda-py state (safe during motion).
+        """Read O_F_ext_hat_K from robot state via franka-rt.
 
         Returns 6D force/torque array [Fx,Fy,Fz,Tx,Ty,Tz] or None on failure.
         """
         try:
-            state = self._robot.get_state()
-            return np.array(state.O_F_ext_hat_K)
+            state = self._rt_client.get_state()
+            ft = state.get("O_F_ext_hat_K")
+            if ft is not None:
+                return np.array(ft)
+            return None
         except Exception as e:
             logger.debug(f"_read_forces failed: {e}")
             return None
@@ -451,17 +372,14 @@ class FrankaController:
         # If object is there, gripper physically can't close past it.
         verify_target = max(pre_grip_width - 0.02, 0.001)  # 20mm below current
         try:
-            self._call_with_timeout(
-                self._gripper.move, verify_target, 0.05,  # slow speed
-                timeout=GRIPPER_TIMEOUT_S, label="pg_verify_move")
+            self._rt_client.gripper_move(verify_target, speed=0.05)
         except Exception:
             pass
 
         # Read where the gripper actually ended up
         try:
-            gs = self._call_with_timeout(
-                self._gripper.read_once, timeout=STATE_TIMEOUT_S, label="pg_verify_read")
-            actual_width = gs.width
+            gs = self._rt_client.gripper_read_once()
+            actual_width = gs["width"]
         except Exception as e:
             return {"success": False, "error": f"Failed to read gripper: {e}"}
 
@@ -493,76 +411,8 @@ class FrankaController:
                 "pre_width": round(pre_grip_width, 4),
             }
 
-    def _call_with_timeout(self, fn, *args, timeout: float = STATE_TIMEOUT_S, label: str = "call", recover: bool = False,
-                           monitor_force: bool = False, force_baseline: Optional[np.ndarray] = None, **kwargs):
-        """
-        Call a blocking panda-py/libfranka function with a timeout.
-
-        Many panda-py calls can hang indefinitely if communication drops or
-        the arm enters a bad state. This wraps them with a timeout.
-
-        When monitor_force=True and force_baseline is provided, polls
-        O_F_ext_hat_K in 100ms chunks during motion to detect force drops
-        (e.g. object slipping out of gripper during transport).
-
-        IMPORTANT: We must NOT use `with ThreadPoolExecutor` because the
-        context manager calls shutdown(wait=True) on exit, which blocks
-        until the zombie thread finishes — completely defeating the timeout.
-        Instead we create the executor, submit, and shutdown(wait=False).
-        """
-        executor = ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(fn, *args, **kwargs)
-        force_events = []
-        try:
-            if monitor_force and force_baseline is not None:
-                # Poll in 100ms chunks, checking force between chunks
-                baseline_fz = float(force_baseline[2])
-                start = time.time()
-                while time.time() - start < timeout:
-                    try:
-                        result = future.result(timeout=0.1)
-                        return result, force_events
-                    except FuturesTimeoutError:
-                        # Motion still running — check force
-                        forces = self._read_forces()
-                        if forces is not None:
-                            fz = float(forces[2])
-                            fz_delta = abs(fz - baseline_fz)
-                            if fz_delta > FORCE_DROP_THRESHOLD:
-                                event = {
-                                    "time": round(time.time() - start, 3),
-                                    "fz_baseline": round(baseline_fz, 2),
-                                    "fz_current": round(fz, 2),
-                                    "fz_delta": round(fz_delta, 2),
-                                }
-                                force_events.append(event)
-                                logger.warning(f"Force drop detected during {label}: {event}")
-                # If we exit the while loop, we timed out
-                raise FuturesTimeoutError()
-            else:
-                return future.result(timeout=timeout)
-        except FuturesTimeoutError:
-            logger.error(f"{label} timed out after {timeout}s — stopping controller")
-            # Stop the physical motion first, then recover
-            try:
-                self._robot.stop_controller()
-            except Exception as e:
-                logger.warning(f"stop_controller failed: {e}")
-            try:
-                self._robot.get_robot().stop()
-            except Exception as e:
-                logger.warning(f"libfranka stop failed: {e}")
-            if recover:
-                try:
-                    self._robot.recover()
-                except Exception:
-                    pass
-            raise TimeoutError(f"{label} timed out after {timeout}s")
-        finally:
-            executor.shutdown(wait=False)
-
     def _move_joints_with_timeout(
-        self, solution, speed_factor: float = 0.15, timeout: float = MOTION_TIMEOUT_S,
+        self, solution, speed_factor: float = 0.15, timeout: float = 15.0,
     ) -> bool:
         """Execute move_to_joint_position with a timeout and recovery.
 
@@ -574,7 +424,7 @@ class FrankaController:
         Uses relaxed dq_threshold (0.01 vs default 0.001) and success_threshold
         (0.05 vs default 0.01) to prevent hanging when settling is slow.
         """
-        current_q = np.array(self._robot.q)
+        current_q = np.array(self._rt_client.get_q())
         target_q = np.array(solution).flatten()
         max_joint_change = np.max(np.abs(target_q - current_q))
 
@@ -591,77 +441,48 @@ class FrankaController:
                 f"Large move ({np.degrees(max_joint_change):.1f}°): "
                 f"using {len(waypoints)} waypoints"
             )
-            return self._call_with_timeout(
-                self._robot.move_to_joint_position, waypoints,
-                speed_factor=speed_factor,
-                dq_threshold=0.01,
-                success_threshold=0.05,
-                timeout=timeout, label="Joint motion (waypoints)", recover=True,
+            result = self._rt_client.move_to_joint_position(
+                waypoints, speed_factor=speed_factor,
             )
+            if not result.get("success", False):
+                raise RuntimeError(result.get("error", "move_joints failed"))
+            return True
         else:
-            return self._call_with_timeout(
-                self._robot.move_to_joint_position, solution,
-                speed_factor=speed_factor,
-                dq_threshold=0.01,
-                success_threshold=0.05,
-                timeout=timeout, label="Joint motion", recover=True,
+            result = self._rt_client.move_to_joint_position(
+                target_q, speed_factor=speed_factor,
             )
+            if not result.get("success", False):
+                raise RuntimeError(result.get("error", "move_joints failed"))
+            return True
 
     @property
     def connected(self) -> bool:
         return self._connected
 
     def get_state(self) -> RobotState:
-        """Get current robot state."""
+        """Get current robot state via franka-rt."""
         if not self._connected:
             raise RuntimeError("Not connected to robot")
 
-        state = self._call_with_timeout(
-            self._robot.get_state, timeout=STATE_TIMEOUT_S, label="get_state")
-        position = self._robot.get_position()
-        orientation = self._robot.get_orientation()
+        state = self._rt_client.get_state()
 
         # Convert quaternion to Euler
-        roll, pitch, yaw = quaternion_to_euler(orientation)
+        orientation = state["ee_orientation"]
+        roll, pitch, yaw = quaternion_to_euler(np.array(orientation))
 
-        # Check for errors
-        has_error = False
-        error_msg = None
-        if hasattr(state, 'current_errors') and state.current_errors:
-            has_error = True
-            error_msg = str(state.current_errors)
-
-        # Read gripper width with timeout (this is a common hang point)
-        gripper_w = 0.04
-        if self._gripper:
-            try:
-                gripper_state = self._call_with_timeout(
-                    self._gripper.read_once, timeout=STATE_TIMEOUT_S, label="gripper_read")
-                gripper_w = gripper_state.width
-            except (TimeoutError, Exception) as e:
-                logger.warning(f"Gripper read failed: {e}, using cached/default width")
-
-        # Read force/torque data from cached state
-        ft_ext = None
-        tau_ext = None
-        try:
-            if hasattr(state, 'O_F_ext_hat_K'):
-                ft_ext = [float(f) for f in state.O_F_ext_hat_K]
-            if hasattr(state, 'tau_ext_hat_filtered'):
-                tau_ext = [float(t) for t in state.tau_ext_hat_filtered]
-        except Exception as e:
-            logger.debug(f"Failed to read F/T data: {e}")
+        position = state["ee_position"]
+        gripper_w = state.get("gripper_width", 0.04)
 
         return RobotState(
-            joint_positions=list(state.q),
+            joint_positions=state["q"],
             ee_position=(float(position[0]), float(position[1]), float(position[2])),
             ee_orientation=(roll, pitch, yaw),
             gripper_width=gripper_w,
-            is_moving=False,  # panda-py moves are synchronous
-            has_error=has_error,
-            error_message=error_msg,
-            O_F_ext_hat_K=ft_ext,
-            tau_ext_hat_filtered=tau_ext,
+            is_moving=False,
+            has_error=state.get("has_error", False),
+            error_message=state.get("error_message"),
+            O_F_ext_hat_K=state.get("O_F_ext_hat_K"),
+            tau_ext_hat_filtered=state.get("tau_ext_hat_filtered"),
         )
 
     def move_cartesian(
@@ -752,13 +573,13 @@ class FrankaController:
             positions = [np.array([x, y, z])]
             orientations = [quat]
 
-            success = self._robot.move_to_pose(
+            result = self._rt_client.move_to_pose(
                 positions,
                 orientations,
-                speed_factor=0.1  # Conservative speed
+                speed_factor=0.1,
             )
 
-            if success:
+            if result.get("success"):
                 return {
                     "success": True,
                     "position": {"x": x, "y": y, "z": z},
@@ -768,7 +589,7 @@ class FrankaController:
             else:
                 return {
                     "success": False,
-                    "error": "Motion command returned false",
+                    "error": result.get("error", "Motion command returned false"),
                 }
 
         except Exception as e:
@@ -1056,15 +877,14 @@ class FrankaController:
             }
 
         try:
-            # panda-py's move_to_pose may return None on success
-            self._robot.move_to_pose(
+            result = self._rt_client.move_to_pose(
                 positions,
                 orientations,
                 speed_factor=speed_factor,
             )
 
             return {
-                "success": True,
+                "success": result.get("success", True),
                 "waypoints_executed": len(waypoints),
                 "warnings": all_warnings if all_warnings else None,
             }
@@ -1143,8 +963,8 @@ class FrankaController:
 
     def gripper_move(self, width: float, speed: float = 0.1) -> dict:
         """Move gripper to specified width."""
-        if not self._gripper:
-            return {"success": False, "error": "Gripper not available"}
+        if not self._rt_client:
+            return {"success": False, "error": "Not connected"}
 
         validation = self.validator.validate_gripper_command(width)
         if not validation["valid"]:
@@ -1159,12 +979,8 @@ class FrankaController:
             }
 
         try:
-            success = self._call_with_timeout(
-                self._gripper.move, width, speed,
-                timeout=GRIPPER_TIMEOUT_S, label="gripper_move")
-            return {"success": success, "width": width}
-        except TimeoutError as e:
-            return {"success": False, "error": str(e)}
+            result = self._rt_client.gripper_move(width, speed)
+            return {"success": result.get("success", True), "width": width}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -1175,8 +991,8 @@ class FrankaController:
         speed: float = 0.1,
     ) -> dict:
         """Grasp with specified parameters."""
-        if not self._gripper:
-            return {"success": False, "error": "Gripper not available"}
+        if not self._rt_client:
+            return {"success": False, "error": "Not connected"}
 
         validation = self.validator.validate_gripper_command(width, force)
         if not validation["valid"]:
@@ -1191,55 +1007,33 @@ class FrankaController:
             }
 
         try:
-            success = self._call_with_timeout(
-                self._gripper.grasp, width, speed, force,
-                timeout=GRIPPER_TIMEOUT_S, label="gripper_grasp")
-            return {"success": success, "width": width, "force": force}
-        except TimeoutError as e:
-            return {"success": False, "error": str(e)}
+            result = self._rt_client.gripper_grasp(width, speed=speed, force=force)
+            return {"success": result.get("success", True), "width": width, "force": force}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
     def stop(self) -> dict:
         """Stop current motion (both arm and gripper)."""
-        if not self._connected:
+        if not self._connected or not self._rt_client:
             return {"success": False, "error": "Not connected"}
 
-        errors = []
-        # Stop arm motion controller
         try:
-            self._robot.stop_controller()
+            # Emergency stop via PUB channel (never blocks behind commands)
+            self._rt_client.emergency_stop()
+            return {"success": True, "message": "Motion stopped"}
         except Exception as e:
-            errors.append(f"stop_controller: {e}")
-        # Stop via libfranka
-        try:
-            self._robot.get_robot().stop()
-        except Exception as e:
-            errors.append(f"libfranka stop: {e}")
-        # Stop gripper
-        try:
-            if self._gripper:
-                self._gripper.stop()
-        except Exception as e:
-            errors.append(f"gripper stop: {e}")
-        # Recover from any error state
-        try:
-            self._robot.recover()
-        except Exception as e:
-            errors.append(f"recover: {e}")
-
-        if errors:
-            return {"success": True, "message": "Motion stopped", "warnings": errors}
-        return {"success": True, "message": "Motion stopped"}
+            return {"success": True, "message": "Motion stopped", "warnings": [str(e)]}
 
     def recover(self) -> dict:
         """Recover from error state."""
-        if not self._connected:
+        if not self._connected or not self._rt_client:
             return {"success": False, "error": "Not connected"}
 
         try:
-            self._robot.recover()
-            return {"success": True, "message": "Recovered from errors"}
+            result = self._rt_client.recover()
+            if result.get("success"):
+                return {"success": True, "message": "Recovered from errors"}
+            return {"success": False, "error": result.get("error", "unknown")}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -1288,6 +1082,18 @@ class FrankaController:
                     "dx_mm": round(adapt_dx * 1000, 1),
                     "dy_mm": round(adapt_dy * 1000, 1),
                     "adjusted_target": (round(target_x, 4), round(y, 4)),
+                })
+
+            # Test bias: injected AFTER correction for convergence testing
+            bias_x, bias_y = self._online_adapter.get_test_bias()
+            if abs(bias_x) > 0.0001 or abs(bias_y) > 0.0001:
+                target_x += bias_x
+                y += bias_y
+                steps.append({
+                    "action": "test_bias_injection",
+                    "bias_x_mm": round(bias_x * 1000, 1),
+                    "bias_y_mm": round(bias_y * 1000, 1),
+                    "final_target": (round(target_x, 4), round(y, 4)),
                 })
 
         # Top-down picking orientation (roll=pi, pitch=0, yaw configurable)
@@ -1507,9 +1313,8 @@ class FrankaController:
         # Read libfranka grasp detection flag
         is_grasped_flag = False
         try:
-            gripper_state = self._call_with_timeout(
-                self._gripper.read_once, timeout=STATE_TIMEOUT_S, label="gripper_read_grasp")
-            is_grasped_flag = gripper_state.is_grasped
+            gs = self._rt_client.gripper_read_once()
+            is_grasped_flag = gs.get("is_grasped", False)
         except Exception as e:
             logger.warning(f"Gripper is_grasped read failed: {e}")
 
@@ -1564,9 +1369,8 @@ class FrankaController:
             verify_grip = state.gripper_width
             verify_is_grasped = False
             try:
-                gs = self._call_with_timeout(
-                    self._gripper.read_once, timeout=STATE_TIMEOUT_S, label="gripper_verify")
-                verify_is_grasped = gs.is_grasped
+                gs = self._rt_client.gripper_read_once()
+                verify_is_grasped = gs.get("is_grasped", False)
             except Exception:
                 pass
 
@@ -1765,9 +1569,8 @@ class FrankaController:
         # Check is_grasped flag
         is_grasped = False
         try:
-            gs = self._call_with_timeout(
-                self._gripper.read_once, timeout=STATE_TIMEOUT_S, label=f"gripper_{label}")
-            is_grasped = gs.is_grasped
+            gs = self._rt_client.gripper_read_once()
+            is_grasped = gs.get("is_grasped", False)
         except Exception:
             pass
 
@@ -1938,6 +1741,156 @@ class FrankaController:
             if force_events:
                 result_dict["force_events"] = force_events
         return result_dict
+
+    def push_at(
+        self,
+        x: float,
+        y: float,
+        push_dx: float = 0.0,
+        push_dy: float = 0.05,
+        push_z: float = 0.02,
+        approach_height: float = 0.15,
+    ) -> dict:
+        """
+        Push an object at the given position by sweeping the closed gripper through it.
+
+        Executes: close gripper -> move above start -> lower to push height ->
+        sweep through object -> lift -> open gripper.
+
+        The push starts at (x - push_dx, y - push_dy) and ends at
+        (x + push_dx, y + push_dy), sweeping through the object position (x, y).
+
+        Args:
+            x, y: Object position in robot frame (meters)
+            push_dx: Push distance in X direction (meters, default: 0)
+            push_dy: Push distance in Y direction (meters, default: 0.05)
+            push_z: Height for pushing (meters, default: 0.02)
+            approach_height: Height to approach/retreat from (meters, default: 0.15)
+        """
+        if not self._connected:
+            return {"success": False, "error": "Not connected to robot"}
+
+        steps = []
+        import math
+        push_roll = math.pi
+        push_pitch = 0.0
+        push_yaw = 0.0
+
+        # Compute start and end positions for the push sweep
+        start_x = x - push_dx
+        start_y = y - push_dy
+        end_x = x + push_dx
+        end_y = y + push_dy
+
+        def _abort(msg, steps):
+            logger.error(f"push_at aborted: {msg}")
+            state = self.get_state()
+            return {
+                "success": False,
+                "final_position": {
+                    "x": round(state.ee_position[0], 4),
+                    "y": round(state.ee_position[1], 4),
+                    "z": round(state.ee_position[2], 4),
+                },
+                "abort_reason": msg,
+                "steps": steps,
+            }
+
+        # Step 1: Close gripper (flat surface for pushing)
+        result = self.gripper_move(0.0)
+        steps.append({"action": "close_gripper", "result": result})
+
+        # Step 2: Move above start position
+        state = self.get_state()
+        current_z = state.ee_position[2]
+        dist_xy = np.sqrt((start_x - state.ee_position[0])**2 + (start_y - state.ee_position[1])**2)
+        dist_z = abs(current_z - approach_height)
+
+        if dist_xy > 0.05 and dist_z > 0.15:
+            safe_z = max(current_z, approach_height + 0.10)
+            result = self.move_cartesian_ik(
+                start_x, start_y, safe_z,
+                roll=push_roll, pitch=push_pitch, yaw=push_yaw, confirmed=True)
+            steps.append({"action": "approach_xy", "method": "ik", "result": result})
+            if not result.get("success"):
+                return _abort(f"approach_xy failed: {result.get('error', 'unknown')}", steps)
+
+        result = self.move_cartesian_ik(
+            start_x, start_y, approach_height,
+            roll=push_roll, pitch=push_pitch, yaw=push_yaw, confirmed=True)
+        steps.append({"action": "approach_above_start", "method": "ik", "result": result})
+        if not result.get("success"):
+            return _abort(f"approach_above_start failed: {result.get('error', 'unknown')}", steps)
+
+        # Chain IK solutions for branch consistency
+        state = self.get_state()
+        chain_joints = np.array(state.joint_positions)
+
+        # Step 3: Lower to push height in increments (4cm steps)
+        current_z = state.ee_position[2]
+        step_z = 0.04
+        while current_z - step_z > push_z:
+            intermediate_z = current_z - step_z
+            result = self.move_cartesian_ik(
+                start_x, start_y, intermediate_z,
+                roll=push_roll, pitch=push_pitch, yaw=push_yaw, confirmed=True,
+                seed_joints=chain_joints)
+            steps.append({"action": "lower_step", "method": "ik", "target_z": round(intermediate_z, 4), "result": result})
+            if not result.get("success"):
+                return _abort(f"lower_step failed at z={intermediate_z:.3f}: {result.get('error', 'unknown')}", steps)
+            state = self.get_state()
+            chain_joints = np.array(state.joint_positions)
+            current_z = state.ee_position[2]
+
+        # Final lower to push height
+        result = self.move_cartesian_ik(
+            start_x, start_y, push_z,
+            roll=push_roll, pitch=push_pitch, yaw=push_yaw, confirmed=True,
+            seed_joints=chain_joints)
+        steps.append({"action": "lower_to_push_height", "method": "ik", "result": result})
+        if not result.get("success"):
+            return _abort(f"lower_to_push_height failed: {result.get('error', 'unknown')}", steps)
+        state = self.get_state()
+        chain_joints = np.array(state.joint_positions)
+
+        # Step 4: Push — sweep from start to end through object position
+        result = self.move_cartesian_ik(
+            end_x, end_y, push_z,
+            roll=push_roll, pitch=push_pitch, yaw=push_yaw, confirmed=True,
+            seed_joints=chain_joints)
+        steps.append({"action": "push_sweep", "method": "ik",
+                       "start": (round(start_x, 4), round(start_y, 4)),
+                       "end": (round(end_x, 4), round(end_y, 4)),
+                       "result": result})
+        if not result.get("success"):
+            return _abort(f"push_sweep failed: {result.get('error', 'unknown')}", steps)
+        state = self.get_state()
+        chain_joints = np.array(state.joint_positions)
+
+        # Step 5: Lift back to approach height
+        result = self.move_cartesian_ik(
+            state.ee_position[0], state.ee_position[1], approach_height,
+            roll=push_roll, pitch=push_pitch, yaw=push_yaw, confirmed=True,
+            seed_joints=chain_joints)
+        steps.append({"action": "lift", "method": "ik", "result": result})
+
+        # Step 6: Open gripper
+        result = self.gripper_move(0.08)
+        steps.append({"action": "open_gripper", "result": result})
+
+        state = self.get_state()
+        return {
+            "success": True,
+            "push_start": {"x": round(start_x, 4), "y": round(start_y, 4)},
+            "push_end": {"x": round(end_x, 4), "y": round(end_y, 4)},
+            "push_z": round(push_z, 4),
+            "final_position": {
+                "x": round(state.ee_position[0], 4),
+                "y": round(state.ee_position[1], 4),
+                "z": round(state.ee_position[2], 4),
+            },
+            "steps": steps,
+        }
 
     def start_recording(self, language_instruction: str, fps: int = 30) -> dict:
         """Start trajectory recording for current episode."""
@@ -2152,7 +2105,7 @@ class FrankaController:
                         if current.has_error:
                             logger.warning(f"Jog: auto-recovering from {current.error_message}")
                             try:
-                                self._robot.recover()
+                                self._rt_client.recover()
                                 time.sleep(0.2)
                             except Exception as re:
                                 logger.error(f"Jog: recovery failed: {re}")
@@ -2196,7 +2149,7 @@ class FrankaController:
                     except Exception as e:
                         logger.warning(f"Jog move failed: {e}")
                         try:
-                            self._robot.recover()
+                            self._rt_client.recover()
                         except Exception:
                             pass
                 else:
@@ -2406,14 +2359,13 @@ class FrankaController:
         This bypasses joint wall checks, so it can be used to recover from
         positions at or beyond joint limits.
         """
-        if not self._connected:
+        if not self._connected or not self._rt_client:
             return {"success": False, "error": "Not connected"}
 
-        if self._mock_mode:
-            return {"success": True, "teaching_mode": active, "mock": True}
-
         try:
-            self._robot.teaching_mode(active)
+            result = self._rt_client.teaching_mode(active)
+            if not result.get("success"):
+                return {"success": False, "error": result.get("error", "unknown")}
             if active:
                 return {
                     "success": True,
@@ -2620,6 +2572,7 @@ class FrankaController:
         Supported skills:
             pick  — pick_at(x, y, z?, grasp_width?, grasp_force?, approach_height?)
             place — place_at(x, y, z?, approach_height?)
+            push  — push_at(x, y, push_dx?, push_dy?, push_z?)
             move  — move_cartesian_ik(x, y, z)
             open_gripper — gripper_move(width?)
             grasp — gripper_grasp(width?, force?)
@@ -2658,9 +2611,8 @@ class FrankaController:
                     }
                     # Read is_grasped flag
                     try:
-                        gs = self._call_with_timeout(
-                            self._gripper.read_once, timeout=STATE_TIMEOUT_S, label="gripper_skill_log")
-                        robot_state["is_grasped"] = gs.is_grasped
+                        gs = self._rt_client.gripper_read_once()
+                        robot_state["is_grasped"] = gs.get("is_grasped", False)
                     except Exception:
                         robot_state["is_grasped"] = None
                     # Read force/torque
@@ -2692,6 +2644,15 @@ class FrankaController:
                         z=step.get("z", 0.08),
                         approach_height=step.get("approach_height", 0.15),
                         yaw=step.get("yaw", 0.0),
+                    )
+
+                elif skill == "push":
+                    r = self.push_at(
+                        x=step.get("x", 0.4),
+                        y=step.get("y", 0.0),
+                        push_dx=step.get("push_dx", 0.0),
+                        push_dy=step.get("push_dy", 0.05),
+                        push_z=step.get("push_z", 0.02),
                     )
 
                 elif skill == "move":
@@ -2894,6 +2855,14 @@ class FrankaController:
             return {"success": False, "error": "Online adaptation not initialized"}
         self._online_adapter.reset()
         return {"success": True, "message": "Online adaptation reset. History cleared, correction zeroed."}
+
+    def online_adapt_set_test_bias(self, bias_x_mm: float, bias_y_mm: float) -> dict:
+        """Set test bias for convergence testing."""
+        if not hasattr(self, '_online_adapter') or self._online_adapter is None:
+            return {"success": False, "error": "Online adaptation not initialized"}
+        result = self._online_adapter.set_test_bias(bias_x_mm / 1000.0, bias_y_mm / 1000.0)
+        result["success"] = True
+        return result
 
 
 # Singleton controller
