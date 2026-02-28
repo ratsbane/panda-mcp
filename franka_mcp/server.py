@@ -224,6 +224,7 @@ async def list_tools() -> list[Tool]:
                     "x_offset": {"type": "number", "description": "X offset to compensate calibration error (meters, default: 0.0)", "default": 0.0},
                     "approach_height": {"type": "number", "description": "Height to approach from (meters, default: 0.15)", "default": 0.15},
                     "yaw": {"type": "number", "description": "Wrist rotation in radians (0=default, pi/2=rotated 90 deg for sideways blocks)", "default": 0.0},
+                    "smooth": {"type": "boolean", "description": "Use smooth RT servo descent (JointPosition controller at 1kHz) instead of jerky 4cm step moves. Much smoother motion.", "default": False},
                 },
                 "required": ["x", "y"],
             },
@@ -240,6 +241,23 @@ async def list_tools() -> list[Tool]:
                     "z": {"type": "number", "description": "Place height (meters, default: 0.08)", "default": 0.08},
                     "approach_height": {"type": "number", "description": "Height to approach/retreat from (meters, default: 0.15)", "default": 0.15},
                     "yaw": {"type": "number", "description": "Wrist rotation in radians (0=default, must match pick yaw if holding rotated object)", "default": 0.0},
+                },
+                "required": ["x", "y"],
+            },
+        ),
+        Tool(
+            name="push_at",
+            description="Push an object at the given position by sweeping the closed gripper through it. "
+                       "Useful for toppling standing blocks, sliding objects, or decluttering.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number", "description": "X position of object (meters)"},
+                    "y": {"type": "number", "description": "Y position of object (meters)"},
+                    "push_dx": {"type": "number", "description": "Push distance in X (meters, default: 0)", "default": 0},
+                    "push_dy": {"type": "number", "description": "Push distance in Y (meters, default: 0.05)", "default": 0.05},
+                    "push_z": {"type": "number", "description": "Height for pushing (meters, default: 0.02)", "default": 0.02},
+                    "approach_height": {"type": "number", "description": "Approach height (meters, default: 0.15)", "default": 0.15},
                 },
                 "required": ["x", "y"],
             },
@@ -401,7 +419,7 @@ async def list_tools() -> list[Tool]:
             name="execute_plan",
             description="Execute a sequence of skill commands back-to-back with no inter-step latency. "
                        "Claude plans the full sequence, robot executes it all at once. "
-                       "Supported skills: pick(x,y), place(x,y), move(x,y,z), open_gripper, grasp, home, wait.",
+                       "Supported skills: pick(x,y), place(x,y), push(x,y), move(x,y,z), open_gripper, grasp, home, wait.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -413,7 +431,7 @@ async def list_tools() -> list[Tool]:
                             "properties": {
                                 "skill": {
                                     "type": "string",
-                                    "enum": ["pick", "place", "move", "open_gripper", "grasp", "home", "wait"],
+                                    "enum": ["pick", "place", "push", "move", "open_gripper", "grasp", "home", "wait"],
                                     "description": "Skill to execute",
                                 },
                                 "x": {"type": "number", "description": "X position (meters)"},
@@ -425,6 +443,9 @@ async def list_tools() -> list[Tool]:
                                 "width": {"type": "number", "description": "Gripper width (meters)"},
                                 "force": {"type": "number", "description": "Force (N)"},
                                 "yaw": {"type": "number", "description": "Wrist rotation in radians (for pick/place, 0=default, pi/2=rotated 90 deg)"},
+                                "push_dx": {"type": "number", "description": "Push distance in X (meters, for push skill)"},
+                                "push_dy": {"type": "number", "description": "Push distance in Y (meters, for push skill)"},
+                                "push_z": {"type": "number", "description": "Height for pushing (meters, for push skill)"},
                                 "seconds": {"type": "number", "description": "Wait duration"},
                             },
                             "required": ["skill"],
@@ -648,6 +669,25 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="online_adapt_set_test_bias",
+            description="Inject artificial position bias for adaptation convergence testing. "
+                       "Bias is added AFTER adapter correction, simulating calibration drift. "
+                       "Adapter should learn to cancel it. Set both to 0 to disable.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "bias_x_mm": {
+                        "type": "number",
+                        "description": "X bias in millimeters (e.g. 15 = +15mm systematic error)",
+                    },
+                    "bias_y_mm": {
+                        "type": "number",
+                        "description": "Y bias in millimeters",
+                    },
+                },
+            },
+        ),
+        Tool(
             name="get_safety_limits",
             description="Get current safety limits (workspace bounds, velocity limits).",
             inputSchema={
@@ -830,6 +870,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 x_offset=arguments.get("x_offset", 0.0),
                 approach_height=arguments.get("approach_height", 0.15),
                 yaw=arguments.get("yaw", 0.0),
+                smooth=arguments.get("smooth", False),
             )
             return json_response(result)
 
@@ -840,6 +881,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 z=arguments.get("z", 0.08),
                 approach_height=arguments.get("approach_height", 0.15),
                 yaw=arguments.get("yaw", 0.0),
+            )
+            return json_response(result)
+
+        elif name == "push_at":
+            result = controller.push_at(
+                x=arguments["x"],
+                y=arguments["y"],
+                push_dx=arguments.get("push_dx", 0.0),
+                push_dy=arguments.get("push_dy", 0.05),
+                push_z=arguments.get("push_z", 0.02),
+                approach_height=arguments.get("approach_height", 0.15),
             )
             return json_response(result)
 
@@ -1003,6 +1055,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "online_adapt_reset":
             result = controller.online_adapt_reset()
+            return json_response(result)
+
+        elif name == "online_adapt_set_test_bias":
+            result = controller.online_adapt_set_test_bias(
+                bias_x_mm=arguments.get("bias_x_mm", 0.0),
+                bias_y_mm=arguments.get("bias_y_mm", 0.0),
+            )
             return json_response(result)
 
         elif name == "get_safety_limits":

@@ -27,6 +27,15 @@
         "cd /home/pi/panda-mcp && ./venv/bin/python -m depth_mcp.server"
       ],
       "env": {}
+    },
+    "realsense": {
+      "command": "ssh",
+      "args": [
+        "-o", "StrictHostKeyChecking=no",
+        "pi@panda-pi.local",
+        "cd /home/pi/panda-mcp && ./venv/bin/python -m realsense_mcp.server"
+      ],
+      "env": {}
     }
   }
 }

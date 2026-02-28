@@ -1047,6 +1047,7 @@ class FrankaController:
         x_offset: float = 0.0,
         approach_height: float = 0.15,
         yaw: float = 0.0,
+        smooth: bool = False,
     ) -> dict:
         """
         Pick an object at the given robot coordinates.
@@ -1125,8 +1126,8 @@ class FrankaController:
                     target_type="block",
                 )
                 # Apply random XY perturbation for training data diversity
-                nudge_perturb_dx = np.random.uniform(-0.020, 0.020)  # ±20mm
-                nudge_perturb_dy = np.random.uniform(-0.020, 0.020)
+                nudge_perturb_dx = np.random.uniform(-0.035, 0.035)  # ±35mm
+                nudge_perturb_dy = np.random.uniform(-0.035, 0.035)
                 # Clamp to stay within safe workspace
                 px = target_x + nudge_perturb_dx
                 py = y + nudge_perturb_dy
@@ -1216,129 +1217,167 @@ class FrankaController:
         if nudge_active:
             self._nudge_record_frame()
 
-        # Step 3: Lower in increments (avoid large joint changes that trigger reflex)
-        current_z = state.ee_position[2]
-        step_z = 0.04  # 4cm increments
-        while current_z - step_z > z:
-            intermediate_z = current_z - step_z
+        # Step 3: Descent + Grasp
+        if smooth and self._rt_client and not MOCK_MODE:
+            # ---- Smooth descent via RT servo (JointPosition controller at 1kHz) ----
+            # Remove NUDGE perturbation before servo (servo handles its own corrections)
+            servo_x, servo_y = target_x, y
+            if nudge_active and (abs(nudge_perturb_dx) > 0.001 or abs(nudge_perturb_dy) > 0.001):
+                servo_x -= nudge_perturb_dx
+                servo_y -= nudge_perturb_dy
+
+            # Build servo_pick kwargs
+            servo_kwargs = {
+                "x": servo_x, "y": servo_y, "z": z,
+                "yaw": pick_yaw,
+                "grasp_width": grasp_width, "grasp_force": grasp_force,
+                "speed_factor": 0.5,
+            }
+
+            # Add NUDGE model if loaded
+            nudge_model_path = None
+            if nudge_servo and hasattr(self, '_nudge_servo') and self._nudge_servo is not None:
+                nudge_model_path = getattr(self._nudge_servo, '_model_path', None)
+            if nudge_model_path:
+                servo_bbox = nudge_bbox or self._nudge_detect_target_bbox()
+                servo_kwargs["model_path"] = nudge_model_path
+                servo_kwargs["target_bbox"] = servo_bbox
+
+            logger.info(f"Smooth descent via RT servo: target=({servo_x:.3f}, {servo_y:.3f}, {z:.3f})")
+            servo_result = self._rt_client.servo_pick(**servo_kwargs)
+            steps.append({"action": "smooth_descent_grasp", "result": servo_result})
+
+            if not servo_result.get("success"):
+                return _abort(
+                    f"smooth descent failed: {servo_result.get('error', 'unknown')}",
+                    steps)
+
+            # Extract grasp info from servo result
+            actual_grip = servo_result.get("gripper_width", 0.0)
+            is_grasped_flag = servo_result.get("is_grasped", False)
+            grasped = servo_result.get("success", False)
+        else:
+            # ---- Standard incremental descent (4cm steps) ----
+            current_z = state.ee_position[2]
+            step_z = 0.04  # 4cm increments
+            while current_z - step_z > z:
+                intermediate_z = current_z - step_z
+                result = self.move_cartesian_ik(
+                    target_x, y, intermediate_z,
+                    roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True,
+                    seed_joints=chain_joints)
+                steps.append({"action": "lower_step", "method": "ik", "target_z": round(intermediate_z, 4), "result": result})
+                if not result.get("success"):
+                    return _abort(f"lower_step failed at z={intermediate_z:.3f}: {result.get('error', 'unknown')}", steps)
+                state = self.get_state()
+                chain_joints = np.array(state.joint_positions)
+                current_z = state.ee_position[2]
+
+                # SAWM: record frame at each Z step
+                if sawm_active:
+                    self._sawm_record_frame()
+
+                # NUDGE: record frame at each Z step
+                if nudge_active:
+                    self._nudge_record_frame()
+
+                # NUDGE servo: apply correction
+                if nudge_servo:
+                    nudge_correction = self._nudge_get_correction()
+                    if nudge_correction is not None:
+                        ndx, ndy, ndz = nudge_correction
+                        target_x += ndx
+                        y += ndy
+                        # dz not applied (Z is controlled by incremental lowering)
+                        steps.append({
+                            "action": "nudge_correction",
+                            "dx_mm": round(ndx * 1000, 1),
+                            "dy_mm": round(ndy * 1000, 1),
+                            "dz_mm": round(ndz * 1000, 1),
+                        })
+                        logger.info(f"NUDGE correction: dx={ndx*1000:.1f}mm dy={ndy*1000:.1f}mm")
+
+                # SAWM monitor: check for correction (clamped to ±15mm)
+                if sawm_monitor:
+                    correction = self._sawm_monitor.get_correction()
+                    if correction:
+                        cdx, cdy = correction
+                        MAX_CORRECTION = 0.015  # 15mm max per step
+                        cdx = max(-MAX_CORRECTION, min(MAX_CORRECTION, cdx))
+                        cdy = max(-MAX_CORRECTION, min(MAX_CORRECTION, cdy))
+                        target_x += cdx
+                        y += cdy
+                        steps.append({
+                            "action": "sawm_correction",
+                            "dx_mm": round(cdx * 1000, 1),
+                            "dy_mm": round(cdy * 1000, 1),
+                        })
+                        logger.info(f"SAWM correction applied: dx={cdx*1000:.1f}mm dy={cdy*1000:.1f}mm")
+
+            # Remove NUDGE perturbation before final grasp (accurate positioning)
+            if nudge_active and (abs(nudge_perturb_dx) > 0.001 or abs(nudge_perturb_dy) > 0.001):
+                target_x -= nudge_perturb_dx
+                y -= nudge_perturb_dy
+                logger.info(
+                    f"NUDGE perturbation removed for grasp: "
+                    f"target=({target_x:.3f}, {y:.3f})"
+                )
+
+            # Final lower to grasp height
             result = self.move_cartesian_ik(
-                target_x, y, intermediate_z,
+                target_x, y, z,
                 roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True,
                 seed_joints=chain_joints)
-            steps.append({"action": "lower_step", "method": "ik", "target_z": round(intermediate_z, 4), "result": result})
+            steps.append({"action": "lower_to_grasp", "method": "ik", "result": result})
             if not result.get("success"):
-                return _abort(f"lower_step failed at z={intermediate_z:.3f}: {result.get('error', 'unknown')}", steps)
+                return _abort(f"lower_to_grasp failed: {result.get('error', 'unknown')}", steps)
             state = self.get_state()
-            chain_joints = np.array(state.joint_positions)
-            current_z = state.ee_position[2]
+            actual_z = state.ee_position[2]
+            steps.append({"action": "check_z", "target_z": z, "actual_z": round(actual_z, 4)})
 
-            # SAWM: record frame at each Z step
+            # SAWM: record frame at grasp height (closest frame)
             if sawm_active:
                 self._sawm_record_frame()
 
-            # NUDGE: record frame at each Z step
+            # NUDGE: record frame at grasp height
             if nudge_active:
                 self._nudge_record_frame()
 
-            # NUDGE servo: apply correction
-            if nudge_servo:
-                nudge_correction = self._nudge_get_correction()
-                if nudge_correction is not None:
-                    ndx, ndy, ndz = nudge_correction
-                    target_x += ndx
-                    y += ndy
-                    # dz not applied (Z is controlled by incremental lowering)
-                    steps.append({
-                        "action": "nudge_correction",
-                        "dx_mm": round(ndx * 1000, 1),
-                        "dy_mm": round(ndy * 1000, 1),
-                        "dz_mm": round(ndz * 1000, 1),
-                    })
-                    logger.info(f"NUDGE correction: dx={ndx*1000:.1f}mm dy={ndy*1000:.1f}mm")
+            # Step 4: Grasp
+            result = self.gripper_grasp(width=grasp_width, force=grasp_force)
+            steps.append({"action": "grasp", "result": result})
+        # Check grasp (skip if smooth mode already set these)
+        if not smooth or MOCK_MODE or not self._rt_client:
+            # Standard grasp check using multiple signals
+            state = self.get_state()
+            actual_grip = state.gripper_width
+            width_ok = actual_grip > GRIP_CLOSED_EMPTY and actual_grip < GRIP_STILL_OPEN
 
-            # SAWM monitor: check for correction (clamped to ±15mm)
-            if sawm_monitor:
-                correction = self._sawm_monitor.get_correction()
-                if correction:
-                    cdx, cdy = correction
-                    MAX_CORRECTION = 0.015  # 15mm max per step
-                    cdx = max(-MAX_CORRECTION, min(MAX_CORRECTION, cdx))
-                    cdy = max(-MAX_CORRECTION, min(MAX_CORRECTION, cdy))
-                    target_x += cdx
-                    y += cdy
-                    steps.append({
-                        "action": "sawm_correction",
-                        "dx_mm": round(cdx * 1000, 1),
-                        "dy_mm": round(cdy * 1000, 1),
-                    })
-                    logger.info(f"SAWM correction applied: dx={cdx*1000:.1f}mm dy={cdy*1000:.1f}mm")
+            # Read libfranka grasp detection flag
+            is_grasped_flag = False
+            try:
+                gs = self._rt_client.gripper_read_once()
+                is_grasped_flag = gs.get("is_grasped", False)
+            except Exception as e:
+                logger.warning(f"Gripper is_grasped read failed: {e}")
 
-        # Remove NUDGE perturbation before final grasp (accurate positioning)
-        if nudge_active and (abs(nudge_perturb_dx) > 0.001 or abs(nudge_perturb_dy) > 0.001):
-            target_x -= nudge_perturb_dx
-            y -= nudge_perturb_dy
+            # Initial grasp decision
+            grasped = is_grasped_flag or width_ok
             logger.info(
-                f"NUDGE perturbation removed for grasp: "
-                f"target=({target_x:.3f}, {y:.3f})"
+                f"Grasp check: width={actual_grip:.4f}m width_ok={width_ok} "
+                f"is_grasped={is_grasped_flag} requested_width={grasp_width:.4f}m -> grasped={grasped}"
             )
-
-        # Final lower to grasp height
-        result = self.move_cartesian_ik(
-            target_x, y, z,
-            roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True,
-            seed_joints=chain_joints)
-        steps.append({"action": "lower_to_grasp", "method": "ik", "result": result})
-        if not result.get("success"):
-            return _abort(f"lower_to_grasp failed: {result.get('error', 'unknown')}", steps)
-        state = self.get_state()
-        actual_z = state.ee_position[2]
-        steps.append({"action": "check_z", "target_z": z, "actual_z": round(actual_z, 4)})
-
-        # SAWM: record frame at grasp height (closest frame)
-        if sawm_active:
-            self._sawm_record_frame()
-
-        # NUDGE: record frame at grasp height
-        if nudge_active:
-            self._nudge_record_frame()
-
-        # Step 4: Grasp
-        result = self.gripper_grasp(width=grasp_width, force=grasp_force)
-        steps.append({"action": "grasp", "result": result})
-        # Check grasp using multiple signals (width-independent)
-        state = self.get_state()
-        actual_grip = state.gripper_width
-        width_ok = actual_grip > GRIP_CLOSED_EMPTY and actual_grip < GRIP_STILL_OPEN
-
-        # Read libfranka grasp detection flag
-        is_grasped_flag = False
-        try:
-            gs = self._rt_client.gripper_read_once()
-            is_grasped_flag = gs.get("is_grasped", False)
-        except Exception as e:
-            logger.warning(f"Gripper is_grasped read failed: {e}")
+            steps.append({
+                "action": "check_grasp",
+                "gripper_width": round(actual_grip, 4),
+                "requested_width": round(grasp_width, 4),
+                "is_grasped": is_grasped_flag,
+                "width_ok": width_ok,
+                "grasped": grasped,
+            })
 
         # Record force baseline for slip detection during transport
         force_baseline = self._read_forces()
-
-        # Initial grasp decision: trust is_grasped as primary signal.
-        # width_ok alone is not sufficient — gripper can sit around an object
-        # without actually squeezing (happens when grasp_width is very wrong).
-        # The verify step below will confirm by checking width stability after mini-lift.
-        grasped = is_grasped_flag or width_ok
-        logger.info(
-            f"Grasp check: width={actual_grip:.4f}m width_ok={width_ok} "
-            f"is_grasped={is_grasped_flag} requested_width={grasp_width:.4f}m → grasped={grasped}"
-        )
-        steps.append({
-            "action": "check_grasp",
-            "gripper_width": round(actual_grip, 4),
-            "requested_width": round(grasp_width, 4),
-            "is_grasped": is_grasped_flag,
-            "width_ok": width_ok,
-            "grasped": grasped,
-            "force_baseline": [round(f, 2) for f in force_baseline] if force_baseline is not None else None,
-        })
 
         # Store force baseline for transport monitoring
         if grasped and force_baseline is not None:

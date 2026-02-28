@@ -165,6 +165,20 @@ class RobotProxy:
     def connected(self) -> bool:
         return self._connected
 
+    @property
+    def is_mock(self) -> bool:
+        return self._mock
+
+    @property
+    def panda(self):
+        """Raw panda-py Panda object (for servo/RTC access)."""
+        return self._panda
+
+    @property
+    def raw_gripper(self):
+        """Raw panda-py Gripper object (for servo access)."""
+        return self._gripper
+
     def _call_with_timeout(self, fn, *args, timeout=STATE_TIMEOUT_S,
                            label="call", recover=False, **kwargs):
         """Execute fn with timeout. Extracted from controller.py."""

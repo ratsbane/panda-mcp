@@ -212,11 +212,17 @@ class FrankaRTServer:
                 return {"result": result}
 
             elif cmd == CMD_SERVO_PICK:
-                # Phase 3 - not yet implemented
-                return {"error": "servo_pick not yet implemented"}
+                if self.proxy.is_mock:
+                    return {"result": {"success": True, "mock": True, "phases": ["mock"]}}
+                if not self.proxy.connected:
+                    return {"error": "Not connected to robot"}
+                from .servo import NudgeRTServo
+                servo = NudgeRTServo(self.proxy.panda, self.proxy.raw_gripper)
+                result = servo.execute(**args)
+                return {"result": result}
 
             elif cmd == CMD_SERVO_STATUS:
-                return {"result": {"active": False, "message": "servo not yet implemented"}}
+                return {"result": {"available": True, "active": False}}
 
             else:
                 return {"error": f"Unknown command: {cmd}"}

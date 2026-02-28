@@ -22,6 +22,17 @@ calibration.json
 voices/*.onnx
 voices/*.onnx.json
 models/*.onnx
+models/*.onnx.data
+models/*.pt
+models/*.history.json
+
+# Training data
+data/
+
+# Scratch / experiments
+test_scratch.py
+gstshark_*/
+realsense_mcp/
 
 # OS
 .DS_Store

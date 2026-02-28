@@ -1,0 +1,33 @@
+[Unit]
+Description=Qwen2.5-VL Visual Grounding Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude
+WorkingDirectory=/home/claude/panda-mcp
+ExecStart=/usr/bin/python3 scripts/grounding_server.py --port 8090
+
+# Thread safety: limit CPU threads to prevent thread bomb
+Environment=OMP_NUM_THREADS=4
+Environment=MKL_NUM_THREADS=4
+Environment=TOKENIZERS_PARALLELISM=false
+
+# Restart on crash, but back off to avoid rapid restart loops
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Resource limits
+LimitNOFILE=65536
+TasksMax=128
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=grounding-server
+
+[Install]
+WantedBy=multi-user.target

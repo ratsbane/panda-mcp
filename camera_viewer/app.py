@@ -193,28 +193,32 @@ async def homepage(request):
     return HTMLResponse(HTML_PAGE)
 
 
-async def mjpeg_stream(request):
-    """MJPEG stream from the USB camera daemon via ZeroMQ."""
+def mjpeg_stream(request):
+    """MJPEG stream from the USB camera daemon via ZeroMQ.
 
-    async def generate():
-        ctx = zmq.asyncio.Context()
+    Uses a sync generator (run in thread pool by Starlette) to avoid
+    async ZMQ event loop issues that can prevent frame flushing.
+    """
+
+    def generate():
+        ctx = zmq.Context()
         sock = ctx.socket(zmq.SUB)
-        sock.setsockopt(zmq.RCVTIMEO, 3000)
+        sock.setsockopt(zmq.RCVTIMEO, 5000)
         sock.setsockopt_string(zmq.SUBSCRIBE, "frame")
 
         connected = False
         for endpoint in [ZMQ_IPC, ZMQ_TCP]:
             try:
                 sock.connect(endpoint)
-                # Test receive
-                parts = await asyncio.wait_for(
-                    sock.recv_multipart(), timeout=3.0
-                )
+                parts = sock.recv_multipart()
                 connected = True
-                logger.info(f"Connected to camera at {endpoint}")
+                logger.info(f"MJPEG stream connected to camera at {endpoint}")
                 break
             except Exception:
-                sock.disconnect(endpoint)
+                try:
+                    sock.disconnect(endpoint)
+                except Exception:
+                    pass
 
         if not connected:
             sock.close()
@@ -223,29 +227,30 @@ async def mjpeg_stream(request):
 
         try:
             # Yield the first frame we already received
-            if len(parts) == 3:
-                jpeg_bytes = parts[2]
+            if len(parts) >= 3:
+                jpeg = parts[2]
                 yield (
                     b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n" + jpeg_bytes + b"\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n"
+                    b"\r\n" + jpeg + b"\r\n"
                 )
 
             while True:
                 try:
-                    parts = await asyncio.wait_for(
-                        sock.recv_multipart(), timeout=5.0
-                    )
-                    if len(parts) == 3:
-                        jpeg_bytes = parts[2]
+                    parts = sock.recv_multipart()
+                    if len(parts) >= 3:
+                        jpeg = parts[2]
                         yield (
                             b"--frame\r\n"
-                            b"Content-Type: image/jpeg\r\n\r\n"
-                            + jpeg_bytes
-                            + b"\r\n"
+                            b"Content-Type: image/jpeg\r\n"
+                            b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n"
+                            b"\r\n" + jpeg + b"\r\n"
                         )
-                except asyncio.TimeoutError:
+                except zmq.Again:
+                    # Timeout - daemon might be slow, keep trying
                     continue
-                except asyncio.CancelledError:
+                except Exception:
                     break
         finally:
             sock.close()

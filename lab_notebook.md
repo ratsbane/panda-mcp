@@ -884,20 +884,331 @@ Comprehensive survey in `research/online_learning.md`. Key papers:
 
 **41. Online adaptation works end-to-end.** The EMA correction system successfully records outcomes, builds corrections, and applies them — all transparent to the user. First correction applied on pick #4 (after 3 successful samples). The architecture is proven; the value grows with systematic error.
 
-### Competition Target: ICRA 2026 RGMC
+### Benchmark: ICRA 2026 RGMC
 
-**Event:** 11th Robotic Grasping and Manipulation Competition, ICRA 2026, Vienna, June 1-5
-**Track:** Picking from Clutter — pick known + unknown objects from cluttered transparent box, follow commanded grasp sequence via ROS topic/service
-**Application deadline:** Feb 23, 2026 (passed, but late apps accepted based on availability)
-**Contact:** bcalli@wpi.edu
+The 11th Robotic Grasping and Manipulation Competition (ICRA 2026, Vienna, June 1-5) provides a useful benchmark for our system. Track 2 (Picking from Clutter) involves picking known + unknown objects from a cluttered transparent box following a commanded grasp sequence via ROS topic/service.
 
-**Notable:** Tsinghua University won back-to-back (THU-bot 2024, Team JVD 2025). Competition involves ordered picking with pushing/decluttering strategies.
-
-**What we'd need:**
-- ROS integration for commanded grasp sequence
-- Robust clutter perception (D405 wrist camera + NUDGE servo)
-- Ship Panda to Vienna or use provided arm
-- 14 weeks to prepare
+Tsinghua University won back-to-back (THU-bot 2024, Team JVD 2025). The task requires ordered picking with pushing/decluttering strategies — directly relevant to the block collision problem we've been working on.
 
 ### Hardware Update
 Intel RealSense D405 wrist camera shipped from Stem, NC via USPS — expected early next week. This will be transformative: direct gripper-to-target view, built-in stereo depth, 7-50cm optimal range. Enables proper eye-in-hand visual servoing.
+
+## 2026-02-26 - RealSense MCP Skeleton + Extended NUDGE Collection + Side Table Picking
+
+### Context
+D405 delivery updated from "early next week" to Sunday/Monday. Built the RealSense MCP server skeleton in advance so we can start using it immediately when the camera arrives. Continued NUDGE data collection with picking from both the main workspace and a new side table.
+
+### Experiment 19: RealSense MCP Server (Skeleton)
+
+**Goal:** Build a complete MCP server for Intel RealSense D405/D435 depth cameras, ready for hardware testing when the cameras arrive.
+
+**Architecture:**
+```
+realsense_mcp/
+├── __init__.py       # Lazy import (avoids mcp dependency for controller-only usage)
+├── __main__.py       # python -m realsense_mcp
+├── controller.py     # RealSenseController with mock mode (REALSENSE_MOCK=1)
+├── server.py         # 10 MCP tools
+└── pyproject.toml    # robot-mcp-realsense package
+```
+
+**10 MCP tools:**
+- `list_devices` — Enumerate connected RealSense cameras
+- `connect` / `disconnect` — Lifecycle management
+- `capture` — Full RGBD capture (color + depth NPZ)
+- `capture_color` — Color frame as JPEG (returns ImageContent)
+- `capture_depth_image` — JET-colorized depth visualization (returns ImageContent)
+- `get_depth_at` — Depth + 3D position at pixel coordinate
+- `get_robot_coords_at` — Camera-to-robot frame transform (requires calibration)
+- `get_pointcloud_stats` — Point count, bounds, centroid
+- `save_scan` — Save as compressed NPZ
+- `get_camera_info` — Resolution, serial, firmware, frame counts
+
+**Design decisions:**
+- Post-processing pipeline: decimation (4x) → spatial (α=0.5, δ=20) → temporal (α=0.4, δ=20) → hole-filling (nearest)
+- Warm-up: discard first 30 frames on connect (auto-exposure/WB stabilization)
+- Mock mode generates synthetic depth (gaussian blob) + gradient color images
+- Calibration matrix stored at `/tmp/realsense_calibration.npz` (4x4 SE(3), same format as depth_mcp)
+- Lazy `__getattr__` in `__init__.py` prevents `mcp` import when only the controller is needed
+
+**Verified:** Mock mode passes full end-to-end test (all 10 tools return valid responses).
+
+### Bug Fix: Safety Limit Propagation
+
+**Problem:** `set_safety_limits` MCP tool updated the global safety config, but `pick_at()` didn't respect the new limits because the controller created its own `SafetyValidator()` with default config.
+
+**Root cause:** `controller.py` line 380: `self.validator = SafetyValidator()` — uses default y_max=0.5, ignoring any `set_safety_limits` calls.
+
+**Fix:** Changed to `self.validator = SafetyValidator(config=get_safety_config())` — now the controller shares the global safety config singleton. Required server restart to take effect.
+
+**Impact:** This bug had been silently clipping all pick/place coordinates to the default workspace bounds. Fixing it enabled reaching the side table (y≈0.586-0.618).
+
+### Experiment 20: Side Table Picking
+
+**Goal:** Pick blocks from a round side table to the right of the main workspace, expanding the training data position diversity.
+
+**Setup:** Small round table at y≈0.586-0.618, x≈0.323-0.375. Safety limits expanded to y_max=0.65.
+
+**Challenge 1 — Lateral approach trajectory:**
+`pick_at()` approaches from the main workspace side at low height (z=0.15), then sweeps laterally to the target. For the side table (y=0.586), this sweep knocks over blocks.
+
+**Solution:** Use `execute_plan` with explicit `move` waypoints to approach straight down from above:
+```
+move(x, y, z=0.25)  →  move(x, y, z=0.15)  →  move(x, y, z=0.10)  →  move(x, y, z=grasp_z)  →  grasp
+```
+
+**Challenge 2 — No camera coverage:**
+The USB camera and depth camera don't cover the side table. Blocks must be located by either:
+- Gamepad jogging to find block positions manually
+- Using known positions from previous jog measurements
+
+**Challenge 3 — Variable surface height:**
+The round side table surface varies from z=0.048 to z=0.072 depending on position. Too-high grasp heights result in closing above the block.
+
+**Results:**
+
+| # | Block | Position | z_grasp | Result | Notes |
+|---|-------|----------|---------|--------|-------|
+| 1 | Yellow (stacked) | (0.325, 0.586) | 0.075 | SUCCESS | Stack of 2 yellow blocks |
+| 2 | Yellow | (0.325, 0.586) | 0.075 | SUCCESS | Same spot, second block |
+| 3 | Unknown | (0.323, 0.618) | 0.075 | FAIL | z too high — closed above block |
+| 4 | Unknown | (0.323, 0.618) | 0.050 | SUCCESS | User: "go down about one block height" |
+
+### Experiment 21: Extended Main Workspace Picking
+
+**Goal:** Continue NUDGE data collection on the main workspace blocks.
+
+**Results (main desk blocks this session):**
+
+| # | Method | Block | Robot coords | Result |
+|---|--------|-------|-------------|--------|
+| 1 | learned_pick(red) | Red | (0.503, 0.059) | SUCCESS |
+| 2 | learned_pick(blue) | Blue #1 | (0.447, -0.188) | FAIL — near workspace edge |
+| 3 | learned_pick(blue) | Blue #2 | (0.443, -0.114) | SUCCESS |
+| 4 | learned_pick(blue) | Blue #3 | (0.410, -0.072) | SUCCESS (edge grip, 64mm width) |
+| 5 | learned_pick(green) | Green #1 | (0.490, 0.114) | SUCCESS |
+| 6 | learned_pick(green) | Green #2 | (0.469, 0.046) | SUCCESS |
+
+**Online adaptation interference:** Early picks had the online adapter applying wrong corrections (-8.6mm X), causing misses. Reset resolved it. The EMA-based correction learns incorrect offsets when picks are at very different workspace positions (the bias isn't uniform across the workspace).
+
+### NUDGE Data Collection Summary
+
+| Metric | Start of session | End of session |
+|--------|-----------------|----------------|
+| Total approaches | ~180 | 240 |
+| Successful | ~130 | 174 |
+| Failed | ~50 | 66 |
+| Total frames | ~900 | 1200 |
+| Success rate | ~72% | 72.5% |
+
+**Position diversity improved** — now includes side table positions (y≈0.586-0.618) alongside main workspace (y=-0.20 to +0.20), giving ~800mm of Y range.
+
+### Key Learnings
+
+**42. Safety validator singleton pattern matters.** Creating `SafetyValidator()` without passing the shared config means each module has its own limits. Any subsystem that needs to respect dynamic safety limits must share `get_safety_config()`. This kind of bug is silent — picks still succeed but get silently clipped to default bounds.
+
+**43. Approach trajectory depends on target location.** `pick_at()` was designed for the main workspace where lateral approach at z=0.15 works. Side table (y>0.5) needs a straight-down approach to avoid sweeping through the workspace. `execute_plan` with explicit waypoints provides the flexibility.
+
+**44. Online adaptation has a position-dependent bias problem.** The EMA correction assumes a uniform systematic error across the workspace. In reality, the error varies by position (homography is more accurate near calibration points, less accurate at edges). A more sophisticated adapter would need position-dependent correction (e.g., a local linear model or grid-based correction map).
+
+**45. Camera coverage limits autonomous operation.** Without camera coverage of the side table, block positions must be measured manually (gamepad jog). This is the strongest argument for the D405 wrist camera — it goes wherever the gripper goes, providing universal coverage regardless of workspace geometry.
+
+### Next Steps
+- Continue NUDGE collection toward 500+ successful approaches
+- Retrain NUDGE when dataset is large enough for meaningful XY accuracy improvement
+- Install D405 when it arrives (Monday) — test realsense-mcp with real hardware
+- Build stacking pipeline (NUDGE Phase 4) once servo corrections are validated
+
+---
+
+## 2026-02-27 - franka-rt: ZMQ Real-Time Server
+
+### Motivation
+
+The MCP request-response model is fundamentally wrong for real-time visual servoing. NUDGE corrections during pick approaches currently work step-by-step: move, stop, take photo, run inference, solve IK, move again. Each step goes through MCP → controller → panda-py → robot, with Claude in the loop for every frame. This is slow (~1s per correction step) and jerky.
+
+What we need: a 1kHz JointPosition controller running continuously while a vision thread feeds corrections at ~30Hz. That requires a process that holds the panda-py connection permanently and runs the tight control loop internally — it can't be gated by MCP round-trips.
+
+### Architecture Decision
+
+**Solution:** A new `franka-rt` process owns the panda-py connection and serves commands from franka-mcp over ZMQ IPC sockets.
+
+```
+Claude → MCP → franka-mcp ──ZMQ──→ franka-rt → Panda robot
+                (IK, pick_at)        (panda-py, 1kHz RTC, camera)
+```
+
+**What stays in franka-mcp (unchanged):**
+- IK solver (`_solve_ik()` — pure math, no hardware connection)
+- pick_at/place_at/push_at orchestration logic
+- Safety validation, workspace bounds
+- Waypoint interpolation for large moves
+- SAWM/NUDGE data collection, online adaptation, skill logging
+- Gamepad jog loop, VLA client
+- All 30+ MCP tool definitions in server.py
+
+**What moves to franka-rt:**
+- `Panda()` + `Gripper()` connections (panda-py)
+- `_call_with_timeout()` ThreadPoolExecutor wrapper
+- All blocking hardware calls: move_to_joint_position, gripper.grasp/move/read_once, get_state, recover, teaching_mode
+- Force monitoring during motion
+- (Future) NUDGE real-time JointPosition controller + vision thread
+
+### Implementation
+
+**Three ZMQ channels:**
+| Channel | Pattern | Endpoint | Purpose |
+|---------|---------|----------|---------|
+| Command | DEALER↔ROUTER | `ipc:///tmp/franka-rt-cmd.sock` | All request-reply commands |
+| Stop | PUB→SUB | `ipc:///tmp/franka-rt-stop.sock` | Emergency stop (never queued) |
+| State | PUB→SUB | `ipc:///tmp/franka-rt-state.sock` | Future: RTC state broadcast |
+
+DEALER-ROUTER allows stop signals to arrive even while a blocking move_joints is in flight. Serialization via msgpack (~5x faster than JSON, handles numpy via `.tolist()`).
+
+**New files (1052 lines):**
+| File | Lines | Purpose |
+|------|-------|---------|
+| `franka_rt/protocol.py` | 85 | Shared message types, pack/unpack, IPC endpoints |
+| `franka_rt/robot_proxy.py` | 454 | Panda+Gripper with ThreadPoolExecutor timeouts |
+| `franka_rt/server.py` | 230 | ZMQ ROUTER event loop, command dispatch |
+| `franka_rt/__main__.py` | 32 | Entry point: `python -m franka_rt` |
+| `franka_mcp/rt_client.py` | 250 | ZMQ DEALER client with convenience methods |
+
+**Modified: `franka_mcp/controller.py`** — Surgical replacement of all `self._robot`/`self._gripper` references with `self._rt_client` calls. Removed MockRobot, MockGripper, and `_call_with_timeout` (all moved to robot_proxy.py). Net -212 lines. IK solver and all orchestration logic completely unchanged.
+
+**14 commands implemented:** ping, connect, get_state, get_q, move_joints, move_joints_monitored, move_to_pose, gripper_move, gripper_grasp, gripper_read, gripper_stop, stop, recover, teaching_mode
+
+### Testing
+
+**Mock mode (all 14 commands verified):**
+- franka-rt with `FRANKA_MOCK=1` → ZMQ round-trip → correct results
+- FrankaController through ZMQ → RobotState dataclass populated correctly
+- Waypoint interpolation (large moves split into ~0.15 rad steps) works through proxy
+- Emergency stop via PUB channel works
+
+**Real hardware (live test):**
+1. Started `franka-rt` with `/home/doug/panda-mcp/venv/bin/python -m franka_rt`
+2. Restarted franka-mcp MCP server to pick up new controller.py
+3. `connect` → panda-py connected to 192.168.0.253 through franka-rt
+4. `get_status` → full state with joint positions, EE pose, gripper width, forces all correct
+5. `recover` → success
+6. `move_relative(dz=0.05)` → moved 5cm up, **~1mm position accuracy** (IK through ZMQ)
+7. `gripper_move(0.08)` → opened, `gripper_move(0.02)` → closed, `gripper_move(0.08)` → opened
+8. `move_cartesian(0.307, 0, 0.487)` → home position, **12 waypoints over 5.65s** (large-move interpolation working)
+
+All commands pass cleanly through the ZMQ proxy with no perceptible latency increase.
+
+### Key Learnings
+
+**46. ZMQ IPC is effectively free.** The franka-rt proxy adds no measurable latency to MCP operations. The dominant cost is still panda-py/libfranka blocking calls (motion planning, gripper communication). IPC socket round-trip is sub-millisecond.
+
+**47. Surgical refactoring beats rewrites.** By keeping all the orchestration logic (IK, pick_at, waypoint interpolation, safety validation) in controller.py and only moving the hardware I/O to franka-rt, the change was safe and testable. Every MCP tool works identically — the ZMQ layer is invisible to Claude and to the MCP interface.
+
+**48. The venv matters.** The Pi has two venvs: `.venv/` (general, no panda-py) and `venv/` (MCP server, has panda-py). franka-rt must use `venv/` to access panda-py. Spent a few minutes debugging mock-mode startup before finding this.
+
+### What This Enables (Phase 3)
+
+With franka-rt holding the panda-py connection, we can now implement:
+- `franka_rt/servo.py` — JointPosition RTC at 1kHz with NUDGE vision thread at 30Hz
+- `servo_pick` command: start controller → run vision thread → descend with XY corrections → grasp
+- Camera subscribes to existing ZeroMQ daemon with `CONFLATE=1` (latest frame only)
+- IK solved in the vision thread (stateless, no connection needed), chain-seeded from last target
+
+Expected result: smooth, continuous descent toward target with real-time visual corrections, instead of the current step-pause-correct-step pattern. Should be faster, smoother, and more accurate.
+
+## 2026-02-27 ~evening - Phase 3: Real-Time Servo Descent with NUDGE
+
+### Context
+
+Continuing from the Phase 1-2 work (franka-rt ZMQ proxy). Now implementing Phase 3: smooth descent via panda-py's `JointPosition` controller at 1kHz with NUDGE visual corrections at ~10-30Hz.
+
+### Approach 1: JointPosition Controller Streaming (20mm/s)
+
+**Implementation:** `franka_rt/servo.py` with `NudgeRTServo` class. Start JointPosition controller (impedance mode at 1kHz), then update joint targets from Python at ~30Hz. Each loop: lower target Z by descent_rate×dt, solve IK, call `ctrl.set_control(new_q)`.
+
+**First test at 20mm/s (open-loop, no NUDGE):**
+- 207 loops, 6.96s descent, **0 IK failures** — perfectly smooth motion
+- Gripper width 0.0294m — successfully grasped a green block
+- Key parameters: `filter_coeff=0.05`, stiffness=[600,600,600,600,250,150,50], damping=[50,50,50,20,20,20,10]
+
+**Result:** The smooth descent works beautifully at slow speed. Night-and-day difference from the jerky 4cm incremental steps.
+
+### Approach 2: Speed Up to 60mm/s
+
+**Problem:** At 60mm/s with `filter_coeff=0.05`, the commanded position ran ahead of the actual robot position. The low-pass filter introduced too much lag. Robot only descended halfway (z=0.10 vs target z=0.013), then snapped sideways and grasped air.
+
+**Attempted fixes:**
+1. Increased filter_coeff from 0.05 to 0.2 — still only partial descent
+2. Added settle phase with timeout — final `move_to_joint_position` fallback got to target Z, but XY drifted
+3. Closed-loop Z tracking (read actual panda.q each loop) — 68 IK failures (33%!), because the actual robot state mid-tracking produces terrible IK seeds
+4. IK seed resync on failure — helped slightly, still unreliable
+
+**Key insight: IK must be chain-seeded from COMMANDED targets, not actual robot state.** The actual joint positions during impedance tracking lag behind and are not good IK seeds. Using the commanded chain (which we know is valid IK) gives 0 failures.
+
+### Approach 3: Pre-Computed Waypoint Trajectory
+
+**Idea:** Give up on real-time JointPosition streaming for now. Pre-compute IK at every 5mm Z interval, send all waypoints as a single `move_to_joint_position(waypoints, speed_factor)`. panda-py's internal trajectory planner handles velocity/acceleration/jerk properly.
+
+**Test at speed_factor=0.25:**
+- 28 waypoints (5mm steps from z=0.15 to z=0.013)
+- **0 IK failures**, 3.23s descent
+- Gripper width 0.0296m — successful grasp
+- Total servo time 4.86s
+
+**Result:** Reliable, smooth, fast. But no mid-trajectory corrections possible (open-loop).
+
+### Approach 4: JointPosition + NUDGE (The Real Deal)
+
+Went back to JointPosition streaming with lessons learned:
+- `filter_coeff=0.3` (responsive but smooth)
+- `descent_rate=0.040` (40mm/s — fast but trackable)
+- IK chain-seeded from COMMANDED targets (not actual panda.q)
+- Camera frames via fresh-socket-per-frame (not CONFLATE — multipart messages + CONFLATE causes ZMQ `!_more` assertion crash)
+- NUDGE ONNX inference in the main loop (~15ms per frame)
+
+**Test with NUDGE enabled:**
+- 104 loops, 10.39s descent, **0 IK failures**, 104 NUDGE corrections applied
+- Loop rate ~10Hz (not 30Hz — fresh-socket-per-frame overhead ~70ms)
+- Reached target Z correctly (z=0.016)
+- **Grasped empty** — NUDGE pushed XY off by constant +2.8mm X bias
+
+**NUDGE model diagnosis:** Every single step outputs `x=+nudge, y=aligned, z=+nudge` (class predictions constant regardless of camera image). The model is severely undertrained (216 approaches, 1087 frames, heavy overfit with train_loss=0.58 vs val_loss=5.99). It's applying a constant +2.8mm X correction per step that accumulates.
+
+### Architecture Validated
+
+Despite the NUDGE model being useless, the full pipeline works end-to-end:
+
+```
+Camera daemon (30fps) → ZMQ fresh-socket → NUDGE ONNX (15ms) → XY correction
+    → IK solve → ctrl.set_control() → JointPosition controller (1kHz) → Robot
+```
+
+- franka-rt holds panda-py connection, runs JointPosition controller
+- Camera frames arrive at ~10Hz (limited by socket overhead, not model speed)
+- NUDGE inference is fast enough (15-17ms on Pi CPU)
+- IK chain-seeding from commanded position gives 0 failures at 40mm/s
+- Low-pass filtered corrections with per-step clamp prevent instability
+
+### ZMQ CONFLATE + Multipart = Crash
+
+**Critical finding:** Using `zmq.CONFLATE=1` with multipart messages (topic + metadata + jpeg) causes `Assertion failed: !_more (src/fq.cpp:80)` — crashes the process. CONFLATE drops "older" messages but can corrupt multipart message boundaries, leaving a partial message that triggers the assertion.
+
+**Fix:** Use fresh-socket-per-frame (create SUB, connect, recv_multipart, close). Adds ~70ms overhead per frame but is safe. This is the same pattern used by the camera daemon client (`_fresh_recv()`).
+
+### Key Learnings
+
+**49. Chain-seed IK from commanded targets, not actual robot state.** During impedance-controlled tracking, the actual joint positions lag behind the commanded targets. Using actual panda.q as IK seeds causes cascade failures (33% failure rate). Using the commanded chain gives 0% failures because each solution is close to the previous valid solution.
+
+**50. ZMQ CONFLATE is unsafe with multipart messages.** Use fresh-socket-per-frame instead. The ~70ms overhead is acceptable for servo control (~10Hz update rate).
+
+**51. JointPosition controller filter_coeff matters enormously.** Too low (0.05) = the controller can't track fast targets, overshoots and snaps. Too high (1.0) = no smoothing, jerky motion from discrete IK updates. Sweet spot: 0.2-0.3 for 40mm/s descent.
+
+**52. The NUDGE model is the bottleneck, not the servo infrastructure.** With 216 training approaches and heavy overfit, the model outputs constant predictions. Needs 5-10x more data (1000+ approaches) to be position-dependent. Data collection is the priority.
+
+### Next Steps
+
+1. **Collect more NUDGE training data** — run autonomous pick cycles with `nudge_collect_enable`, aim for 1000+ approaches over the weekend. Widened perturbation from ±20mm to ±35mm for more diversity.
+2. **Retrain on Spark** — should see position-dependent corrections with enough data
+3. **Optimize camera loop** — consider keeping a persistent socket with manual multipart assembly, or a dedicated camera thread, to get closer to 30Hz
+4. **Speed up descent** — once NUDGE model is reliable, test 60-80mm/s with higher filter_coeff
+5. **Diversify training objects** — RGMC "Picking from Clutter" uses YCB-like household items (soup cans, cloth napkins, bananas, bottles, boxes). Start mixing these into the workspace alongside blocks to train on shape/texture diversity. The NUDGE model needs to generalize beyond colored blocks on a flat table.

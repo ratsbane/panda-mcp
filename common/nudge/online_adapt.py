@@ -86,6 +86,10 @@ class OnlineAdapter:
         self._total_corrections_applied = 0
         self._session_start = None
 
+        # Test bias injection (for convergence testing)
+        self._test_bias_x = 0.0
+        self._test_bias_y = 0.0
+
         # Persistent log
         self._data_dir = DATA_DIR
         self._data_dir.mkdir(parents=True, exist_ok=True)
@@ -115,6 +119,30 @@ class OnlineAdapter:
         )
         return status
 
+    def set_test_bias(self, bias_x_m: float = 0.0, bias_y_m: float = 0.0) -> dict:
+        """
+        Inject artificial position bias for convergence testing.
+
+        The bias is added to the robot's target AFTER the adapter correction,
+        simulating systematic calibration error. The adapter should learn to
+        cancel it. Set both to 0 to disable.
+        """
+        self._test_bias_x = bias_x_m
+        self._test_bias_y = bias_y_m
+        logger.info(
+            f"Test bias set: dx={bias_x_m*1000:.1f}mm dy={bias_y_m*1000:.1f}mm"
+        )
+        return {
+            "test_bias_mm": {
+                "dx": round(bias_x_m * 1000, 1),
+                "dy": round(bias_y_m * 1000, 1),
+            }
+        }
+
+    def get_test_bias(self) -> Tuple[float, float]:
+        """Return current test bias (x, y) in meters."""
+        return (self._test_bias_x, self._test_bias_y)
+
     def reset(self):
         """Clear all history and reset EMA."""
         self._history.clear()
@@ -123,6 +151,8 @@ class OnlineAdapter:
         self._total_picks = 0
         self._total_successful = 0
         self._total_corrections_applied = 0
+        self._test_bias_x = 0.0
+        self._test_bias_y = 0.0
         logger.info("Online adaptation reset")
 
     def get_correction(self, target_x: float, target_y: float) -> Tuple[float, float]:
@@ -242,6 +272,10 @@ class OnlineAdapter:
             "current_correction_mm": {
                 "dx": round(self._ema_dx * 1000, 1),
                 "dy": round(self._ema_dy * 1000, 1),
+            },
+            "test_bias_mm": {
+                "dx": round(self._test_bias_x * 1000, 1),
+                "dy": round(self._test_bias_y * 1000, 1),
             },
             "config": {
                 "ema_alpha": self.config.ema_alpha,
