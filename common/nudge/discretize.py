@@ -1,48 +1,40 @@
 """
 Offset discretization for NUDGE.
 
-Maps continuous offsets (meters) to discrete classes {-3..+3} and back.
-Per-axis exponential thresholds (base 3x) matched to each axis's natural range:
+3-class scheme: negative / aligned / positive per axis.
 
-XY thresholds [2, 6, 18]mm — gripper lateral corrections:
-| Class | Label   | Offset range  |
-|-------|---------|---------------|
-|   0   | aligned | < 2mm         |
-|   1   | nudge   | 2 - 6mm       |
-|   2   | shift   | 6 - 18mm      |
-|   3   | jump    | > 18mm        |
+XY threshold: 4mm
+| Class | Label    | Offset range     |
+|-------|----------|------------------|
+|   0   | negative | offset < -4mm    |
+|   1   | aligned  | |offset| <= 4mm  |
+|   2   | positive | offset > +4mm    |
 
-Z thresholds [8, 24, 72]mm — approach descent corrections:
-| Class | Label   | Offset range  |
-|-------|---------|---------------|
-|   0   | aligned | < 8mm         |
-|   1   | nudge   | 8 - 24mm      |
-|   2   | shift   | 24 - 72mm     |
-|   3   | jump    | > 72mm        |
+Z threshold: 15mm
+| Class | Label    | Offset range     |
+|-------|----------|------------------|
+|   0   | negative | offset < -15mm   |
+|   1   | aligned  | |offset| <= 15mm |
+|   2   | positive | offset > +15mm   |
 
-Sign determines direction: negative classes = negative offset direction.
-Class index in [0, 6] maps to signed class in [-3, +3] via: signed = index - 3.
+Representative magnitudes: 8mm for XY, 30mm for Z (used for class->continuous).
 """
 
 from dataclasses import dataclass, field
 from typing import List
 
+NUM_CLASSES = 3
+
 
 @dataclass
 class DiscretizeConfig:
-    """Thresholds for magnitude bins (in meters), per axis."""
-    # Boundaries between magnitude classes (ascending, in meters)
-    # Class 0: [0, thresholds[0])
-    # Class 1: [thresholds[0], thresholds[1])
-    # Class 2: [thresholds[1], thresholds[2])
-    # Class 3: [thresholds[2], inf)
-    thresholds_xy: List[float] = field(default_factory=lambda: [0.002, 0.006, 0.018])
-    thresholds_z: List[float] = field(default_factory=lambda: [0.008, 0.024, 0.072])
+    """Single threshold per axis separating negative / aligned / positive."""
+    threshold_xy: float = 0.004   # 4mm
+    threshold_z: float = 0.015    # 15mm
 
-    # Representative magnitudes for each class (meters), used for class->continuous
-    # Midpoint of each bin (last bin uses 1.5x the upper threshold)
-    representatives_xy: List[float] = field(default_factory=lambda: [0.0, 0.004, 0.012, 0.025])
-    representatives_z: List[float] = field(default_factory=lambda: [0.0, 0.016, 0.048, 0.100])
+    # Representative magnitude for non-aligned classes (meters)
+    representative_xy: float = 0.008   # 8mm
+    representative_z: float = 0.030    # 30mm
 
 
 DEFAULT_CONFIG = DiscretizeConfig()
@@ -54,32 +46,21 @@ def continuous_to_class(
     config: DiscretizeConfig = DEFAULT_CONFIG,
 ) -> int:
     """
-    Convert a continuous offset (meters, signed) to a class index [0, 6].
-
-    Args:
-        offset_m: Signed offset in meters.
-        axis: One of "x", "y", "z". X and Y use lateral thresholds, Z uses descent thresholds.
-        config: Discretization config.
+    Convert a continuous offset (meters, signed) to a class index [0, 2].
 
     Returns:
-        Class index 3 = aligned (0). Index 0 = -3 (large negative). Index 6 = +3 (large positive).
+        0 = negative (needs negative correction)
+        1 = aligned (within threshold)
+        2 = positive (needs positive correction)
     """
-    thresholds = config.thresholds_z if axis == "z" else config.thresholds_xy
+    threshold = config.threshold_z if axis == "z" else config.threshold_xy
 
-    sign = 1 if offset_m >= 0 else -1
-    mag = abs(offset_m)
-
-    # Determine magnitude class (0-3)
-    mag_class = 0
-    for i, thresh in enumerate(thresholds):
-        if mag >= thresh:
-            mag_class = i + 1
-        else:
-            break
-
-    # Convert signed magnitude class to index [0, 6]
-    signed_class = sign * mag_class  # range [-3, +3]
-    return signed_class + 3  # range [0, 6]
+    if offset_m < -threshold:
+        return 0  # negative
+    elif offset_m > threshold:
+        return 2  # positive
+    else:
+        return 1  # aligned
 
 
 def class_to_continuous(
@@ -88,29 +69,30 @@ def class_to_continuous(
     config: DiscretizeConfig = DEFAULT_CONFIG,
 ) -> float:
     """
-    Convert a class index [0, 6] to a representative offset in meters.
+    Convert a class index [0, 2] to a representative offset in meters.
 
-    Returns signed value: negative for classes 0-2, zero for class 3, positive for classes 4-6.
+    Returns: negative value for class 0, zero for class 1, positive for class 2.
     """
-    reps = config.representatives_z if axis == "z" else config.representatives_xy
+    rep = config.representative_z if axis == "z" else config.representative_xy
 
-    signed = cls_index - 3  # [-3, +3]
-    sign = 1 if signed >= 0 else -1
-    mag_class = abs(signed)  # [0, 3]
-    return sign * reps[mag_class]
+    if cls_index == 0:
+        return -rep
+    elif cls_index == 2:
+        return rep
+    else:
+        return 0.0
 
 
 def class_label(cls_index: int) -> str:
     """Human-readable label for a class index."""
-    signed = cls_index - 3
-    mag = abs(signed)
-    labels = ["aligned", "nudge", "shift", "jump"]
-    direction = "" if signed == 0 else ("+" if signed > 0 else "-")
-    return f"{direction}{labels[mag]}"
+    labels = ["negative", "aligned", "positive"]
+    if 0 <= cls_index < len(labels):
+        return labels[cls_index]
+    return f"unknown({cls_index})"
 
 
 if __name__ == "__main__":
-    print("=== XY discretization ===")
+    print("=== XY discretization (3-class) ===")
     test_offsets = [0.0, 0.001, -0.003, 0.005, -0.008, 0.012, -0.020, 0.030]
     for offset in test_offsets:
         cls = continuous_to_class(offset, axis="x")
@@ -118,7 +100,7 @@ if __name__ == "__main__":
         label = class_label(cls)
         print(f"  {offset*1000:+7.1f}mm -> class {cls} ({label:>8s}) -> {back*1000:+7.1f}mm")
 
-    print("\n=== Z discretization ===")
+    print("\n=== Z discretization (3-class) ===")
     test_offsets = [0.0, 0.005, -0.010, 0.020, -0.030, 0.050, -0.080, 0.100]
     for offset in test_offsets:
         cls = continuous_to_class(offset, axis="z")
@@ -126,14 +108,9 @@ if __name__ == "__main__":
         label = class_label(cls)
         print(f"  {offset*1000:+7.1f}mm -> class {cls} ({label:>8s}) -> {back*1000:+7.1f}mm")
 
-    print("\n=== All XY classes ===")
-    for i in range(7):
-        val = class_to_continuous(i, axis="x")
+    print("\n=== All classes ===")
+    for i in range(NUM_CLASSES):
+        val_xy = class_to_continuous(i, axis="x")
+        val_z = class_to_continuous(i, axis="z")
         label = class_label(i)
-        print(f"  class {i} = {label:>8s} = {val*1000:+6.1f}mm")
-
-    print("\n=== All Z classes ===")
-    for i in range(7):
-        val = class_to_continuous(i, axis="z")
-        label = class_label(i)
-        print(f"  class {i} = {label:>8s} = {val*1000:+6.1f}mm")
+        print(f"  class {i} = {label:>8s} = XY:{val_xy*1000:+6.1f}mm  Z:{val_z*1000:+6.1f}mm")

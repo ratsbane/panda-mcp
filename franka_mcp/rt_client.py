@@ -226,7 +226,7 @@ class FrankaRTClient:
 
     def servo_pick(self, **kwargs) -> dict:
         """Run NUDGE servo pick (Phase 3)."""
-        return self.send_command(CMD_SERVO_PICK, timeout_ms=30_000, **kwargs)
+        return self.send_command(CMD_SERVO_PICK, timeout_ms=60_000, **kwargs)
 
     def servo_status(self) -> dict:
         """Get servo status."""

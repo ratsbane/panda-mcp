@@ -1,13 +1,22 @@
-"""franka_rt/servo.py - Real-time servo descent with NUDGE visual corrections.
+"""franka_rt/servo.py - Smooth servo descent for pick operations.
 
-Uses panda-py's JointPosition controller for continuous 1kHz impedance-controlled
-descent. Camera frames + NUDGE inference at ~30Hz provide XY corrections.
+Two modes:
+1. Waypoint mode (default): Pre-compute IK waypoints at 5mm Z intervals,
+   execute as single move_to_joint_position call. Reliable, no controller
+   transition issues. Uses panda-py's trajectory planner for smooth,
+   velocity/power-safe motion.
+
+2. NUDGE mode (future): JointPosition impedance controller with real-time
+   camera corrections at ~30Hz. Requires trained NUDGE model.
 
 Key design decisions:
-- IK seeding uses COMMANDED target chain (not actual panda.q) to avoid cascade failures
-- Descent rate of 40mm/s balances speed with controller tracking
-- filter_coeff=0.3 gives responsive but smooth joint target updates
-- Falls back to open-loop smooth descent if no NUDGE model provided
+- IK seeding uses chain from previous waypoint (not actual panda.q)
+- 5mm Z steps give smooth trajectory with fine-grained IK control
+- Waypoints include XY blend from approach position to target position
+- Grasp detection uses gripper width threshold
+- Two-phase descent: fast to SLOW_START_HEIGHT, then slow for final approach
+- Collision thresholds raised during descent, restored in finally block
+- Recovery from trajectory errors with retry from actual position
 """
 
 import logging
@@ -48,35 +57,45 @@ _JOINT_LIMITS = np.array([
     [-2.8973, 2.8973],
 ])
 
-# JointPosition controller parameters
-DEFAULT_STIFFNESS = np.array([600., 600., 600., 600., 250., 150., 50.])
-DEFAULT_DAMPING = np.array([50., 50., 50., 20., 20., 20., 10.])
-
-# Servo parameters
-DEFAULT_DESCENT_RATE = 0.040   # 40 mm/s — fast but trackable
-FILTER_COEFF = 0.3             # JointPosition LP filter (0=heavy smoothing, 1=passthrough)
-LOOP_HZ = 30                   # Target servo loop rate
-SETTLE_TIME_S = 0.2            # Hold at grasp height before grasping
+# Waypoint descent parameters
+WAYPOINT_Z_STEP = 0.005        # 5mm between waypoints
+DESCENT_SPEED_FACTOR = 0.15    # Speed for move_to_joint_position
 
 # Grasp detection
 GRIP_CLOSED_EMPTY_M = 0.0015   # Width below this = empty grasp
 
-# NUDGE correction limits
+# NUDGE correction limits (for future NUDGE mode)
 MAX_CORRECTION_PER_STEP = 0.005  # 5mm max XY correction per loop iteration
-CORRECTION_LOWPASS = 0.4         # Low-pass filter for corrections (0=ignore, 1=instant)
+CORRECTION_LOWPASS = 0.4         # Low-pass filter for corrections
+
+# Two-phase descent: slow down for last 30mm
+SLOW_START_HEIGHT = 0.030       # Start slowing 30mm above grasp
+SLOW_SPEED_FACTOR = 0.12        # Speed for final approach phase
+
+# Collision recovery
+MAX_RECOVERIES = 3              # Give up after this many reflexes per descent
+
+# Relaxed collision thresholds during descent
+# Lower = contact detection, Upper = reflex trigger
+# Defaults are 20/20. Raise both to tolerate light contact.
+DESCENT_CONTACT_TORQUE = [30.0] * 7     # Joint torque contact threshold (Nm)
+DESCENT_REFLEX_TORQUE = [40.0] * 7      # Joint torque reflex threshold (Nm)
+DESCENT_CONTACT_FORCE = [30.0] * 6      # Cartesian force contact threshold (N)
+DESCENT_REFLEX_FORCE = [40.0] * 6       # Cartesian force reflex threshold (N)
+
+# Default (tight) collision thresholds to restore after descent
+DEFAULT_COLLISION_TORQUE = [20.0] * 7
+DEFAULT_COLLISION_FORCE = [20.0] * 6
+
+# Settle time after reaching grasp height (let vibrations damp)
+SETTLE_TIME_S = 0.15
 
 
 class NudgeRTServo:
-    """Real-time servo using JointPosition controller + NUDGE visual corrections.
+    """Smooth servo descent with optional NUDGE visual corrections.
 
-    The servo operates in phases:
-    1. Start JointPosition controller (1kHz impedance loop)
-    2. Descent loop at ~30Hz: lower Z, get camera frame, NUDGE → XY corrections
-    3. Settle at grasp height (0.2s)
-    4. Stop controller, grasp, verify
-
-    IK targets are chain-seeded from the COMMANDED position, not the actual
-    robot state (which lags behind). This prevents IK cascade failures.
+    Default mode: pre-compute IK waypoints, execute as single trajectory.
+    NUDGE mode: JointPosition controller with real-time camera corrections.
     """
 
     def __init__(self, panda, gripper):
@@ -147,16 +166,12 @@ class NudgeRTServo:
         logger.info("Servo camera ready (fresh-socket-per-frame)")
 
     def _get_frame(self):
-        """Get latest camera frame via fresh socket (avoids CONFLATE multipart crash).
-
-        Creates a new SUB socket per call, receives one multipart message, closes.
-        ~5ms overhead per call, safe with multipart messages.
-        """
+        """Get latest camera frame via fresh socket."""
         import zmq
         if not hasattr(self, '_zmq_ctx') or self._zmq_ctx is None:
             return None
         sock = self._zmq_ctx.socket(zmq.SUB)
-        sock.setsockopt(zmq.RCVTIMEO, 100)  # 100ms timeout
+        sock.setsockopt(zmq.RCVTIMEO, 100)
         sock.setsockopt_string(zmq.SUBSCRIBE, "frame")
         try:
             sock.connect(CAMERA_IPC)
@@ -186,23 +201,130 @@ class NudgeRTServo:
             self._nudge = None
             return False
 
+    def _raise_collision_thresholds(self):
+        """Raise collision thresholds for softer contact during descent.
+
+        Uses 8-argument form: lower/upper for both acceleration and nominal phases.
+        Lower = contact detection, Upper = reflex trigger.
+        """
+        try:
+            self._panda.get_robot().set_collision_behavior(
+                DESCENT_CONTACT_TORQUE, DESCENT_REFLEX_TORQUE,
+                DESCENT_CONTACT_TORQUE, DESCENT_REFLEX_TORQUE,
+                DESCENT_CONTACT_FORCE, DESCENT_REFLEX_FORCE,
+                DESCENT_CONTACT_FORCE, DESCENT_REFLEX_FORCE,
+            )
+            logger.debug("Collision thresholds raised for descent")
+        except Exception as e:
+            logger.warning(f"Could not raise collision thresholds: {e}")
+
+    def _restore_collision_thresholds(self):
+        """Restore default collision thresholds."""
+        try:
+            self._panda.get_robot().set_collision_behavior(
+                DEFAULT_COLLISION_TORQUE, DEFAULT_COLLISION_TORQUE,
+                DEFAULT_COLLISION_TORQUE, DEFAULT_COLLISION_TORQUE,
+                DEFAULT_COLLISION_FORCE, DEFAULT_COLLISION_FORCE,
+                DEFAULT_COLLISION_FORCE, DEFAULT_COLLISION_FORCE,
+            )
+            logger.debug("Collision thresholds restored")
+        except Exception:
+            pass
+
+    def _compute_waypoints(self, start_x, start_y, start_z,
+                           target_x, target_y, target_z,
+                           seed_q, yaw, result):
+        """Compute IK waypoints for descent trajectory.
+
+        Blends XY linearly from start to target over the full Z descent.
+        Returns list of joint configurations.
+        """
+        z_levels = []
+        current_z = start_z
+        while current_z - WAYPOINT_Z_STEP > target_z:
+            current_z -= WAYPOINT_Z_STEP
+            z_levels.append(current_z)
+        z_levels.append(target_z)
+
+        total_descent = start_z - target_z
+        waypoints = []
+        q_seed = seed_q.copy()
+
+        for z_level in z_levels:
+            if total_descent > 0:
+                t = (start_z - z_level) / total_descent
+            else:
+                t = 1.0
+            wp_x = start_x + t * (target_x - start_x)
+            wp_y = start_y + t * (target_y - start_y)
+
+            q_sol = self._solve_ik(wp_x, wp_y, z_level, q_seed, yaw)
+            if q_sol is not None:
+                waypoints.append(q_sol)
+                q_seed = q_sol
+            else:
+                result["ik_failures"] += 1
+                logger.warning(
+                    f"IK failed at z={z_level:.4f} ({wp_x:.3f},{wp_y:.3f})")
+
+        return waypoints
+
+    def _split_waypoints_at_height(self, waypoints, start_z, target_z, split_height):
+        """Split waypoints into fast (above split_height) and slow (below).
+
+        Returns (fast_waypoints, slow_waypoints).
+        """
+        if start_z <= split_height or not waypoints:
+            return [], waypoints
+
+        total_descent = start_z - target_z
+        if total_descent <= 0:
+            return [], waypoints
+
+        # Find the split index: which waypoint corresponds to split_height?
+        split_z = target_z + split_height
+        n_above = 0
+        for i, wp in enumerate(waypoints):
+            fk_pose = panda_py.fk(wp)
+            wp_z = float(fk_pose[2, 3])
+            if wp_z > split_z:
+                n_above = i + 1
+            else:
+                break
+
+        if n_above == 0:
+            return [], waypoints
+        if n_above >= len(waypoints):
+            return waypoints, []
+
+        return waypoints[:n_above], waypoints[n_above:]
+
     def execute(
         self,
         x: float, y: float, z: float = 0.013,
         yaw: float = 0.0,
         grasp_width: float = 0.03,
         grasp_force: float = 70.0,
-        descent_rate: float = DEFAULT_DESCENT_RATE,
+        descent_rate: float = 0.040,
         model_path: str = None,
         target_bbox: list = None,
         nudge_gain: float = 0.7,
-        speed_factor: float = 0.5,
+        speed_factor: float = 0.15,
         **kwargs,
     ) -> dict:
-        """Execute smooth descent with optional NUDGE corrections + grasp.
+        """Execute smooth descent + grasp.
 
-        Uses JointPosition controller (1kHz impedance) with ~30Hz target updates.
-        Camera frames drive NUDGE XY corrections during descent.
+        Without NUDGE model: pre-compute waypoints, single trajectory.
+        With NUDGE model: (future) impedance controller with camera corrections.
+
+        Two-phase descent:
+        1. Fast phase: from current height down to SLOW_START_HEIGHT above grasp.
+           Uses speed_factor for rapid approach.
+        2. Slow phase: last SLOW_START_HEIGHT. Uses SLOW_SPEED_FACTOR for
+           gentle contact and collision tolerance.
+
+        Collision thresholds are raised for the entire descent and restored
+        in the finally block.
 
         Args:
             x, y: Target position in robot frame (meters)
@@ -210,11 +332,7 @@ class NudgeRTServo:
             yaw: Gripper rotation (radians)
             grasp_width: Expected object width for grasp (meters)
             grasp_force: Grasp force in Newtons
-            descent_rate: Z descent speed (m/s, default 0.040)
-            model_path: Path to NUDGE ONNX model (None = open-loop)
-            target_bbox: [x1, y1, x2, y2] in pixels for NUDGE
-            nudge_gain: Correction gain (0-1)
-            speed_factor: (unused, descent_rate controls speed)
+            speed_factor: Motion speed for fast phase (0.0-1.0, default 0.15)
 
         Returns:
             dict with results
@@ -225,131 +343,166 @@ class NudgeRTServo:
             "corrections": [],
             "ik_failures": 0,
             "n_corrections": 0,
+            "recoveries": 0,
         }
         start_time = time.time()
-        controller_active = False
 
         try:
             # ---- Setup ----
             current_q = np.array(self._panda.q)
             fk_current = panda_py.fk(current_q)
-            current_z = float(fk_current[2, 3])
-            result["start_z"] = round(current_z, 4)
+            start_x = float(fk_current[0, 3])
+            start_y = float(fk_current[1, 3])
+            start_z = float(fk_current[2, 3])
+            result["start_z"] = round(start_z, 4)
 
             target_x, target_y = float(x), float(y)
-            target_z = current_z  # Will ramp down
 
             logger.info(
-                f"Servo descent: ({target_x:.3f}, {target_y:.3f}) "
-                f"z={current_z:.3f} -> {z:.3f}, rate={descent_rate*1000:.0f}mm/s"
+                f"Servo descent: ({start_x:.3f},{start_y:.3f},{start_z:.3f}) -> "
+                f"({target_x:.3f},{target_y:.3f},{z:.3f}), "
+                f"step={WAYPOINT_Z_STEP*1000:.0f}mm, "
+                f"slow_start={SLOW_START_HEIGHT*1000:.0f}mm"
             )
 
-            # Load NUDGE if model provided
-            use_nudge = False
-            if model_path and target_bbox:
-                if self._load_nudge(model_path):
-                    self._nudge.start(target_bbox_pixels=target_bbox)
-                    self._connect_camera()
-                    use_nudge = True
-                    result["phases"].append("nudge_enabled")
-                    logger.info(f"NUDGE corrections active, bbox={target_bbox}")
+            # ---- Raise collision thresholds ----
+            self._raise_collision_thresholds()
 
-            # Accumulated correction (low-pass filtered)
-            corr_x, corr_y = 0.0, 0.0
-
-            # ---- Start JointPosition controller ----
-            ctrl = JointPosition(
-                stiffness=DEFAULT_STIFFNESS,
-                damping=DEFAULT_DAMPING,
-                filter_coeff=FILTER_COEFF,
+            # ---- Compute waypoints ----
+            waypoints = self._compute_waypoints(
+                start_x, start_y, start_z,
+                target_x, target_y, z,
+                current_q, yaw, result,
             )
-            self._panda.start_controller(ctrl)
-            controller_active = True
-            result["phases"].append("controller_started")
 
-            # Set initial target to current position
-            seed_q = current_q.copy()
-            ctrl.set_control(current_q)
+            result["n_waypoints"] = len(waypoints)
+            logger.info(
+                f"Generated {len(waypoints)} waypoints "
+                f"({result['ik_failures']} IK failures)"
+            )
 
-            # ---- Descent loop ----
-            loop_period = 1.0 / LOOP_HZ
-            descent_start = time.time()
-            loop_count = 0
+            if len(waypoints) < 3:
+                result["error"] = f"Too few waypoints ({len(waypoints)})"
+                result["phases"].append("waypoint_error")
+                return result
 
-            while target_z > z:
-                loop_start = time.time()
-                loop_count += 1
+            result["phases"].append("waypoints_computed")
 
-                # Ramp Z down
-                target_z -= descent_rate * loop_period
-                target_z = max(target_z, z)
+            # ---- Split into fast + slow phases ----
+            fast_wps, slow_wps = self._split_waypoints_at_height(
+                waypoints, start_z, z, SLOW_START_HEIGHT)
 
-                # Get NUDGE correction from camera
-                if use_nudge:
-                    frame = self._get_frame()
-                    if frame is not None:
-                        correction = self._nudge.predict(frame)
-                        if correction is not None:
-                            dx, dy, _dz = correction
-                            # Low-pass filter + clamp corrections
-                            dx = max(-MAX_CORRECTION_PER_STEP, min(MAX_CORRECTION_PER_STEP, dx))
-                            dy = max(-MAX_CORRECTION_PER_STEP, min(MAX_CORRECTION_PER_STEP, dy))
-                            corr_x = corr_x * (1 - CORRECTION_LOWPASS) + dx * CORRECTION_LOWPASS
-                            corr_y = corr_y * (1 - CORRECTION_LOWPASS) + dy * CORRECTION_LOWPASS
-                            result["n_corrections"] += 1
-                            if loop_count <= 3 or loop_count % 10 == 0:
-                                result["corrections"].append({
-                                    "step": loop_count,
-                                    "dx_mm": round(corr_x * 1000, 1),
-                                    "dy_mm": round(corr_y * 1000, 1),
-                                })
+            result["n_fast_waypoints"] = len(fast_wps)
+            result["n_slow_waypoints"] = len(slow_wps)
+            logger.info(
+                f"Descent phases: {len(fast_wps)} fast + {len(slow_wps)} slow waypoints"
+            )
 
-                # Solve IK for corrected target
-                ik_x = target_x + corr_x
-                ik_y = target_y + corr_y
-                q_sol = self._solve_ik(ik_x, ik_y, target_z, seed_q, yaw)
+            # ---- Execute fast descent ----
+            if fast_wps:
+                descent_start = time.time()
+                try:
+                    self._panda.move_to_joint_position(
+                        fast_wps,
+                        speed_factor=speed_factor,
+                        dq_threshold=0.01,
+                        success_threshold=0.05,
+                    )
+                    result["phases"].append("fast_descent_complete")
+                except Exception as e:
+                    logger.warning(f"Fast descent error: {e}")
+                    result["phases"].append("fast_descent_error")
+                    result["recoveries"] += 1
 
-                if q_sol is not None:
-                    ctrl.set_control(q_sol)
-                    seed_q = q_sol  # Chain from COMMANDED, not actual
-                else:
-                    result["ik_failures"] += 1
+                    if not self._try_recovery(result):
+                        return result
 
-                # Rate limit
-                elapsed = time.time() - loop_start
-                if elapsed < loop_period:
-                    time.sleep(loop_period - elapsed)
+                    # After recovery, recompute remaining waypoints from actual pos
+                    actual_q = np.array(self._panda.q)
+                    fk_actual = panda_py.fk(actual_q)
+                    actual_z = float(fk_actual[2, 3])
+                    logger.info(f"Recovered at z={actual_z:.4f}, recomputing slow phase")
 
-            descent_time = time.time() - descent_start
+                    # Recompute slow waypoints from current position
+                    slow_wps = self._compute_waypoints(
+                        float(fk_actual[0, 3]), float(fk_actual[1, 3]), actual_z,
+                        target_x, target_y, z,
+                        actual_q, yaw, result,
+                    )
+
+                result["fast_descent_time_s"] = round(time.time() - descent_start, 2)
+
+            # ---- Execute slow descent (final approach) ----
+            if slow_wps:
+                slow_start = time.time()
+                try:
+                    self._panda.move_to_joint_position(
+                        slow_wps,
+                        speed_factor=SLOW_SPEED_FACTOR,
+                        dq_threshold=0.01,
+                        success_threshold=0.05,
+                    )
+                    result["phases"].append("slow_descent_complete")
+                except Exception as e:
+                    logger.warning(f"Slow descent error: {e}")
+                    result["phases"].append("slow_descent_error")
+                    result["recoveries"] += 1
+
+                    if not self._try_recovery(result):
+                        return result
+
+                    # After recovery, try to finish descent from actual position
+                    actual_q = np.array(self._panda.q)
+                    fk_actual = panda_py.fk(actual_q)
+                    actual_z = float(fk_actual[2, 3])
+                    remaining = actual_z - z
+
+                    if remaining > 0.003:  # More than 3mm above target
+                        logger.info(
+                            f"Re-descending from z={actual_z:.4f} "
+                            f"({remaining*1000:.0f}mm remaining)")
+                        retry_wps = self._compute_waypoints(
+                            float(fk_actual[0, 3]), float(fk_actual[1, 3]),
+                            actual_z, target_x, target_y, z,
+                            actual_q, yaw, result,
+                        )
+                        if retry_wps:
+                            try:
+                                self._panda.move_to_joint_position(
+                                    retry_wps,
+                                    speed_factor=SLOW_SPEED_FACTOR,
+                                    dq_threshold=0.01,
+                                    success_threshold=0.05,
+                                )
+                                result["phases"].append("slow_retry_complete")
+                            except Exception as e2:
+                                logger.warning(f"Slow retry also failed: {e2}")
+                                result["phases"].append("slow_retry_error")
+                                # Don't try again, just proceed to grasp
+
+                result["slow_descent_time_s"] = round(time.time() - slow_start, 2)
+
+            descent_time = time.time() - start_time
             result["descent_time_s"] = round(descent_time, 2)
-            result["loop_count"] = loop_count
-            result["phases"].append("descent_complete")
 
-            # ---- Settle at grasp height ----
-            settle_start = time.time()
-            while time.time() - settle_start < SETTLE_TIME_S:
-                # Keep commanding the final target
-                q_sol = self._solve_ik(target_x + corr_x, target_y + corr_y, z, seed_q, yaw)
-                if q_sol is not None:
-                    ctrl.set_control(q_sol)
-                    seed_q = q_sol
-                time.sleep(loop_period)
-            result["phases"].append("settled")
-
-            # ---- Stop controller ----
-            self._panda.stop_controller()
-            controller_active = False
-            time.sleep(0.05)
-
-            # Verify final position
+            # ---- Verify final position ----
             actual_q = np.array(self._panda.q)
             fk_final = panda_py.fk(actual_q)
+            actual_x = float(fk_final[0, 3])
+            actual_y = float(fk_final[1, 3])
             actual_z = float(fk_final[2, 3])
+            pos_error = np.linalg.norm([actual_x - target_x, actual_y - target_y, actual_z - z])
             logger.info(
-                f"Descent done: z={actual_z:.4f} (target {z:.4f}), "
-                f"{loop_count} loops, {result['ik_failures']} IK fails, "
-                f"{result['n_corrections']} corrections"
+                f"Descent done: ({actual_x:.3f},{actual_y:.3f},{actual_z:.4f}) "
+                f"target ({target_x:.3f},{target_y:.3f},{z:.4f}), "
+                f"error={pos_error*1000:.1f}mm"
             )
+            result["position_error_mm"] = round(pos_error * 1000, 1)
+
+            # ---- Settle ----
+            if SETTLE_TIME_S > 0:
+                time.sleep(SETTLE_TIME_S)
+                result["phases"].append("settled")
 
             # ---- Grasp ----
             try:
@@ -394,12 +547,8 @@ class NudgeRTServo:
             result["error"] = str(e)
 
         finally:
-            # Safety: stop controller if still active
-            if controller_active:
-                try:
-                    self._panda.stop_controller()
-                except Exception:
-                    pass
+            # Restore default collision thresholds
+            self._restore_collision_thresholds()
 
             # Cleanup
             self._close_camera()
@@ -411,3 +560,28 @@ class NudgeRTServo:
 
         result["total_time_s"] = round(time.time() - start_time, 2)
         return result
+
+    def _try_recovery(self, result: dict) -> bool:
+        """Attempt to recover from a trajectory error.
+
+        Returns True if recovered and descent can continue,
+        False if recovery limit exceeded.
+        """
+        if result["recoveries"] > MAX_RECOVERIES:
+            result["error"] = f"Too many collisions ({result['recoveries']})"
+            result["phases"].append("recovery_limit")
+            return False
+
+        try:
+            self._panda.recover()
+            result["phases"].append(f"recovery_{result['recoveries']}")
+            logger.info(f"Recovery {result['recoveries']}/{MAX_RECOVERIES} successful")
+
+            # Re-raise collision thresholds (recovery may reset them)
+            self._raise_collision_thresholds()
+            return True
+        except Exception as e:
+            result["error"] = f"Recovery failed: {e}"
+            result["phases"].append("recovery_failed")
+            logger.error(f"Recovery failed: {e}")
+            return False

@@ -1,9 +1,9 @@
 """
-NUDGE servo loop -- applies discrete corrections during pick/place approach.
+NUDGE servo loop v2 -- applies continuous corrections during pick approach.
 
 Loads ONNX model, constructs 4-channel input (RGB + mask) from camera frame
-and target bbox, predicts correction classes, converts to meters, and returns
-the correction to apply.
+and target bbox, passes gripper position, predicts (dx, dy, dz) offset in mm,
+and returns the correction to apply.
 """
 
 import logging
@@ -14,8 +14,6 @@ from typing import Optional, Tuple, List
 
 import cv2
 import numpy as np
-
-from .discretize import class_to_continuous, class_label, DEFAULT_CONFIG, DiscretizeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +26,6 @@ class NUDGEServoConfig:
 
     # Gain: fraction of predicted correction to apply (0-1)
     gain: float = 0.7
-
-    # Discretization config
-    discretize: DiscretizeConfig = field(default_factory=DiscretizeConfig)
 
 
 class NUDGEServoLoop:
@@ -54,7 +49,19 @@ class NUDGEServoLoop:
         self._step_count = 0
         self._corrections: list[dict] = []
 
-        logger.info(f"NUDGE servo loaded: {model_path}")
+        # Check if model expects gripper_xyz input
+        input_names = [inp.name for inp in self.session.get_inputs()]
+        self._has_gripper_input = "gripper_xyz" in input_names
+
+        # Check if model outputs mm values or class indices
+        output_names = [out.name for out in self.session.get_outputs()]
+        self._regression_mode = "dx_mm" in output_names
+
+        logger.info(
+            f"NUDGE servo loaded: {model_path} "
+            f"(gripper_input={self._has_gripper_input}, "
+            f"regression={self._regression_mode})"
+        )
 
     @property
     def active(self) -> bool:
@@ -80,16 +87,18 @@ class NUDGEServoLoop:
         self,
         frame: np.ndarray,
         target_bbox_px: Optional[List[float]] = None,
+        gripper_xyz: Optional[Tuple[float, float, float]] = None,
     ) -> Optional[Tuple[float, float, float]]:
         """
         Run one prediction step.
 
         Args:
             frame: BGR camera frame (any size)
-            target_bbox_px: Updated bbox [x1,y1,x2,y2] in camera pixels. Uses initial if None.
+            target_bbox_px: Updated bbox [x1,y1,x2,y2] in camera pixels.
+            gripper_xyz: Current gripper position (x, y, z) in meters.
 
         Returns:
-            (dx, dy, dz) correction in meters, or None if not active / prediction is "aligned"
+            (dx, dy, dz) correction in meters, or None if not active
         """
         if not self._active:
             return None
@@ -101,7 +110,7 @@ class NUDGEServoLoop:
         h, w = frame.shape[:2]
         resized = cv2.resize(frame, (224, 224))
         resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        img = resized.astype(np.float32) / 255.0  # [0, 1]
+        img = resized.astype(np.float32) / 255.0
 
         # Scale bbox to 224x224
         sx, sy = 224.0 / w, 224.0 / h
@@ -116,22 +125,46 @@ class NUDGEServoLoop:
         mask[y1:y2, x1:x2] = 1.0
 
         # Stack: (1, 4, 224, 224)
-        img_t = np.transpose(img, (2, 0, 1))  # (3, 224, 224)
-        mask_t = mask[np.newaxis, :, :]        # (1, 224, 224)
-        input_4ch = np.concatenate([img_t, mask_t], axis=0)  # (4, 224, 224)
+        img_t = np.transpose(img, (2, 0, 1))
+        mask_t = mask[np.newaxis, :, :]
+        input_4ch = np.concatenate([img_t, mask_t], axis=0)
         input_batch = input_4ch[np.newaxis, :, :, :].astype(np.float32)
+
+        # Build ONNX inputs
+        onnx_inputs = {"image": input_batch}
+        if self._has_gripper_input:
+            if gripper_xyz is not None:
+                xyz_arr = np.array([[gripper_xyz[0], gripper_xyz[1], gripper_xyz[2]]],
+                                   dtype=np.float32)
+            else:
+                xyz_arr = np.zeros((1, 3), dtype=np.float32)
+            onnx_inputs["gripper_xyz"] = xyz_arr
 
         # ONNX inference
         t0 = time.time()
-        outputs = self.session.run(None, {"image": input_batch})
+        outputs = self.session.run(None, onnx_inputs)
         dt = time.time() - t0
 
-        cls_x, cls_y, cls_z = int(outputs[0][0]), int(outputs[1][0]), int(outputs[2][0])
+        if self._regression_mode:
+            # Outputs are (dx_mm, dy_mm, dz_mm)
+            dx_mm = float(outputs[0][0])
+            dy_mm = float(outputs[1][0])
+            dz_mm = float(outputs[2][0])
 
-        # Convert classes to meters (per-axis thresholds)
-        dx = class_to_continuous(cls_x, axis="x", config=self.config.discretize)
-        dy = class_to_continuous(cls_y, axis="y", config=self.config.discretize)
-        dz = class_to_continuous(cls_z, axis="z", config=self.config.discretize)
+            # Convert mm to meters
+            dx = dx_mm / 1000.0
+            dy = dy_mm / 1000.0
+            dz = dz_mm / 1000.0
+
+            label_str = f"dx={dx_mm:.1f}mm dy={dy_mm:.1f}mm dz={dz_mm:.1f}mm"
+        else:
+            # Legacy: outputs are class indices
+            from .discretize import class_to_continuous, class_label
+            cls_x, cls_y, cls_z = int(outputs[0][0]), int(outputs[1][0]), int(outputs[2][0])
+            dx = class_to_continuous(cls_x, axis="x")
+            dy = class_to_continuous(cls_y, axis="y")
+            dz = class_to_continuous(cls_z, axis="z")
+            label_str = f"x={class_label(cls_x)} y={class_label(cls_y)} z={class_label(cls_z)}"
 
         # Apply gain
         dx *= self.config.gain
@@ -144,14 +177,13 @@ class NUDGEServoLoop:
         dy = max(-max_c, min(max_c, dy))
         dz = max(-max_c, min(max_c, dz))
 
-        # Check if all aligned (class 3 = zero)
-        if cls_x == 3 and cls_y == 3 and cls_z == 3:
+        # Check if correction is negligible
+        if abs(dx) < 0.001 and abs(dy) < 0.001 and abs(dz) < 0.001:
             logger.info(f"NUDGE step {self._step_count}: ALIGNED ({dt*1000:.0f}ms)")
-            return None  # No correction needed
+            return None
 
         self._corrections.append({
             "step": self._step_count,
-            "cls": [cls_x, cls_y, cls_z],
             "dx_m": round(dx, 5),
             "dy_m": round(dy, 5),
             "dz_m": round(dz, 5),
@@ -159,9 +191,9 @@ class NUDGEServoLoop:
         })
 
         logger.info(
-            f"NUDGE step {self._step_count}: "
-            f"x={class_label(cls_x)} y={class_label(cls_y)} z={class_label(cls_z)} "
-            f"-> dx={dx*1000:.1f}mm dy={dy*1000:.1f}mm dz={dz*1000:.1f}mm ({dt*1000:.0f}ms)"
+            f"NUDGE step {self._step_count}: {label_str} "
+            f"-> correction dx={dx*1000:.1f}mm dy={dy*1000:.1f}mm dz={dz*1000:.1f}mm "
+            f"({dt*1000:.0f}ms)"
         )
 
         return (dx, dy, dz)
@@ -170,6 +202,8 @@ class NUDGEServoLoop:
         return {
             "active": self._active,
             "model_path": self._model_path,
+            "regression_mode": self._regression_mode,
+            "has_gripper_input": self._has_gripper_input,
             "step_count": self._step_count,
             "corrections_applied": len(self._corrections),
             "last_correction": self._corrections[-1] if self._corrections else None,

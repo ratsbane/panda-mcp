@@ -1179,6 +1179,10 @@ class FrankaController:
         result = self.gripper_move(0.08)
         steps.append({"action": "open_gripper", "result": result})
 
+        # NUDGE: record frame at start (before any movement, max XY offset)
+        if nudge_active:
+            self._nudge_record_frame()
+
         # Step 2: Approach above target
         # Break into intermediate waypoints to avoid large diagonal moves
         # that cause oscillation in the motion controller
@@ -1196,6 +1200,10 @@ class FrankaController:
             steps.append({"action": "approach_xy", "method": "ik", "result": result})
             if not result.get("success"):
                 return _abort(f"approach_xy failed: {result.get('error', 'unknown')}", steps)
+
+            # NUDGE: record frame after XY approach (large Z offset remains)
+            if nudge_active:
+                self._nudge_record_frame()
 
         result = self.move_cartesian_ik(
             target_x, y, approach_height,
@@ -1580,7 +1588,12 @@ class FrankaController:
             frame = client.get_frame()
             if frame is None:
                 return None
-            return self._nudge_servo.predict(frame)
+            # Pass gripper position for v2 regression model
+            state = self.get_state()
+            ee = state.ee_position
+            return self._nudge_servo.predict(
+                frame, gripper_xyz=(ee[0], ee[1], ee[2])
+            )
         except Exception as e:
             logger.warning(f"NUDGE servo prediction failed: {e}")
             return None

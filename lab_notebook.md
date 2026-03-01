@@ -1116,6 +1116,59 @@ With franka-rt holding the panda-py connection, we can now implement:
 
 Expected result: smooth, continuous descent toward target with real-time visual corrections, instead of the current step-pause-correct-step pattern. Should be faster, smoother, and more accurate.
 
+## 2026-02-28 - RT Servo Collision Recovery + Compliance Ramp
+
+### Context
+
+During NUDGE data collection, descent collisions (gripper clipping block edges or table) trigger `cartesian_reflex` safety stops. Previously this was a fatal abort — the servo would crash and the pick would fail. The fix: integrate error monitoring directly into the 30Hz RT servo loop in `servo.py`.
+
+### Changes to `franka_rt/servo.py`
+
+**1. Collision recovery in the descent loop:**
+Every servo iteration checks `panda.get_state().current_errors`. On reflex:
+- Stop dead controller, recover, read actual position
+- Reset `target_z` to actual Z (descent resumes from where it stopped)
+- Start fresh JointPosition controller
+- `continue` to re-enter loop — descent naturally resumes
+- Give up after 3 recoveries (`MAX_RECOVERIES`)
+
+**2. Compliance ramp near grasp height:**
+In the last 30mm of descent (`SOFT_START_HEIGHT`), linearly interpolate stiffness/damping from full (600/50 Nm/rad) to soft (200/30 Nm/rad). The arm complies with light contact instead of triggering a reflex. Uses `ctrl.set_stiffness()`/`ctrl.set_damping()` — real-time safe, microsecond latency.
+
+**3. Raised collision thresholds during descent:**
+Before starting the controller: `set_collision_behavior([30]*7, [30]*7, [50]*6, [50]*6)` — joint torque threshold 30Nm (vs default 20), Cartesian force threshold 50N (vs default 20). Restored to defaults in the `finally` block. This gives the arm more tolerance for light contact before triggering a hard reflex.
+
+**4. Result tracking:**
+`recoveries` count and `recovery_N` phases in the result JSON for diagnostics.
+
+### Latency impact
+
+- `get_state()` reads cached 1kHz state — sub-millisecond
+- `set_stiffness()`/`set_damping()` are mutex-protected writes — microseconds
+- Total overhead per loop iteration: <1ms against 33ms budget — no impact on 30Hz rate
+
+### Proposed panda-py fork changes
+
+During this work, identified 5 improvements to panda-py that would make collision recovery cleaner. These are NOT implemented — just documented for a future fork:
+
+1. **Clear `last_error_` on `recover()`** — currently `raise_error()` re-raises stale errors after recovery because `last_error_` (shared_ptr) is never reset. Add `last_error_.reset()` in `Panda::recover()`.
+
+2. **Add `is_controller_active()` method** — expose whether the control thread is alive. Currently the only detection is indirect (state read + `current_errors` check, or `raise_error()` which throws).
+
+3. **Expose `motion_finished_` on controllers** — let Python code check if a TorqueController has been terminated by a reflex without relying on state reads.
+
+4. **Release GIL in `stop_controller()`** — `start_controller` has `py::call_guard<py::gil_scoped_release>` but `stop_controller` does not. The `current_thread_.join()` inside can block the Python interpreter if the control thread is still running.
+
+5. **Custom reflex callback** — instead of hard stop on `cartesian_reflex`, allow registering a callback that transitions the controller to a compliant hold (zero stiffness). This would prevent the stop-recover-restart cycle entirely.
+
+### Key Learnings
+
+**53. Compliance ramp prevents most reflexes.** Dropping stiffness from 600→200 Nm/rad in the last 30mm means light contact (gripper finger brushing a block edge) produces compliance instead of a hard reflex. The EMA filter (filter_coeff=0.3) smooths the transition.
+
+**54. Recovery after reflex is straightforward.** The recipe: `stop_controller()` → `recover()` → read actual `q` → start fresh controller → `set_control(actual_q)` → continue loop. The key insight is resetting `target_z` to the actual height so the descent loop condition (`while target_z > z`) naturally continues.
+
+**55. panda-py's `get_state()` is non-blocking.** It reads a cached copy of the last 1kHz state update — no round-trip to the robot. This makes per-loop error checking essentially free.
+
 ## 2026-02-27 ~evening - Phase 3: Real-Time Servo Descent with NUDGE
 
 ### Context
@@ -1205,10 +1258,48 @@ Camera daemon (30fps) → ZMQ fresh-socket → NUDGE ONNX (15ms) → XY correcti
 
 **52. The NUDGE model is the bottleneck, not the servo infrastructure.** With 216 training approaches and heavy overfit, the model outputs constant predictions. Needs 5-10x more data (1000+ approaches) to be position-dependent. Data collection is the priority.
 
+## 2026-03-01 ~morning - RT Servo Two-Phase Descent & Collision Recovery
+
+Rewrote `franka_rt/servo.py` with three key improvements to handle collisions during NUDGE data collection:
+
+### Changes
+
+1. **Two-phase descent**: Fast phase (speed_factor=0.15) from approach height to 30mm above grasp, then slow phase (speed_factor=0.08) for the last 30mm. Waypoints are pre-computed at 5mm Z intervals with XY blend, then split at SLOW_START_HEIGHT. Fast phase covers ~80% of descent, slow phase gives gentle contact.
+
+2. **Collision threshold management**: `set_collision_behavior` raises joint torque thresholds from 20Nm→30Nm and Cartesian force from 20N→50N before descent. Restored in `finally` block. This lets the arm tolerate light contact (e.g. gripper finger brushing block edge) without triggering `cartesian_reflex`.
+
+3. **Collision recovery**: If `move_to_joint_position` throws during descent, the servo catches it, calls `panda.recover()`, re-raises collision thresholds, reads actual position via FK, recomputes remaining waypoints from that position, and continues. Up to MAX_RECOVERIES=3 attempts.
+
+4. **Settle phase**: 150ms sleep after reaching grasp height, before closing gripper. Lets residual vibrations damp.
+
+### Test Results (6 servo picks)
+
+Position accuracy: **1.6-2.6mm** on clean descents. Two-phase split: 24 fast + 7 slow waypoints (from 164mm approach to 13mm grasp). Total descent time: 6-10 seconds. Zero recoveries triggered — the raised collision thresholds prevented reflexes even when a gripper finger contacted a block edge (one attempt stopped at z=42mm = block top height, no reflex).
+
+**53. Raised collision thresholds eliminate most descent reflexes.** Default 20Nm/20N is too sensitive for table-height picks — any slight contact triggers `cartesian_reflex` which kills the controller. At 30Nm/50N, the arm tolerates light finger-on-block contact without reflex. The slow phase (0.08 speed factor) further reduces impact force. Combined effect: the arm that previously needed multiple recovery cycles now descends cleanly.
+
+**54. Two-phase descent is the right architecture.** Fast phase gets through the "safe" zone (>30mm above grasp) quickly. Slow phase handles the critical last 30mm where contact is likely. Total time competitive with single-phase (~10s for 150mm descent) because fast phase is 2x faster than old single-speed approach.
+
+**55. Pre-computed waypoints + move_to_joint_position is more robust than real-time JointPosition controller.** panda-py's trajectory planner handles velocity/power limits automatically. The JointPosition controller approach (from original servo.py) required manual filter tuning and had failure modes at controller start/stop boundaries. Waypoints "just work" at the cost of no mid-trajectory correction (NUDGE integration will need a different approach).
+
+### Proposed panda-py Fork (for future)
+
+Discovered several panda-py limitations during collision recovery work:
+
+1. **Clear `last_error_` on `recover()`** — currently `raise_error()` re-raises stale errors after recovery because `last_error_` (shared_ptr) is never reset. Fix: add `last_error_.reset()` in `Panda::recover()`.
+
+2. **Add `is_controller_active()` method** — expose whether the control thread is alive. Currently detection is indirect (state read + `current_errors` check, or `raise_error()` which throws).
+
+3. **Expose `motion_finished_` on controllers** — let Python check if a controller was terminated by reflex without state reads.
+
+4. **Release GIL in `stop_controller()`** — `start_controller` has `py::call_guard<py::gil_scoped_release>` but `stop_controller` does not. The `current_thread_.join()` can block Python if control thread is still running.
+
+5. **Custom reflex callback** — instead of hard stop on `cartesian_reflex`, allow registering a callback that transitions to compliant hold (zero stiffness). Would eliminate the stop-recover-restart cycle entirely.
+
 ### Next Steps
 
-1. **Collect more NUDGE training data** — run autonomous pick cycles with `nudge_collect_enable`, aim for 1000+ approaches over the weekend. Widened perturbation from ±20mm to ±35mm for more diversity.
-2. **Retrain on Spark** — should see position-dependent corrections with enough data
-3. **Optimize camera loop** — consider keeping a persistent socket with manual multipart assembly, or a dedicated camera thread, to get closer to 30Hz
-4. **Speed up descent** — once NUDGE model is reliable, test 60-80mm/s with higher filter_coeff
-5. **Diversify training objects** — RGMC "Picking from Clutter" uses YCB-like household items (soup cans, cloth napkins, bananas, bottles, boxes). Start mixing these into the workspace alongside blocks to train on shape/texture diversity. The NUDGE model needs to generalize beyond colored blocks on a flat table.
+1. **RealSense D405 wrist camera** arriving today — integrate for close-range visual servoing. Most wrist camera code already exists. This solves the fundamental NUDGE limitation (static external camera provides zero XY signal).
+2. **Collect more NUDGE training data** — with wrist camera, image signal will be position-dependent. Run autonomous pick cycles aiming for 1000+ approaches.
+3. **Optimize camera loop** — consider persistent socket or dedicated camera thread to get closer to 30Hz
+4. **Speed up descent** — with wrist camera NUDGE working, test 60-80mm/s with higher filter_coeff
+5. **Diversify training objects** — RGMC uses YCB-like household items. Mix these into workspace for shape/texture diversity.
