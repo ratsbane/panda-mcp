@@ -1298,8 +1298,115 @@ Discovered several panda-py limitations during collision recovery work:
 
 ### Next Steps
 
-1. **RealSense D405 wrist camera** arriving today — integrate for close-range visual servoing. Most wrist camera code already exists. This solves the fundamental NUDGE limitation (static external camera provides zero XY signal).
+1. **RealSense D405 wrist camera** arriving Monday — integrate for close-range visual servoing. This solves the fundamental NUDGE limitation (static external camera provides zero XY signal).
 2. **Collect more NUDGE training data** — with wrist camera, image signal will be position-dependent. Run autonomous pick cycles aiming for 1000+ approaches.
 3. **Optimize camera loop** — consider persistent socket or dedicated camera thread to get closer to 30Hz
 4. **Speed up descent** — with wrist camera NUDGE working, test 60-80mm/s with higher filter_coeff
 5. **Diversify training objects** — RGMC uses YCB-like household items. Mix these into workspace for shape/texture diversity.
+
+---
+
+## 2026-03-01 ~afternoon - RT Servo Stress Test & First Non-Block Grasps
+
+### Context
+Continued testing the RT servo two-phase descent from the morning session. Goals: stress test with repeated pick-and-place cycles, attempt picking novel objects (soup can), explore manipulation beyond simple block picks.
+
+### Automated Stress Test: 6/6 Green Block Picks
+
+Ran 6 consecutive pick-and-place cycles moving the green block through 4 positions (right, left, center-far, center-near). **All 6 succeeded**, 0 recoveries needed.
+
+| Cycle | Pick Time | Position Error | Recoveries | Held? |
+|-------|-----------|---------------|------------|-------|
+| 1     | 4.2s      | 6.6mm         | 0          | Yes   |
+| 2     | 3.5s      | —             | 0          | Yes   |
+| 3     | 5.0s      | 6.1mm         | 0          | Yes   |
+| 4     | 4.2s      | 6.6mm         | 0          | Yes   |
+| 5     | —         | —             | 0          | Yes   |
+| 6     | 5.0s      | 6.1mm         | 0          | Yes   |
+
+Mean pick time: ~4.3s. Mean position error: ~6.3mm. The RT servo is production-quality for block picking.
+
+### Collision Tolerance in Cluttered Scenes
+
+During picks, the gripper repeatedly contacted the dark brick (copper ingot) leaning against the green block. The raised collision thresholds (30Nm contact / 40Nm reflex) handled these contacts gracefully — no reflexes triggered, the arm continued through. This is a major improvement over the pre-RT-servo behavior where any contact would abort the pick.
+
+**56. Raised collision thresholds + slow descent phase make cluttered picking viable.** The arm can brush past neighboring objects without triggering safety stops. This is essential for real-world pick-and-place where objects are close together.
+
+### Accidental Object Manipulation
+
+During several picks, the gripper clipped the green block (standing upright) and tilted it. On one pass it toppled over; on another it survived upright. This led to a discussion about:
+
+- **Orientation detection from images**: upright blocks have different bounding box aspect ratios (taller than wide vs wider than tall). Qwen grounding can be asked directly about orientation.
+- **Adaptive grasp height**: upright 30mm block needs z=0.03-0.04 (mid-height) vs z=0.013 (table level)
+- **Intentional toppling**: `push_at` skill can knock objects flat before picking — simpler than adjusting grasp parameters
+
+**57. Accidental contact during picks is a useful manipulation primitive.** Rather than avoiding all contact, we should develop controlled pushing/sliding skills. The collision-tolerant servo descent already handles this safely.
+
+### First Cylindrical Object: Campbell's Soup Can
+
+Added a Campbell's Cream of Chicken soup can (10.2cm tall, ~66mm diameter, ~300g) to the workspace.
+
+**Localization challenge — homography completely fails for tall objects:**
+- Qwen grounding estimated (0.324, -0.026) — **12cm X error, 10cm Y error** vs actual position
+- Multiple blind pick attempts at homography-derived coordinates all missed
+- The can's red label also confused the HSV color detector (competed with red blocks)
+- Depth camera fusion detected it as "cup" but gave unreliable robot-frame coordinates (depth calibration doesn't extrapolate to this region)
+
+**Ground truth via gamepad jog:**
+- Jogged gripper to can center: **(0.443, -0.133, z=0.079)**
+- This was 12cm away from the Qwen estimate — homography is useless for 10cm tall objects due to parallax
+
+**Successful can pick:**
+- Using jogged coordinates: **2.2mm position error, 3.5s descent, gripper width 63.7mm**
+- Grasped firmly, lifted cleanly, Fz=9.5N confirming heavy object
+
+**Can transport — slip failure:**
+- Picked successfully from placed position (21mm error — close enough for 66mm target)
+- During transport to far left, can slipped: grip width changed 62mm→42mm
+- Can fell on its side at table edge
+- Root cause: 21mm off-center on a cylindrical object → gripper only contacts one side → rotational slip
+
+**58. Cylindrical objects demand sub-10mm centering accuracy.** Unlike blocks (which have flat faces and forgive 20mm offset), cylinders slip if the gripper isn't centered. The wrist camera is critical for this — we need visual feedback during the final approach to center on round objects.
+
+**59. Homography-based localization is useless for objects taller than ~30mm.** A 10cm tall can produces 12cm+ coordinate errors due to parallax from the overhead camera angle. Only solutions: depth camera (if calibrated for the region), wrist camera (close-range), or manual jogging.
+
+**60. Gamepad jog is the reliable ground-truth method for unknown object positions.** When perception fails, 30 seconds of jogging gives exact coordinates. This should be the fallback for novel objects until wrist camera is integrated.
+
+### Grasp Strategy Taxonomy (Future Development)
+
+Objects in the workspace now include blocks (various sizes), a soup can, a copper ingot, a stuffed tiger, and red blocks. Each needs different grasp approaches:
+
+| Strategy | When to Use | Key Parameters |
+|----------|-------------|----------------|
+| **Top-down** (current) | Blocks, small objects on flat surface | z=table, width=object width |
+| **Mid-height** | Tall objects (cans, bottles) | z=object_height/2, need centering |
+| **Side grasp** | Flat objects, objects against walls | Tilt wrist, approach horizontally |
+| **Pinch** | Small/thin objects | Fingertip contact, low force |
+| **Scoop** | Flat items (cards, paper) | Push against edge then lift |
+| **Cage** | Irregular shapes (tiger toy) | Wide open, close around shape |
+| **Push-then-pick** | Upright objects, decluttering | Topple with push_at, then top-down |
+
+**Object properties that drive strategy selection:**
+- Shape: cylindrical→mid-height+centering, rectangular→top-down, irregular→cage
+- Size vs gripper: tiny→pinch, medium→standard, large→cage/two-stage
+- Orientation: upright→adjust z or topple, on-side→side grasp
+- Material: smooth/round→need centering, rough/flat→forgiving
+- Weight: heavy→lower grasp point, light→less force
+
+### Lessons Summary
+
+| # | Lesson |
+|---|--------|
+| 56 | Raised collision thresholds + slow descent make cluttered picking viable |
+| 57 | Accidental contact is a useful manipulation primitive — develop controlled push/slide skills |
+| 58 | Cylindrical objects demand sub-10mm centering (wrist camera critical) |
+| 59 | Homography useless for objects >30mm tall — 12cm+ errors from parallax |
+| 60 | Gamepad jog is reliable ground-truth fallback for novel object positions |
+
+### Next Steps
+
+1. **RealSense D405 wrist camera** arriving Monday — mount, calibrate, integrate for close-range centering
+2. **Grasp strategy selection** — given object type/shape, choose appropriate grasp parameters (z height, approach angle, force)
+3. **Push/slide skills** — controlled object manipulation beyond pick-and-place
+4. **Side grasp** — tilt wrist for horizontal approach (can on its side, flat objects)
+5. **More objects** — YCB-like household items for shape/texture diversity
