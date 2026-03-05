@@ -1410,3 +1410,282 @@ Objects in the workspace now include blocks (various sizes), a soup can, a coppe
 3. **Push/slide skills** — controlled object manipulation beyond pick-and-place
 4. **Side grasp** — tilt wrist for horizontal approach (can on its side, flat objects)
 5. **More objects** — YCB-like household items for shape/texture diversity
+
+---
+
+## 2026-03-03 - Collision Retry & Cluttered Manipulation
+
+### Context
+Green block next to a Campbell's soup can — pick_at consistently detected contact (21.6N force at z=0.065) but just aborted. Goal: implement collision retry so the arm retreats, nudges XY using force direction as a hint, and retries the descent.
+
+### Implementation: Collision Retry for pick_at
+
+**Changes to `franka_mcp/controller.py`:**
+
+1. **Module-level constants** — `MAX_COLLISION_RETRIES=2`, `COLLISION_RETREAT_MARGIN=0.05`, `COLLISION_NUDGE_DISTANCE=0.02`, `COLLISION_MIN_ABOVE_TARGET=0.03`, `CONTACT_FORCE_THRESHOLD=15.0` (moved from inline to module-level)
+
+2. **`_compute_collision_nudge()` method** — Takes signed force delta `[dFx, dFy, dFz]` and retry index. Strategy:
+   - Retry 0: nudge 2cm opposite to dominant lateral force axis (or +Y default if ambiguous/<3N)
+   - Retry 1: nudge perpendicular to retry 0 + rotate gripper yaw 90°
+   - Effective position clamped to workspace bounds x:[0.30, 0.60] y:[-0.20, 0.20]
+
+3. **Descent loop restructured** — Outer `while True` retry loop wraps the existing 4cm step descent. Both stall detection (3 consecutive <2mm moves) and force monitoring (15N threshold) now set `descent_contact=True` + `break` instead of calling `_abort()` directly. On contact:
+   - Height analysis: if contact within 3cm of target z → abort (it's the object itself)
+   - Retreat to max(contact_z + 5cm, approach_height)
+   - Compute nudge from signed force delta
+   - Move to nudged approach position
+   - Re-baseline forces and IK chain
+   - Retry descent
+
+4. **Final lower_to_grasp** uses `effective_x/y/yaw` incorporating collision offsets
+
+5. **Signed force delta** captured for nudge direction — key change from `np.abs()` to preserving sign
+
+### Experiment 1: Collision Retry — Green Block Next to Soup Can
+
+**Setup:** Green block at (0.424, 0.055), soup can immediately adjacent.
+
+**Result — SUCCESS on first retry:**
+- Descent detected 21.6N contact at z=0.065 (soup can height)
+- Signed force delta: `[+4.4, +0.7, -21.6]` — Fx dominant lateral axis
+- Retreated to z=0.15
+- Nudged -20mm in X (opposite to +Fx force, away from can)
+- Repositioned to (0.404, 0.055)
+- Retried descent — cleared the can, reached z=0.013
+- Grasped green block successfully (width=0.029m, is_grasped=true)
+
+**Key insight:** The force-directed nudge correctly identified the can was in the +X direction and moved away from it. 2cm nudge was enough to clear the ~33mm can radius.
+
+### Experiment 2: Unobstructed Pick — No False Positives
+
+Picked the same green block from an open area (0.550, 0.069) with no obstacles nearby. Clean descent, no contact detected, no retries. Confirms collision retry doesn't interfere with normal picks.
+
+### Experiment 3: Picking Off the Soup Can
+
+**Setup:** Green block placed on top of soup can by user. Can top at z≈0.115.
+
+**Attempt 1 (yaw=0):** Descended cleanly to z=0.114 but gripper closed empty (0.0003m). Block was between fingers but off-center — pivoted out during grasp.
+
+**Attempt 2 (yaw=π/2):** Rotated gripper 90° to match block orientation. Clean descent, grasped successfully (width=0.029m). Picked block right off the can top.
+
+**Key insight:** Gripper yaw matters critically for narrow elevated targets. The rotated fingers went alongside the can body without clipping it. No collision retry needed when yaw is correct.
+
+### Experiment 4: Placing on Soup Can
+
+**Attempt 1:** Placed at (0.50, 0.116, z=0.125) — missed, landed on table. Can center estimate was off.
+
+**Attempt 2:** Used coordinates from successful pick (0.478, 0.162, z=0.12) — landed perfectly on the can. **Key learning: use successful pick coords as place targets for the same object.**
+
+### Experiment 5: Stacking — Block Off Blue Block, Onto Soup Can
+
+Picked green block off a blue block stack (z=0.045 grasp height), carried across workspace, placed on soup can at (0.478, 0.162, z=0.12). Success — block balanced on can.
+
+### Bug Found & Fixed: push_at Infinite Loop
+
+**Bug:** `push_at` descent loop (lines 2117-2131) had NO collision detection or stall detection. When descending onto the soup can top, `current_z` got stuck at ~0.11 while the loop kept trying to reach `push_z=0.05`. Since `0.11 - 0.04 = 0.07 > 0.05`, the loop condition stayed true forever. Required e-stop recovery.
+
+**Fix:** Added stall detection (3 consecutive <2mm moves → abort) and force monitoring (15N threshold → abort) to `push_at`'s descent loop, matching the same checks in `pick_at`. Confirmed fix works: next push attempt detected 18.7N contact at z=0.114 and aborted cleanly.
+
+**Root cause:** `push_at` was written for pushing small objects at table level and never encountered elevated obstacles before. The incremental descent had no safety checks — a dangerous gap.
+
+### Experiment 6: Block Bridge Across Two Soup Cans
+
+**Setup:** Two Campbell's cans placed ~4cm apart by user. Goal: place blue block spanning both can tops.
+
+**Attempt 1 (yaw=π/2):** Block fell — wrong orientation, long axis didn't span the gap.
+
+**Attempt 2 (yaw=0):** Rotated 90° — block landed and stayed! Blue block bridge across two soup cans.
+
+**Key insight:** Block orientation relative to the gap matters. At yaw=0, the Panda gripper fingers close along Y, so the block's long axis extends along X... but the bridge worked, so the cans must be arranged more in X than my depth readings suggested. Camera-to-robot coord estimation remains the weakest link.
+
+### Lessons Summary
+
+| # | Lesson |
+|---|--------|
+| 61 | Force-directed collision retry works: signed force delta correctly identifies obstacle direction |
+| 62 | 2cm nudge sufficient to clear a 66mm soup can — obstacle radius + small margin |
+| 63 | Contact near target height (within 3cm) correctly aborts — it's the object, not an obstacle |
+| 64 | push_at needs the same safety checks as pick_at — any descent loop can get stuck without stall/force detection |
+| 65 | Gripper yaw is critical for narrow elevated targets (picking off can tops, bridge placement) |
+| 66 | Successful pick coordinates make the best place targets for the same location |
+| 67 | RealSense depth-to-robot coords consistently off by 2-4cm for round objects (surface vs center) |
+
+### Next Steps
+
+1. **push_at collision retry** — currently just aborts; could retreat and try a different approach angle
+2. **Can grasping** — 66mm can vs 80mm gripper should work, but need better center estimation (wrist camera would help)
+3. **Wrist camera for precision placement** — placing on narrow targets (can tops) needs visual feedback during descent
+4. **Systematic RealSense calibration check** — depth-to-robot transform seems to have systematic offset for elevated/round objects
+
+---
+
+## 2026-03-04 - Wrist Camera Calibration, IK Solver Fix, Literature Survey
+
+### D405 Wrist Camera Calibration Improved
+
+Collected 6 additional calibration samples (total 11), recomputed the D405 wrist camera calibration with outlier rejection (threshold >15mm). 21 point correspondences retained after filtering.
+
+| Metric | Before | After |
+|--------|--------|-------|
+| RMSE | 9.23mm | 6.42mm |
+| LOO mean | 8.7mm | 5.6mm |
+
+Getting close to the ~5mm accuracy floor needed for reliable grasping from wrist cam alone.
+
+### detect_objects Fixed for Wrist Camera
+
+Added `ee_position` and `ee_rpy` parameters to the `detect_objects` MCP tool in `realsense_mcp/server.py`. The wrist camera transform depends on the current EE pose, so the tool now passes EE pose to the controller before running detection. Successfully detected 5 objects from z=0.23 survey height — this is the basic "look down, find stuff" workflow for wrist-cam-guided picking.
+
+### IK Stall Problem Identified
+
+`pick_at` at x=0.324 (near base) caused an IK solver stall. The robot physically couldn't reach table height in its current configuration, but `panda_py.ik()` reported "success" with a configuration that was kinematically valid but unreachable via the planned trajectory. Stall detection triggered collision retry inappropriately, requiring two e-stop resets.
+
+**Root cause:** `panda_py.ik()` returns only 1 solution branch (the "elbow up" configuration). `ik_full()` returns all 4 branches. The "shoulder rotated 180deg" configuration — which would have reached the target cleanly — was being silently discarded. This has likely caused intermittent failures in the x=0.30-0.35 zone for weeks.
+
+### Literature Review: IK Solvers
+
+Benchmarked `panda_py.ik()` vs `ik_full()` on Pi 5 for table-height (z=0.013) reachability:
+
+| Solver | q7 candidates | Workspace coverage | Time |
+|--------|--------------|-------------------|------|
+| `ik()` | 14 | 85.8% | ~240us |
+| `ik_full()` | 14 | 99.5% | ~336us |
+| `ik_full()` | 55 (dense sweep) | 100% | ~1.3ms |
+
+Other solvers reviewed:
+- **TRAC-IK** — 1-5ms, random restarts. Overkill for a 7-DOF arm with analytical solutions.
+- **Pinocchio/Pink** — Already installed. Good for differential IK / constrained tasks, not point solutions.
+- **GeoFIK** — Promising geometric solver, potential future upgrade for constrained grasps.
+- **CuRobo** — NVIDIA GPU-accelerated. Wrong platform.
+- **IKFlow** — Generative model for IK. Overkill for single-arm pick-and-place.
+
+**Conclusion:** Fix the wrapper, not the solver. Switching from `ik()` to `ik_full()` costs 96 extra microseconds and closes a 14% coverage gap. No new dependencies.
+
+### Literature Review: Grasping Data Collection
+
+Surveyed data collection strategies from recent manipulation papers:
+
+- **ForceVLA** (NeurIPS 2025) — Uses the exact same camera setup (RealSense D435 external + D415 wrist). Showed 23% improvement from force/torque data. We already have `O_F_ext_hat_K` and `tau_ext_hat_filtered` from libfranka but don't log them during skill episodes.
+- **DROID** — 76k episodes across 564 scenes. Used ZED cameras (Mini for wrist, 2 for external). Our ordered ZED cameras match this setup.
+- **Bridge V2 / Open X-Embodiment** — Standard format converging on LeRobot v3 Parquet.
+- **RH20T** — 110k episodes. Emphasized multi-modal sensing (F/T, tactile, audio).
+- **REASSEMBLE** — Assembly tasks with F/T feedback.
+- **RIPT-VLA** — 1 demo + 15 online iterations for 97% success. Shows that small amounts of high-quality data beat large noisy datasets when starting from a pre-trained VLA.
+
+**Key takeaway:** 50-100 demos is sufficient for fine-tuning a pre-trained VLA, but data quality matters enormously. Logging F/T data costs nothing and ForceVLA proves it helps.
+
+### Strategic Realization: Local Minimum
+
+We've been polishing Claude as a low-level controller — collision retry, push_at fixes, can stacking — instead of building the neural motor layer that replaces it. The robot works well enough with Claude in the loop, but that's a dead end for autonomy.
+
+**Priority order going forward:**
+1. **Fix IK** — Switch `ik()` to `ik_full()` in controller.py. Eliminates the near-base stall failures.
+2. **Enrich data logging** — Add F/T data, wrist camera frames, and joint torques to skill episodes.
+3. **Collect episodes** — 50-100 pick-and-place demos with enriched data.
+4. **Fine-tune VLM** — SmolVLM2-500M on Spark, skill call output format.
+
+The IK fix is a 10-line change that unlocks reliable picking across the full workspace. Everything else builds on that foundation.
+
+### Lessons Summary
+
+| # | Lesson |
+|---|--------|
+| 68 | `ik()` covers 86% of workspace at table height; `ik_full()` covers 99.5%. Always use `ik_full()`. |
+| 69 | IK "success" doesn't mean the trajectory is feasible — stalls mid-descent look like collisions but aren't. |
+| 70 | Wrist camera calibration needs >10 samples with outlier rejection to get below 7mm RMSE. |
+| 71 | detect_objects for wrist camera needs live EE pose — the transform is configuration-dependent. |
+| 72 | ForceVLA proves F/T logging improves manipulation by 23% — log everything, filter later. |
+| 73 | 50-100 high-quality demos beat thousands of noisy ones when fine-tuning pre-trained VLAs. |
+
+### Next Steps
+
+1. **Switch IK solver** — Replace `ik()` with `ik_full()` in controller.py, benchmark full workspace
+2. **Add F/T logging to skill episodes** — Capture `O_F_ext_hat_K` and `tau_ext_hat_filtered` per skill step
+3. **Add wrist camera frame to skill episodes** — D405 image alongside the scene camera image
+4. **Collect 50 pick-and-place demos** — Systematic coverage of workspace with varied objects
+5. **Begin VLM fine-tuning pipeline** — SmolVLM2-500M + TRL SFTTrainer on Spark
+
+---
+
+## 2026-03-04 (late) - D435 Calibration Refresh & Autonomous Episode Collection
+
+### Context
+Following the IK solver fix (`ik()` → `ik_full()`) and F/T logging additions, the focus shifted to: (1) improving D435 RealSense calibration coverage, and (2) collecting skill episodes autonomously across the full workspace. The D435 had been calibrated with 4 ArUco markers (RMSE 7.8mm, LOO 10.8mm) but the user asked about improving coverage — including using the robot arm itself as a calibration target.
+
+### D435 Calibration: Robot-Arm-as-Target Experiment
+
+**Motivation:** The user suggested using the robot's known FK position to validate/recalibrate camera perception. This could eventually enable continuous online recalibration.
+
+**Approach:** Background subtraction — capture D435 frame with arm parked away, then capture with arm at known positions. Detect gripper via depth differencing.
+
+**Data collection:**
+- Parked arm at (0.15, 0.4, 0.5) — out of D435 view
+- Captured background scan to `/tmp/rs_cal_bg.npz`
+- Moved through 10 positions spanning workspace at z=0.15
+
+**Critical bug found:** `save_scan()` doesn't call `capture()` internally — it saves the cached frame. All 10 scans were identical until explicit `capture()` was added before each `save_scan()`.
+
+**Detection attempts (progressive refinement):**
+
+| # | Method | Result |
+|---|--------|--------|
+| 1 | Largest depth among arm pixels | Found robot base (depth 1535mm), not gripper |
+| 2 | Bottom of arm in Y (image coords) | Found wrist at depth 525mm, not gripper fingers |
+| 3 | Depth zone filter (>650mm) | Scattered noise, not localized |
+| 4 | Contour (morph close + bottommost point) | Best — pixel near gripper area, depth 699mm |
+
+**Contour approach across all 10 positions:** Distance ratio mean=1.88, std=0.89 — poor consistency. Far-right positions (y<-0.30) detected desk edges instead of gripper. RMSE: 250.6mm.
+
+**Combined approach (ArUco + filtered arm):** 4 ArUco + 7 arm points = 11 total. RMSE: 83.2mm — worse than ArUco-only because arm detection adds noise.
+
+**Conclusion:** D435 at 640x480 cannot reliably resolve thin gripper fingers from the arm body via depth alone. The contour-bottommost approach is the best depth method but has 50-120mm error. **ArUco markers remain the reliable calibration source.**
+
+### D435 Calibration Refresh (ArUco-only)
+
+Re-captured fresh D435 frame with all visible markers. Result:
+
+| Metric | Old | New |
+|--------|-----|-----|
+| Markers | 4 (IDs 1,2,3,4) | 4 (IDs 0,2,3,4) |
+| RMSE | 7.8mm | 5.2mm |
+| LOO mean | 10.8mm | 10.8mm |
+| Distance ratio std | — | 0.024 (excellent) |
+
+### New Script: `scripts/calibrate_realsense_robot.py`
+
+Reusable D435 calibration script supporting two modes:
+- **ArUco markers (primary, reliable):** Detect 4X4_50 markers in color image, get depth at center, deproject to 3D, Kabsch SVD
+- **Robot arm positions (experimental):** Background subtraction → morphological close → contour bottom → depth lookup
+
+Features: distance consistency check, per-point errors, LOO cross-validation, saves in format compatible with `realsense_mcp/controller.py`'s `_load_calibration()`.
+
+### Verification Pick: Outside the Sweet Spot
+
+After refreshing calibration, tested a pick at (0.371, -0.298) — far outside the old "sweet spot" of x=0.43-0.52.
+
+**Result: SUCCESS.** Green block grasped cleanly (width=0.030m, is_grasped=true), placed at (0.45, -0.25). This confirms:
+1. The `ik_full()` solver handles the full workspace
+2. The refreshed D435 calibration works at the workspace edges
+3. Collision retry didn't false-positive on an unobstructed pick
+
+### Autonomous Episode Collection (episodes 64-102)
+
+Collected 39 skill episodes autonomously using D435 `detect_objects` for perception and `execute_plan` for execution. Covered picks across the workspace with varied objects (red, green, blue, orange blocks).
+
+### Lessons Summary
+
+| # | Lesson |
+|---|--------|
+| 74 | D435 depth background subtraction can't reliably find gripper fingers — arm body dominates at 640x480 |
+| 75 | `save_scan()` doesn't call `capture()` — must explicitly capture before save or all frames are identical |
+| 76 | ArUco calibration with 4 markers gives 5.2mm RMSE — good enough for table-plane picking |
+| 77 | `ik_full()` + refreshed calibration enables reliable picks across x=0.30-0.60, y=-0.35 to +0.25 |
+| 78 | Future online recalibration could use VLM grounding (Qwen) to find gripper in color images instead of depth |
+
+### Next Steps
+
+1. **Expose markers 1 and 5 to D435** — currently occluded, would give 6-point calibration
+2. **VLM-based gripper detection** — Qwen2.5-VL could ground "the gripper tip" in color images for arm-based calibration
+3. **Use detected z from D435** — elevated blocks need grasp height from depth, not default z=0.013
+4. **Resume episode collection** — target 100 episodes for VLM fine-tuning
+5. **Online recalibration prototype** — robot's FK + visual detection of gripper → continuous transform refinement

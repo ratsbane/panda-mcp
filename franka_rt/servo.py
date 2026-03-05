@@ -1,22 +1,24 @@
 """franka_rt/servo.py - Smooth servo descent for pick operations.
 
-Two modes:
-1. Waypoint mode (default): Pre-compute IK waypoints at 5mm Z intervals,
-   execute as single move_to_joint_position call. Reliable, no controller
-   transition issues. Uses panda-py's trajectory planner for smooth,
-   velocity/power-safe motion.
+Two-phase descent:
+1. Fast phase: Pre-compute IK waypoints at 5mm Z intervals, execute via
+   move_to_joint_position (panda-py trajectory planner). Rapid approach
+   from current height to SLOW_START_HEIGHT above grasp.
 
-2. NUDGE mode (future): JointPosition impedance controller with real-time
-   camera corrections at ~30Hz. Requires trained NUDGE model.
+2. Slow phase (impedance): JointPosition impedance controller steps through
+   remaining waypoints at ~20mm/s with compliance ramp. Stiffness decreases
+   from DEFAULT→SOFT as gripper approaches grasp height, so light contact
+   yields instead of triggering safety reflexes. Error detection every 33ms
+   with automatic recovery (up to MAX_RECOVERIES).
 
 Key design decisions:
 - IK seeding uses chain from previous waypoint (not actual panda.q)
 - 5mm Z steps give smooth trajectory with fine-grained IK control
 - Waypoints include XY blend from approach position to target position
 - Grasp detection uses gripper width threshold
-- Two-phase descent: fast to SLOW_START_HEIGHT, then slow for final approach
 - Collision thresholds raised during descent, restored in finally block
-- Recovery from trajectory errors with retry from actual position
+- Impedance compliance ramp prevents reflexes near table surface
+- Recovery from errors: stop controller, recover, restart from actual position
 """
 
 import logging
@@ -86,6 +88,17 @@ DESCENT_REFLEX_FORCE = [40.0] * 6       # Cartesian force reflex threshold (N)
 # Default (tight) collision thresholds to restore after descent
 DEFAULT_COLLISION_TORQUE = [20.0] * 7
 DEFAULT_COLLISION_FORCE = [20.0] * 6
+
+# Impedance control for compliant slow descent
+# These are panda-py JointPosition controller gains (7 joints).
+# DEFAULT = firm position tracking; SOFT = compliant near grasp height.
+DEFAULT_STIFFNESS = np.array([600., 600., 600., 600., 250., 150., 50.])
+DEFAULT_DAMPING = np.array([50., 50., 50., 20., 20., 20., 10.])
+SOFT_STIFFNESS = np.array([200., 200., 200., 200., 100., 50., 20.])
+SOFT_DAMPING = np.array([30., 30., 30., 15., 15., 15., 5.])
+FILTER_COEFF = 0.3         # EMA filter for target smoothing at 1kHz
+IMPEDANCE_HZ = 30          # Python-side check rate for errors + stiffness updates
+IMPEDANCE_DESCENT_RATE = 0.020  # 20mm/s for impedance-controlled slow descent
 
 # Settle time after reaching grasp height (let vibrations damp)
 SETTLE_TIME_S = 0.15
@@ -314,14 +327,12 @@ class NudgeRTServo:
     ) -> dict:
         """Execute smooth descent + grasp.
 
-        Without NUDGE model: pre-compute waypoints, single trajectory.
-        With NUDGE model: (future) impedance controller with camera corrections.
-
         Two-phase descent:
         1. Fast phase: from current height down to SLOW_START_HEIGHT above grasp.
-           Uses speed_factor for rapid approach.
-        2. Slow phase: last SLOW_START_HEIGHT. Uses SLOW_SPEED_FACTOR for
-           gentle contact and collision tolerance.
+           Uses trajectory planner (move_to_joint_position) at speed_factor.
+        2. Slow phase: last SLOW_START_HEIGHT via JointPosition impedance
+           controller with compliance ramp (stiffness DEFAULT→SOFT).
+           Light contact yields instead of triggering safety reflexes.
 
         Collision thresholds are raised for the entire descent and restored
         in the finally block.
@@ -432,55 +443,17 @@ class NudgeRTServo:
 
                 result["fast_descent_time_s"] = round(time.time() - descent_start, 2)
 
-            # ---- Execute slow descent (final approach) ----
+            # ---- Execute slow descent with impedance control ----
+            # Uses JointPosition controller with compliance ramp:
+            # stiffness decreases from DEFAULT→SOFT as gripper approaches
+            # grasp height, so light contact yields instead of triggering reflex.
             if slow_wps:
                 slow_start = time.time()
-                try:
-                    self._panda.move_to_joint_position(
-                        slow_wps,
-                        speed_factor=SLOW_SPEED_FACTOR,
-                        dq_threshold=0.01,
-                        success_threshold=0.05,
-                    )
-                    result["phases"].append("slow_descent_complete")
-                except Exception as e:
-                    logger.warning(f"Slow descent error: {e}")
-                    result["phases"].append("slow_descent_error")
-                    result["recoveries"] += 1
-
-                    if not self._try_recovery(result):
-                        return result
-
-                    # After recovery, try to finish descent from actual position
-                    actual_q = np.array(self._panda.q)
-                    fk_actual = panda_py.fk(actual_q)
-                    actual_z = float(fk_actual[2, 3])
-                    remaining = actual_z - z
-
-                    if remaining > 0.003:  # More than 3mm above target
-                        logger.info(
-                            f"Re-descending from z={actual_z:.4f} "
-                            f"({remaining*1000:.0f}mm remaining)")
-                        retry_wps = self._compute_waypoints(
-                            float(fk_actual[0, 3]), float(fk_actual[1, 3]),
-                            actual_z, target_x, target_y, z,
-                            actual_q, yaw, result,
-                        )
-                        if retry_wps:
-                            try:
-                                self._panda.move_to_joint_position(
-                                    retry_wps,
-                                    speed_factor=SLOW_SPEED_FACTOR,
-                                    dq_threshold=0.01,
-                                    success_threshold=0.05,
-                                )
-                                result["phases"].append("slow_retry_complete")
-                            except Exception as e2:
-                                logger.warning(f"Slow retry also failed: {e2}")
-                                result["phases"].append("slow_retry_error")
-                                # Don't try again, just proceed to grasp
-
+                descent_ok = self._impedance_descent(
+                    slow_wps, target_x, target_y, z, yaw, result)
                 result["slow_descent_time_s"] = round(time.time() - slow_start, 2)
+                if not descent_ok:
+                    return result
 
             descent_time = time.time() - start_time
             result["descent_time_s"] = round(descent_time, 2)
@@ -585,3 +558,167 @@ class NudgeRTServo:
             result["phases"].append("recovery_failed")
             logger.error(f"Recovery failed: {e}")
             return False
+
+    def _impedance_descent(self, waypoints, target_x, target_y, target_z,
+                           yaw, result):
+        """Execute slow descent using JointPosition impedance controller.
+
+        Ramps stiffness from DEFAULT→SOFT as gripper approaches grasp height,
+        so light contact yields instead of triggering reflexes.
+
+        Checks for controller errors every cycle (~30Hz) and recovers
+        automatically up to MAX_RECOVERIES times.
+
+        Args:
+            waypoints: List of joint configurations to step through.
+            target_x, target_y, target_z: Grasp target in robot frame (m).
+            yaw: Gripper yaw for IK re-solves after recovery.
+            result: Mutable result dict for logging.
+
+        Returns:
+            True if descent completed (or close enough), False if gave up.
+        """
+        if not waypoints:
+            return True
+
+        # Time to dwell on each waypoint: 5mm at 20mm/s = 250ms
+        dwell_s = WAYPOINT_Z_STEP / max(IMPEDANCE_DESCENT_RATE, 0.001)
+        n_checks = max(1, int(dwell_s * IMPEDANCE_HZ))
+        check_dt = dwell_s / n_checks
+
+        logger.info(
+            f"Impedance descent: {len(waypoints)} waypoints, "
+            f"{dwell_s*1000:.0f}ms/wp, {n_checks} checks/wp")
+
+        controller_active = False
+
+        try:
+            # Start impedance controller at current position
+            actual_q = np.array(self._panda.q)
+            ctrl = JointPosition(
+                stiffness=DEFAULT_STIFFNESS,
+                damping=DEFAULT_DAMPING,
+                filter_coeff=FILTER_COEFF,
+            )
+            self._panda.start_controller(ctrl)
+            ctrl.set_control(actual_q)
+            controller_active = True
+
+            wp_idx = 0
+            while wp_idx < len(waypoints):
+                wp_q = waypoints[wp_idx]
+
+                # Compute compliance alpha from waypoint height
+                fk_pose = panda_py.fk(wp_q)
+                wp_z = float(fk_pose[2, 3])
+                z_above = wp_z - target_z
+
+                if SLOW_START_HEIGHT > 0 and z_above < SLOW_START_HEIGHT:
+                    alpha = max(0.0, min(1.0, z_above / SLOW_START_HEIGHT))
+                    stiffness = SOFT_STIFFNESS + alpha * (DEFAULT_STIFFNESS - SOFT_STIFFNESS)
+                    damping = SOFT_DAMPING + alpha * (DEFAULT_DAMPING - SOFT_DAMPING)
+                else:
+                    stiffness = DEFAULT_STIFFNESS
+                    damping = DEFAULT_DAMPING
+
+                ctrl.set_stiffness(stiffness)
+                ctrl.set_damping(damping)
+                ctrl.set_control(wp_q)
+
+                # Dwell at this waypoint, checking for errors each cycle
+                error_detected = False
+                for _ in range(n_checks):
+                    time.sleep(check_dt)
+
+                    try:
+                        state = self._panda.get_state()
+                        if hasattr(state, 'current_errors') and state.current_errors:
+                            error_detected = True
+                            break
+                    except Exception:
+                        # Can't read state — controller may have died
+                        error_detected = True
+                        break
+
+                if error_detected:
+                    result["recoveries"] += 1
+                    logger.warning(
+                        f"Impedance descent: error at waypoint {wp_idx}/"
+                        f"{len(waypoints)} z={wp_z:.4f} "
+                        f"(recovery {result['recoveries']}/{MAX_RECOVERIES})")
+
+                    if result["recoveries"] > MAX_RECOVERIES:
+                        result["error"] = "Too many collisions during descent"
+                        result["phases"].append("recovery_limit")
+                        return False
+
+                    # Stop dead controller, recover
+                    try:
+                        self._panda.stop_controller()
+                    except Exception:
+                        pass
+                    controller_active = False
+
+                    try:
+                        self._panda.recover()
+                    except Exception as e:
+                        result["error"] = f"Recovery failed: {e}"
+                        result["phases"].append("recovery_failed")
+                        logger.error(f"Impedance recovery failed: {e}")
+                        return False
+
+                    self._raise_collision_thresholds()
+                    result["phases"].append(
+                        f"impedance_recovery_{result['recoveries']}")
+
+                    # Read actual position after recovery
+                    actual_q = np.array(self._panda.q)
+                    fk_actual = panda_py.fk(actual_q)
+                    actual_z = float(fk_actual[2, 3])
+
+                    if actual_z - target_z < 0.003:
+                        # Close enough to grasp height — proceed
+                        logger.info(
+                            f"Post-recovery z={actual_z:.4f}, "
+                            f"close enough to target {target_z:.4f}")
+                        break
+
+                    # Recompute remaining waypoints from actual position
+                    logger.info(
+                        f"Re-descending from z={actual_z:.4f} "
+                        f"({(actual_z - target_z)*1000:.0f}mm remaining)")
+                    waypoints = self._compute_waypoints(
+                        float(fk_actual[0, 3]), float(fk_actual[1, 3]),
+                        actual_z, target_x, target_y, target_z,
+                        actual_q, yaw, result,
+                    )
+                    wp_idx = 0
+
+                    # Restart controller from actual position
+                    ctrl = JointPosition(
+                        stiffness=DEFAULT_STIFFNESS,
+                        damping=DEFAULT_DAMPING,
+                        filter_coeff=FILTER_COEFF,
+                    )
+                    self._panda.start_controller(ctrl)
+                    ctrl.set_control(actual_q)
+                    controller_active = True
+                    continue
+
+                wp_idx += 1
+
+            result["phases"].append("impedance_descent_complete")
+            return True
+
+        except Exception as e:
+            logger.error(f"Impedance descent error: {e}", exc_info=True)
+            result["phases"].append("impedance_descent_error")
+            result["error"] = str(e)
+            return False
+
+        finally:
+            if controller_active:
+                try:
+                    self._panda.stop_controller()
+                except Exception:
+                    pass

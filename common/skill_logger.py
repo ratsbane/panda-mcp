@@ -129,7 +129,8 @@ class SkillLogger:
             "data_dir": str(self._episode_dir),
         }
 
-    def log_skill(self, skill: str, params: dict, result: Optional[dict] = None) -> dict:
+    def log_skill(self, skill: str, params: dict, result: Optional[dict] = None,
+                  robot_state: Optional[dict] = None) -> dict:
         """
         Log a single skill invocation.
 
@@ -143,6 +144,8 @@ class SkillLogger:
             skill: Skill name (pick, place, move, open_gripper, grasp, home, done, etc.)
             params: Skill parameters dict
             result: Skill execution result (optional, can update later)
+            robot_state: Robot state dict (joint_positions, ee_position, ee_orientation,
+                         gripper_width, O_F_ext_hat_K, tau_ext_hat_filtered, is_grasped)
 
         Returns:
             dict with step_index and image status
@@ -167,6 +170,8 @@ class SkillLogger:
             "params": params,
             "result": result,
         }
+        if robot_state:
+            step["robot_state"] = robot_state
         self._steps.append(step)
 
         logger.info(f"SkillLogger: step {step_index} — {skill}({params})")
@@ -181,7 +186,7 @@ class SkillLogger:
         if self._steps:
             self._steps[-1]["result"] = result
 
-    def end_episode(self, success: bool) -> dict:
+    def end_episode(self, success: bool, final_robot_state: Optional[dict] = None) -> dict:
         """
         End the current episode.
 
@@ -190,6 +195,7 @@ class SkillLogger:
 
         Args:
             success: Whether the episode was successful
+            final_robot_state: Robot state at episode end (optional)
 
         Returns:
             dict with episode stats
@@ -197,8 +203,8 @@ class SkillLogger:
         if not self._active:
             return {"success": False, "error": "No active episode"}
 
-        # Log final "done" step with a fresh frame
-        self.log_skill("done", {}, {"success": success})
+        # Log final "done" step with a fresh frame and final robot state
+        self.log_skill("done", {}, {"success": success}, robot_state=final_robot_state)
 
         end_time = time.time()
         duration = end_time - self._start_time

@@ -18,6 +18,13 @@ GRIP_STILL_OPEN = 0.075      # Above this width: didn't close meaningfully
 GRIP_SLIP_TOLERANCE = 0.008  # Width change > this during transport = slip
 FORCE_DROP_THRESHOLD = 2.0   # Fz change (N) suggesting object dropped
 
+# Collision retry during descent
+MAX_COLLISION_RETRIES = 2
+COLLISION_RETREAT_MARGIN = 0.05     # 5cm above contact point
+COLLISION_NUDGE_DISTANCE = 0.02    # 2cm XY nudge per retry
+COLLISION_MIN_ABOVE_TARGET = 0.03  # If contact within 3cm of target z, it's the object itself
+CONTACT_FORCE_THRESHOLD = 15.0     # Newtons above baseline for contact detection
+
 # Check for mock mode (no hardware)
 MOCK_MODE = os.environ.get("FRANKA_MOCK", "0") == "1"
 
@@ -129,9 +136,9 @@ def _solve_ik(
     """
     Solve analytical IK for a target Cartesian pose.
 
-    Uses panda_py.ik() with current joints as seed to find the nearest
-    valid solution. Tries the current q7 first, then nearby values,
-    to minimize unnecessary joint movement.
+    Uses panda_py.ik_full() to get ALL 4 solution branches per q7 candidate,
+    not just the case-consistent one. This gives ~100% workspace coverage vs
+    ~86% with ik() alone (which discards 3 of 4 branches).
 
     Args:
         position: Target [x, y, z] in meters
@@ -173,68 +180,133 @@ def _solve_ik(
 
     best_solution = None
     best_cost = float('inf')
+    solutions_checked = 0
 
     for q7 in unique_q7:
         try:
-            # panda_py.ik returns the solution closest to current_joints
-            sol = panda_py.ik(position, orientation_quat, current_joints, q7)
+            # ik_full returns [4, 7] — all 4 solution branches
+            sols = panda_py.ik_full(position, orientation_quat, current_joints, q7)
         except Exception as e:
             logger.debug(f"IK failed for q7={q7:.3f}: {e}")
             continue
 
-        if sol is None:
+        if sols is None:
             continue
 
-        sol = np.array(sol).flatten()
-        if sol.shape != (7,):
-            continue
+        sols = np.array(sols)
+        if sols.ndim == 1:
+            sols = sols.reshape(1, -1)
 
-        # Hard reject: joint limits
-        in_limits = True
-        for i in range(7):
-            if sol[i] < _JOINT_LIMITS[i, 0] + margin or sol[i] > _JOINT_LIMITS[i, 1] - margin:
-                in_limits = False
-                break
-        if not in_limits:
-            continue
-
-        # Soft penalty for large single-joint changes (was a hard reject, which
-        # caused "no solution found" when the only valid path required a big move)
-        joint_changes = np.abs(sol - current_joints)
-        max_change = np.max(joint_changes)
-        large_change_penalty = 0.0
-        if max_change > max_single_joint_change:
-            # Exponential penalty — strongly discourages but doesn't hard-reject
-            large_change_penalty = 10.0 * (max_change - max_single_joint_change) ** 2
-
-        # Verify with FK: position error < 3mm
-        try:
-            fk_pose = panda_py.fk(sol)
-            pos_error = np.linalg.norm(fk_pose[:3, 3] - position)
-            if pos_error > 0.003:
+        for sol in sols:
+            sol = np.array(sol).flatten()
+            if sol.shape != (7,):
                 continue
-        except Exception:
-            continue
 
-        # Cost: minimize total joint travel (the only thing that matters)
-        travel = np.sum((sol - current_joints) ** 2)
+            # Skip NaN solutions (ik_full returns NaN for invalid branches)
+            if np.any(np.isnan(sol)):
+                continue
 
-        # Small penalty for being near joint limits
-        normalized_pos = (sol - _JOINT_CENTERS) / (_JOINT_RANGES / 2)
-        limit_penalty = 0.1 * np.sum(normalized_pos ** 4)  # quartic: only bites near limits
+            solutions_checked += 1
 
-        cost = travel + limit_penalty + large_change_penalty
-        if cost < best_cost:
-            best_cost = cost
-            best_solution = sol
+            # Hard reject: joint limits
+            in_limits = True
+            for i in range(7):
+                if sol[i] < _JOINT_LIMITS[i, 0] + margin or sol[i] > _JOINT_LIMITS[i, 1] - margin:
+                    in_limits = False
+                    break
+            if not in_limits:
+                continue
+
+            # Soft penalty for large single-joint changes
+            joint_changes = np.abs(sol - current_joints)
+            max_change = np.max(joint_changes)
+            large_change_penalty = 0.0
+            if max_change > max_single_joint_change:
+                large_change_penalty = 10.0 * (max_change - max_single_joint_change) ** 2
+
+            # Verify with FK: position error < 3mm
+            try:
+                fk_pose = panda_py.fk(sol)
+                pos_error = np.linalg.norm(fk_pose[:3, 3] - position)
+                if pos_error > 0.003:
+                    continue
+            except Exception:
+                continue
+
+            # Cost: minimize total joint travel
+            travel = np.sum((sol - current_joints) ** 2)
+
+            # Small penalty for being near joint limits
+            normalized_pos = (sol - _JOINT_CENTERS) / (_JOINT_RANGES / 2)
+            limit_penalty = 0.1 * np.sum(normalized_pos ** 4)
+
+            cost = travel + limit_penalty + large_change_penalty
+            if cost < best_cost:
+                best_cost = cost
+                best_solution = sol
+
+    # If initial candidates failed, try dense q7 sweep as fallback
+    if best_solution is None:
+        logger.info("Primary IK candidates failed, trying dense q7 sweep...")
+        q7_min = _JOINT_LIMITS[6, 0] + margin
+        q7_max = _JOINT_LIMITS[6, 1] - margin
+        dense_q7 = np.linspace(q7_min, q7_max, 25)
+        for q7 in dense_q7:
+            q7_key = round(float(q7), 2)
+            if q7_key in seen:
+                continue
+            try:
+                sols = panda_py.ik_full(position, orientation_quat, current_joints, float(q7))
+            except Exception:
+                continue
+            if sols is None:
+                continue
+            sols = np.array(sols)
+            if sols.ndim == 1:
+                sols = sols.reshape(1, -1)
+            for sol in sols:
+                sol = np.array(sol).flatten()
+                if sol.shape != (7,) or np.any(np.isnan(sol)):
+                    continue
+                solutions_checked += 1
+                in_limits = True
+                for i in range(7):
+                    if sol[i] < _JOINT_LIMITS[i, 0] + margin or sol[i] > _JOINT_LIMITS[i, 1] - margin:
+                        in_limits = False
+                        break
+                if not in_limits:
+                    continue
+                joint_changes = np.abs(sol - current_joints)
+                max_change = np.max(joint_changes)
+                large_change_penalty = 0.0
+                if max_change > max_single_joint_change:
+                    large_change_penalty = 10.0 * (max_change - max_single_joint_change) ** 2
+                try:
+                    fk_pose = panda_py.fk(sol)
+                    pos_error = np.linalg.norm(fk_pose[:3, 3] - position)
+                    if pos_error > 0.003:
+                        continue
+                except Exception:
+                    continue
+                travel = np.sum((sol - current_joints) ** 2)
+                normalized_pos = (sol - _JOINT_CENTERS) / (_JOINT_RANGES / 2)
+                limit_penalty = 0.1 * np.sum(normalized_pos ** 4)
+                cost = travel + limit_penalty + large_change_penalty
+                if cost < best_cost:
+                    best_cost = cost
+                    best_solution = sol
 
     if best_solution is not None:
         max_change = np.max(np.abs(best_solution - current_joints))
         logger.info(
-            f"IK solution: travel={best_cost:.3f}, max_change={max_change:.3f} rad"
+            f"IK solution: cost={best_cost:.3f}, max_change={max_change:.3f} rad, "
+            f"checked={solutions_checked}"
         )
     else:
-        logger.warning(f"No valid IK solution for target ({x:.3f}, {y:.3f}, {z:.3f})")
+        logger.warning(
+            f"No valid IK solution for target ({x:.3f}, {y:.3f}, {z:.3f}), "
+            f"checked {solutions_checked} solutions"
+        )
 
     return best_solution
 
@@ -353,6 +425,65 @@ class FrankaController:
         except Exception as e:
             logger.debug(f"_read_forces failed: {e}")
             return None
+
+    def _compute_collision_nudge(
+        self,
+        force_delta_signed: Optional[np.ndarray],
+        retry_index: int,
+    ) -> tuple:
+        """Compute XY nudge and yaw adjustment to avoid a collision obstacle.
+
+        Strategy:
+        - Retry 0 (force-directed): Nudge 2cm opposite to the axis with the
+          largest force delta. If forces are ambiguous (<3N both axes), default
+          nudge +Y (away from robot base).
+        - Retry 1 (perpendicular + yaw): Nudge perpendicular to retry 0's
+          direction. Also rotate gripper yaw by 90 deg to reorient the fingers.
+
+        Args:
+            force_delta_signed: Signed [dFx, dFy, dFz] force delta at contact,
+                or None if contact was detected by stall (no force data).
+            retry_index: 0 for first retry, 1 for second.
+
+        Returns:
+            (nudge_dx, nudge_dy, yaw_delta) in meters/radians.
+        """
+        nudge = COLLISION_NUDGE_DISTANCE
+        nudge_dx, nudge_dy = 0.0, 0.0
+        yaw_delta = 0.0
+
+        if retry_index == 0:
+            # Force-directed: nudge opposite to the axis with largest force delta
+            if force_delta_signed is not None:
+                fx, fy = float(force_delta_signed[0]), float(force_delta_signed[1])
+                if abs(fx) > 3.0 or abs(fy) > 3.0:
+                    if abs(fx) >= abs(fy):
+                        nudge_dx = -np.sign(fx) * nudge
+                    else:
+                        nudge_dy = -np.sign(fy) * nudge
+                else:
+                    nudge_dy = nudge  # ambiguous forces — default +Y
+            else:
+                nudge_dy = nudge  # no force data (stall) — default +Y
+
+        elif retry_index >= 1:
+            # Perpendicular to retry 0 direction + yaw rotation
+            if force_delta_signed is not None:
+                fx, fy = float(force_delta_signed[0]), float(force_delta_signed[1])
+                if abs(fx) >= abs(fy) and (abs(fx) > 3.0 or abs(fy) > 3.0):
+                    nudge_dy = nudge  # retry 0 nudged in X, now try Y
+                else:
+                    nudge_dx = -nudge  # retry 0 nudged in Y, now try X
+            else:
+                nudge_dx = -nudge
+            yaw_delta = np.pi / 2  # 90 deg gripper rotation
+
+        logger.info(
+            f"Collision nudge (retry {retry_index}): "
+            f"dx={nudge_dx*1000:.1f}mm dy={nudge_dy*1000:.1f}mm yaw={yaw_delta:.3f}rad"
+            f" (force={[round(f,1) for f in force_delta_signed] if force_delta_signed is not None else 'N/A'})")
+
+        return nudge_dx, nudge_dy, yaw_delta
 
     def _progressive_grasp(self, pre_grip_width: float, force: float) -> dict:
         """Verify grasp by trying to close the gripper past the object.
@@ -1156,12 +1287,24 @@ class FrankaController:
                 nudge_servo = False
 
         # Helper to abort pick on move failure
-        def _abort(msg, steps):
+        def _abort(msg, steps, retreat=True):
             logger.error(f"pick_at aborted: {msg}")
             if sawm_monitor:
                 self._sawm_monitor.stop()
             if nudge_servo:
                 self._nudge_servo.stop()
+            # Try to retreat to safe height on contact abort
+            if retreat:
+                try:
+                    s = self.get_state()
+                    safe_z = max(s.ee_position[2] + 0.05, approach_height)
+                    self.move_cartesian_ik(
+                        s.ee_position[0], s.ee_position[1], safe_z,
+                        roll=s.ee_orientation[0], pitch=s.ee_orientation[1],
+                        yaw=s.ee_orientation[2], confirmed=True)
+                    steps.append({"action": "retreat_lift", "z": round(safe_z, 4)})
+                except Exception as e:
+                    logger.warning(f"Retreat lift failed: {e}")
             state = self.get_state()
             return {
                 "success": False,
@@ -1225,6 +1368,9 @@ class FrankaController:
         if nudge_active:
             self._nudge_record_frame()
 
+        # Force baseline before descent (for collision detection)
+        force_at_approach = self._read_forces()
+
         # Step 3: Descent + Grasp
         if smooth and self._rt_client and not MOCK_MODE:
             # ---- Smooth descent via RT servo (JointPosition controller at 1kHz) ----
@@ -1265,62 +1411,214 @@ class FrankaController:
             is_grasped_flag = servo_result.get("is_grasped", False)
             grasped = servo_result.get("success", False)
         else:
-            # ---- Standard incremental descent (4cm steps) ----
-            current_z = state.ee_position[2]
-            step_z = 0.04  # 4cm increments
-            while current_z - step_z > z:
-                intermediate_z = current_z - step_z
-                result = self.move_cartesian_ik(
-                    target_x, y, intermediate_z,
-                    roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True,
-                    seed_joints=chain_joints)
-                steps.append({"action": "lower_step", "method": "ik", "target_z": round(intermediate_z, 4), "result": result})
-                if not result.get("success"):
-                    return _abort(f"lower_step failed at z={intermediate_z:.3f}: {result.get('error', 'unknown')}", steps)
+            # ---- Standard incremental descent (4cm steps) with collision retry ----
+            collision_retries = 0
+            collision_nudge_dx = 0.0
+            collision_nudge_dy = 0.0
+            collision_yaw_delta = 0.0
+
+            while True:  # outer collision-retry loop
+                effective_x = target_x + collision_nudge_dx
+                effective_y = y + collision_nudge_dy
+                effective_yaw = pick_yaw + collision_yaw_delta
+
                 state = self.get_state()
-                chain_joints = np.array(state.joint_positions)
                 current_z = state.ee_position[2]
+                step_z = 0.04  # 4cm increments
+                stall_count = 0
+                descent_contact = False
+                contact_z = None
+                force_delta_signed = None
 
-                # SAWM: record frame at each Z step
-                if sawm_active:
-                    self._sawm_record_frame()
+                while current_z - step_z > z:
+                    prev_z = current_z
+                    intermediate_z = current_z - step_z
+                    result = self.move_cartesian_ik(
+                        effective_x, effective_y, intermediate_z,
+                        roll=pick_roll, pitch=pick_pitch, yaw=effective_yaw, confirmed=True,
+                        seed_joints=chain_joints)
+                    steps.append({"action": "lower_step", "method": "ik", "target_z": round(intermediate_z, 4), "result": result})
+                    if not result.get("success"):
+                        return _abort(f"lower_step failed at z={intermediate_z:.3f}: {result.get('error', 'unknown')}", steps)
+                    state = self.get_state()
+                    chain_joints = np.array(state.joint_positions)
+                    current_z = state.ee_position[2]
 
-                # NUDGE: record frame at each Z step
-                if nudge_active:
-                    self._nudge_record_frame()
+                    # Stall detection: if arm isn't descending, treat as contact
+                    if abs(current_z - prev_z) < 0.002:  # <2mm movement
+                        stall_count += 1
+                        if stall_count >= 3:
+                            contact_z = current_z
+                            descent_contact = True
+                            steps.append({
+                                "action": "contact_detected",
+                                "reason": "stall",
+                                "z": round(current_z, 4),
+                            })
+                            logger.warning(
+                                f"Descent stalled at z={current_z:.3f}m "
+                                f"(target was z={intermediate_z:.3f}m)")
+                            break
+                    else:
+                        stall_count = 0
 
-                # NUDGE servo: apply correction
-                if nudge_servo:
-                    nudge_correction = self._nudge_get_correction()
-                    if nudge_correction is not None:
-                        ndx, ndy, ndz = nudge_correction
-                        target_x += ndx
-                        y += ndy
-                        # dz not applied (Z is controlled by incremental lowering)
-                        steps.append({
-                            "action": "nudge_correction",
-                            "dx_mm": round(ndx * 1000, 1),
-                            "dy_mm": round(ndy * 1000, 1),
-                            "dz_mm": round(ndz * 1000, 1),
-                        })
-                        logger.info(f"NUDGE correction: dx={ndx*1000:.1f}mm dy={ndy*1000:.1f}mm")
+                    # Collision check: compare forces to baseline from previous step.
+                    # Re-baseline after each step so we compare neighboring configs
+                    # (gravity compensation residuals change with arm configuration).
+                    if force_at_approach is not None:
+                        time.sleep(0.05)  # 50ms settle after move
+                        forces_now = self._read_forces()
+                        if forces_now is not None:
+                            _signed = forces_now[:3] - force_at_approach[:3]
+                            _abs_delta = np.abs(_signed)
+                            max_delta = float(np.max(_abs_delta))
+                            if max_delta > CONTACT_FORCE_THRESHOLD:
+                                force_delta_signed = _signed
+                                contact_z = current_z
+                                descent_contact = True
+                                steps.append({
+                                    "action": "contact_detected",
+                                    "reason": "force",
+                                    "force_delta_N": round(max_delta, 1),
+                                    "force_delta_signed": [round(float(f), 1) for f in _signed],
+                                    "z": round(current_z, 4),
+                                })
+                                logger.warning(
+                                    f"Contact during descent at z={current_z:.4f}: "
+                                    f"force delta={max_delta:.1f}N (threshold={CONTACT_FORCE_THRESHOLD}N)")
+                                break
+                            # Update baseline to current settled forces for next step
+                            force_at_approach = forces_now
 
-                # SAWM monitor: check for correction (clamped to ±15mm)
-                if sawm_monitor:
-                    correction = self._sawm_monitor.get_correction()
-                    if correction:
-                        cdx, cdy = correction
-                        MAX_CORRECTION = 0.015  # 15mm max per step
-                        cdx = max(-MAX_CORRECTION, min(MAX_CORRECTION, cdx))
-                        cdy = max(-MAX_CORRECTION, min(MAX_CORRECTION, cdy))
-                        target_x += cdx
-                        y += cdy
-                        steps.append({
-                            "action": "sawm_correction",
-                            "dx_mm": round(cdx * 1000, 1),
-                            "dy_mm": round(cdy * 1000, 1),
-                        })
-                        logger.info(f"SAWM correction applied: dx={cdx*1000:.1f}mm dy={cdy*1000:.1f}mm")
+                    # SAWM: record frame at each Z step
+                    if sawm_active:
+                        self._sawm_record_frame()
+
+                    # NUDGE: record frame at each Z step
+                    if nudge_active:
+                        self._nudge_record_frame()
+
+                    # NUDGE servo: apply correction
+                    if nudge_servo:
+                        nudge_correction = self._nudge_get_correction()
+                        if nudge_correction is not None:
+                            ndx, ndy, ndz = nudge_correction
+                            target_x += ndx
+                            y += ndy
+                            # dz not applied (Z is controlled by incremental lowering)
+                            steps.append({
+                                "action": "nudge_correction",
+                                "dx_mm": round(ndx * 1000, 1),
+                                "dy_mm": round(ndy * 1000, 1),
+                                "dz_mm": round(ndz * 1000, 1),
+                            })
+                            logger.info(f"NUDGE correction: dx={ndx*1000:.1f}mm dy={ndy*1000:.1f}mm")
+
+                    # SAWM monitor: check for correction (clamped to ±15mm)
+                    if sawm_monitor:
+                        correction = self._sawm_monitor.get_correction()
+                        if correction:
+                            cdx, cdy = correction
+                            MAX_CORRECTION = 0.015  # 15mm max per step
+                            cdx = max(-MAX_CORRECTION, min(MAX_CORRECTION, cdx))
+                            cdy = max(-MAX_CORRECTION, min(MAX_CORRECTION, cdy))
+                            target_x += cdx
+                            y += cdy
+                            steps.append({
+                                "action": "sawm_correction",
+                                "dx_mm": round(cdx * 1000, 1),
+                                "dy_mm": round(cdy * 1000, 1),
+                            })
+                            logger.info(f"SAWM correction applied: dx={cdx*1000:.1f}mm dy={cdy*1000:.1f}mm")
+
+                # ---- Collision retry logic ----
+                if descent_contact:
+                    # Height analysis: if contact within 3cm of target z, it's the object
+                    if contact_z is not None and (contact_z - z) < COLLISION_MIN_ABOVE_TARGET:
+                        return _abort(
+                            f"Contact near target height (z={contact_z:.3f}m, target={z:.3f}m) "
+                            f"— object taller than expected or already at grasp height.",
+                            steps)
+
+                    # Retry budget check
+                    if collision_retries >= MAX_COLLISION_RETRIES:
+                        return _abort(
+                            f"Descent collision after {collision_retries} retries at z={contact_z:.3f}m. "
+                            f"Obstacle cannot be avoided.",
+                            steps)
+
+                    collision_retries += 1
+
+                    # 1. Retreat to safe height above contact point
+                    retreat_z = max(contact_z + COLLISION_RETREAT_MARGIN, approach_height)
+                    state = self.get_state()
+                    result = self.move_cartesian_ik(
+                        state.ee_position[0], state.ee_position[1], retreat_z,
+                        roll=pick_roll, pitch=pick_pitch, yaw=effective_yaw, confirmed=True)
+                    steps.append({
+                        "action": "collision_retreat",
+                        "retry": collision_retries,
+                        "contact_z": round(contact_z, 4),
+                        "retreat_z": round(retreat_z, 4),
+                        "result": result,
+                    })
+                    if not result.get("success"):
+                        return _abort(f"Collision retreat failed: {result.get('error', 'unknown')}", steps)
+
+                    # 2. Compute nudge from force direction
+                    nudge_dx, nudge_dy, yaw_delta = self._compute_collision_nudge(
+                        force_delta_signed, collision_retries - 1)
+                    collision_nudge_dx += nudge_dx
+                    collision_nudge_dy += nudge_dy
+                    collision_yaw_delta = yaw_delta  # replace, don't accumulate
+
+                    # Clamp effective position to safe workspace bounds
+                    new_eff_x = target_x + collision_nudge_dx
+                    new_eff_y = y + collision_nudge_dy
+                    new_eff_x = max(0.30, min(0.60, new_eff_x))
+                    new_eff_y = max(-0.20, min(0.20, new_eff_y))
+                    collision_nudge_dx = new_eff_x - target_x
+                    collision_nudge_dy = new_eff_y - y
+
+                    steps.append({
+                        "action": "collision_nudge",
+                        "retry": collision_retries,
+                        "nudge_dx_mm": round(nudge_dx * 1000, 1),
+                        "nudge_dy_mm": round(nudge_dy * 1000, 1),
+                        "total_nudge_dx_mm": round(collision_nudge_dx * 1000, 1),
+                        "total_nudge_dy_mm": round(collision_nudge_dy * 1000, 1),
+                        "yaw_delta_rad": round(yaw_delta, 3),
+                    })
+
+                    # 3. Move to nudged approach position
+                    new_eff_yaw = pick_yaw + collision_yaw_delta
+                    result = self.move_cartesian_ik(
+                        new_eff_x, new_eff_y, retreat_z,
+                        roll=pick_roll, pitch=pick_pitch, yaw=new_eff_yaw, confirmed=True)
+                    steps.append({
+                        "action": "collision_reposition",
+                        "retry": collision_retries,
+                        "x": round(new_eff_x, 4),
+                        "y": round(new_eff_y, 4),
+                        "yaw": round(new_eff_yaw, 3),
+                        "result": result,
+                    })
+                    if not result.get("success"):
+                        return _abort(f"Collision reposition failed: {result.get('error', 'unknown')}", steps)
+
+                    # 4. Re-baseline forces and IK chain for retry
+                    force_at_approach = self._read_forces()
+                    state = self.get_state()
+                    chain_joints = np.array(state.joint_positions)
+
+                    logger.info(
+                        f"Collision retry {collision_retries}/{MAX_COLLISION_RETRIES}: "
+                        f"nudge=({collision_nudge_dx*1000:.1f}, {collision_nudge_dy*1000:.1f})mm "
+                        f"yaw={collision_yaw_delta:.3f}rad")
+
+                    continue  # retry descent from retreat height
+
+                break  # descent succeeded, proceed to grasp
 
             # Remove NUDGE perturbation before final grasp (accurate positioning)
             if nudge_active and (abs(nudge_perturb_dx) > 0.001 or abs(nudge_perturb_dy) > 0.001):
@@ -1331,10 +1629,13 @@ class FrankaController:
                     f"target=({target_x:.3f}, {y:.3f})"
                 )
 
-            # Final lower to grasp height
+            # Final lower to grasp height (apply collision offsets)
+            effective_x = target_x + collision_nudge_dx
+            effective_y = y + collision_nudge_dy
+            effective_yaw = pick_yaw + collision_yaw_delta
             result = self.move_cartesian_ik(
-                target_x, y, z,
-                roll=pick_roll, pitch=pick_pitch, yaw=pick_yaw, confirmed=True,
+                effective_x, effective_y, z,
+                roll=pick_roll, pitch=pick_pitch, yaw=effective_yaw, confirmed=True,
                 seed_joints=chain_joints)
             steps.append({"action": "lower_to_grasp", "method": "ik", "result": result})
             if not result.get("success"):
@@ -1879,9 +2180,13 @@ class FrankaController:
         chain_joints = np.array(state.joint_positions)
 
         # Step 3: Lower to push height in increments (4cm steps)
+        # Includes force monitoring and stall detection to abort on obstacles
         current_z = state.ee_position[2]
         step_z = 0.04
+        force_baseline = self._read_forces()
+        stall_count = 0
         while current_z - step_z > push_z:
+            prev_z = current_z
             intermediate_z = current_z - step_z
             result = self.move_cartesian_ik(
                 start_x, start_y, intermediate_z,
@@ -1893,6 +2198,36 @@ class FrankaController:
             state = self.get_state()
             chain_joints = np.array(state.joint_positions)
             current_z = state.ee_position[2]
+
+            # Stall detection: abort if arm isn't descending
+            if abs(current_z - prev_z) < 0.002:
+                stall_count += 1
+                if stall_count >= 3:
+                    return _abort(
+                        f"Push descent stalled at z={current_z:.3f}m "
+                        f"(target was z={intermediate_z:.3f}m). Obstacle in the way.",
+                        steps)
+            else:
+                stall_count = 0
+
+            # Force monitoring: abort on contact
+            if force_baseline is not None:
+                time.sleep(0.05)
+                forces_now = self._read_forces()
+                if forces_now is not None:
+                    force_delta = np.abs(forces_now[:3] - force_baseline[:3])
+                    max_delta = float(np.max(force_delta))
+                    if max_delta > CONTACT_FORCE_THRESHOLD:
+                        steps.append({
+                            "action": "contact_detected",
+                            "force_delta_N": round(max_delta, 1),
+                            "z": round(current_z, 4),
+                        })
+                        return _abort(
+                            f"Contact during push descent (force={max_delta:.1f}N) "
+                            f"at z={current_z:.3f}m. Obstacle in the way.",
+                            steps)
+                    force_baseline = forces_now
 
         # Final lower to push height
         result = self.move_cartesian_ik(
@@ -2446,10 +2781,26 @@ class FrankaController:
         return self._skill_logger.start_episode(task)
 
     def stop_skill_episode(self, success: bool) -> dict:
-        """Stop skill episode logging, capture final 'done' frame."""
+        """Stop skill episode logging, capture final 'done' frame with robot state."""
         if not hasattr(self, '_skill_logger') or not self._skill_logger or not self._skill_logger.active:
             return {"success": False, "error": "No active skill episode"}
-        result = self._skill_logger.end_episode(success)
+        # Capture final robot state for the "done" step
+        final_state = None
+        try:
+            rs = self.get_state()
+            final_state = {
+                "joint_positions": [round(float(q), 5) for q in rs.joint_positions],
+                "ee_position": [round(rs.ee_position[0], 4),
+                                round(rs.ee_position[1], 4),
+                                round(rs.ee_position[2], 4)],
+                "ee_orientation": [round(rs.ee_orientation[0], 4),
+                                   round(rs.ee_orientation[1], 4),
+                                   round(rs.ee_orientation[2], 4)],
+                "gripper_width": round(rs.gripper_width, 4),
+            }
+        except Exception:
+            pass
+        result = self._skill_logger.end_episode(success, final_robot_state=final_state)
         return result
 
     def get_skill_episode_status(self) -> dict:
@@ -2651,30 +3002,31 @@ class FrankaController:
             # Log skill BEFORE execution (captures pre-action frame + robot state)
             step_params = {k: v for k, v in step.items() if k != "skill"}
             if _logging:
-                # Capture robot state alongside the pre-action frame
+                # Capture full robot state alongside the pre-action frame
                 robot_state = {}
                 try:
                     rs = self.get_state()
+                    robot_state["joint_positions"] = [round(float(q), 5) for q in rs.joint_positions]
+                    robot_state["ee_position"] = [round(rs.ee_position[0], 4),
+                                                  round(rs.ee_position[1], 4),
+                                                  round(rs.ee_position[2], 4)]
+                    robot_state["ee_orientation"] = [round(rs.ee_orientation[0], 4),
+                                                    round(rs.ee_orientation[1], 4),
+                                                    round(rs.ee_orientation[2], 4)]
                     robot_state["gripper_width"] = round(rs.gripper_width, 4)
-                    robot_state["ee_position"] = {
-                        "x": round(rs.ee_position[0], 4),
-                        "y": round(rs.ee_position[1], 4),
-                        "z": round(rs.ee_position[2], 4),
-                    }
+                    if rs.O_F_ext_hat_K is not None:
+                        robot_state["O_F_ext_hat_K"] = [round(float(f), 3) for f in rs.O_F_ext_hat_K]
+                    if rs.tau_ext_hat_filtered is not None:
+                        robot_state["tau_ext_hat_filtered"] = [round(float(t), 3) for t in rs.tau_ext_hat_filtered]
                     # Read is_grasped flag
                     try:
                         gs = self._rt_client.gripper_read_once()
                         robot_state["is_grasped"] = gs.get("is_grasped", False)
                     except Exception:
                         robot_state["is_grasped"] = None
-                    # Read force/torque
-                    forces = self._read_forces()
-                    if forces is not None:
-                        robot_state["O_F_ext_hat_K"] = [round(float(f), 2) for f in forces]
                 except Exception as e:
                     logger.debug(f"Failed to capture robot state for skill log: {e}")
-                step_params["robot_state"] = robot_state
-                self._skill_logger.log_skill(skill, step_params)
+                self._skill_logger.log_skill(skill, step_params, robot_state=robot_state)
 
             try:
                 if skill == "pick":

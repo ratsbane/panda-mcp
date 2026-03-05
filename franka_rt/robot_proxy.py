@@ -81,11 +81,17 @@ class MockRobot:
             self._ee_quat = np.array(orientations[-1])
         return True
 
+    def start_controller(self, ctrl):
+        logger.info("Mock start_controller")
+
     def stop_controller(self):
         pass
 
     def get_robot(self):
         return self
+
+    def set_collision_behavior(self, *args):
+        pass
 
     def stop(self):
         pass

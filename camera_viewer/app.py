@@ -69,10 +69,21 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
 <h1>Camera Viewer</h1>
 <div class="container">
-  <div class="panel">
-    <h2>USB Camera (live)</h2>
-    <img id="stream" alt="2D camera stream" style="display:none">
-    <div id="stream-placeholder" class="placeholder">Connecting to camera...</div>
+  <div class="depth-row">
+    <div class="panel">
+      <h2>Scene Camera (live)</h2>
+      <img id="stream" alt="Camera stream" style="display:none">
+      <div id="stream-placeholder" class="placeholder">Connecting to camera...</div>
+    </div>
+    <div class="panel">
+      <h2>RealSense Depth</h2>
+      <img id="rs-depth" alt="RealSense depth" style="display:none">
+      <div id="rs-depth-placeholder" class="placeholder">Loading depth...</div>
+      <div class="controls">
+        <button onclick="refreshRSDepth()">Refresh</button>
+        <span id="rs-depth-status" class="status"></span>
+      </div>
+    </div>
   </div>
   <div class="panel">
     <h2>3D Fusion (YOLO + Depth)</h2>
@@ -159,9 +170,15 @@ HTML_PAGE = """<!DOCTYPE html>
     tmp.src = '/fusion?t=' + t;
   }
 
+  function refreshRSDepth() {
+    loadImg('rs-depth', '/rs/depth?t=' + Date.now());
+  }
+
   // Initial load + auto-refresh
   refreshDepth();
+  refreshRSDepth();
   setInterval(refreshDepth, 5000);
+  setInterval(refreshRSDepth, 3000);
 
   // Capture button
   async function captureDepth() {
@@ -193,26 +210,39 @@ async def homepage(request):
     return HTMLResponse(HTML_PAGE)
 
 
+def _find_realsense_color_device() -> str | None:
+    """Find D435 color V4L2 device node for fallback streaming."""
+    try:
+        from realsense_mcp.controller import _v4l2_discover
+        for dev in _v4l2_discover():
+            if dev.get("model") in ("D435", "D435i"):
+                return dev["video_nodes"].get("color")
+    except Exception:
+        pass
+    return None
+
+
 def mjpeg_stream(request):
-    """MJPEG stream from the USB camera daemon via ZeroMQ.
+    """MJPEG stream from USB camera daemon (ZMQ) or RealSense D435 fallback.
 
     Uses a sync generator (run in thread pool by Starlette) to avoid
     async ZMQ event loop issues that can prevent frame flushing.
     """
 
     def generate():
+        # Try ZMQ camera daemon first
         ctx = zmq.Context()
         sock = ctx.socket(zmq.SUB)
-        sock.setsockopt(zmq.RCVTIMEO, 5000)
+        sock.setsockopt(zmq.RCVTIMEO, 3000)
         sock.setsockopt_string(zmq.SUBSCRIBE, "frame")
 
-        connected = False
+        zmq_connected = False
         for endpoint in [ZMQ_IPC, ZMQ_TCP]:
             try:
                 sock.connect(endpoint)
                 parts = sock.recv_multipart()
-                connected = True
-                logger.info(f"MJPEG stream connected to camera at {endpoint}")
+                zmq_connected = True
+                logger.info(f"MJPEG stream connected to camera daemon at {endpoint}")
                 break
             except Exception:
                 try:
@@ -220,46 +250,149 @@ def mjpeg_stream(request):
                 except Exception:
                     pass
 
-        if not connected:
-            sock.close()
-            ctx.term()
+        if zmq_connected:
+            try:
+                if len(parts) >= 3:
+                    jpeg = parts[2]
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n"
+                        b"\r\n" + jpeg + b"\r\n"
+                    )
+                while True:
+                    try:
+                        parts = sock.recv_multipart()
+                        if len(parts) >= 3:
+                            jpeg = parts[2]
+                            yield (
+                                b"--frame\r\n"
+                                b"Content-Type: image/jpeg\r\n"
+                                b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n"
+                                b"\r\n" + jpeg + b"\r\n"
+                            )
+                    except zmq.Again:
+                        continue
+                    except Exception:
+                        break
+            finally:
+                sock.close()
+                ctx.term()
+            return
+
+        # ZMQ failed — fall back to RealSense D435 direct V4L2 capture
+        sock.close()
+        ctx.term()
+
+        color_dev = _find_realsense_color_device()
+        if not color_dev:
+            logger.warning("No camera daemon and no RealSense D435 found")
+            return
+
+        logger.info(f"MJPEG stream using RealSense D435 at {color_dev}")
+        cap = cv2.VideoCapture(color_dev, cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        if not cap.isOpened():
+            logger.error(f"Failed to open {color_dev}")
             return
 
         try:
-            # Yield the first frame we already received
-            if len(parts) >= 3:
-                jpeg = parts[2]
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    time.sleep(0.03)
+                    continue
+                _, jpeg = cv2.imencode(".jpg", frame,
+                                       [cv2.IMWRITE_JPEG_QUALITY, 80])
+                jpeg_bytes = jpeg.tobytes()
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n"
-                    b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n"
-                    b"\r\n" + jpeg + b"\r\n"
+                    b"Content-Length: " + str(len(jpeg_bytes)).encode() + b"\r\n"
+                    b"\r\n" + jpeg_bytes + b"\r\n"
                 )
-
-            while True:
-                try:
-                    parts = sock.recv_multipart()
-                    if len(parts) >= 3:
-                        jpeg = parts[2]
-                        yield (
-                            b"--frame\r\n"
-                            b"Content-Type: image/jpeg\r\n"
-                            b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n"
-                            b"\r\n" + jpeg + b"\r\n"
-                        )
-                except zmq.Again:
-                    # Timeout - daemon might be slow, keep trying
-                    continue
-                except Exception:
-                    break
+                time.sleep(0.033)  # ~30 fps
         finally:
-            sock.close()
-            ctx.term()
+            cap.release()
 
     return StreamingResponse(
         generate(),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+def _realsense_depth_jpeg() -> bytes | None:
+    """Capture a depth colormap from the RealSense D435 via V4L2."""
+    try:
+        from realsense_mcp.controller import _v4l2_discover, DEFAULT_DEPTH_SCALE
+        import subprocess as sp
+        devices = _v4l2_discover()
+        d435 = None
+        for dev in devices:
+            if dev.get("model") in ("D435", "D435i"):
+                d435 = dev
+                break
+        if not d435:
+            return None
+
+        depth_node = d435["video_nodes"].get("depth")
+        if not depth_node:
+            return None
+
+        model = d435.get("model", "D435")
+        scale = DEFAULT_DEPTH_SCALE.get(model, 0.001)
+        w, h = 640, 480
+        frame_bytes = w * h * 2
+        tmp = "/tmp/rs_viewer_depth.raw"
+
+        sp.run([
+            "v4l2-ctl", "-d", depth_node,
+            f"--set-fmt-video=width={w},height={h},pixelformat=Z16 ",
+            "--stream-mmap", "--stream-count=3",
+            f"--stream-to={tmp}",
+        ], capture_output=True, timeout=5)
+
+        import os
+        if not os.path.exists(tmp):
+            return None
+        raw_size = os.path.getsize(tmp)
+        n_frames = raw_size // frame_bytes
+        if n_frames == 0:
+            return None
+
+        with open(tmp, "rb") as f:
+            f.seek((n_frames - 1) * frame_bytes)
+            data = f.read(frame_bytes)
+        os.unlink(tmp)
+
+        depth = np.frombuffer(data, dtype=np.uint16).reshape(h, w)
+        valid = (depth > 0) & (depth < 65535)
+        depth_mm = depth.astype(np.float32) * scale * 1000
+        depth_clipped = np.clip(depth_mm, 200, 1500)
+        depth_norm = ((depth_clipped - 200) / 1300 * 255).astype(np.uint8)
+        depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_TURBO)
+        depth_color[~valid] = 0
+
+        # Add coverage text
+        coverage = valid.sum() / valid.size * 100
+        cv2.putText(depth_color, f"Coverage: {coverage:.0f}%",
+                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+        _, jpeg = cv2.imencode(".jpg", depth_color, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        return jpeg.tobytes()
+    except Exception as e:
+        logger.exception("RealSense depth capture failed")
+        return None
+
+
+async def realsense_depth_image(request):
+    """Return a RealSense depth colormap as JPEG."""
+    loop = asyncio.get_event_loop()
+    jpeg = await loop.run_in_executor(None, _realsense_depth_jpeg)
+    if jpeg is None:
+        return Response("No depth data", status_code=404)
+    return Response(jpeg, media_type="image/jpeg")
 
 
 def _load_texture_jpeg() -> bytes | None:
@@ -1156,5 +1289,6 @@ app = Starlette(
         Route("/depth/texture", depth_texture),
         Route("/depth/colormap", depth_colormap),
         Route("/depth/capture", depth_capture),
+        Route("/rs/depth", realsense_depth_image),
     ],
 )
