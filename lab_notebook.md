@@ -1759,3 +1759,70 @@ Key insight: red has moderate B (not very yellow), orange has high B (yellow com
 2. **Test `ground_object`** with Spark for non-color objects (e.g. "the wooden block", "the tiger toy")
 3. **Consider making LAB the default** in auto chain (swap order: LAB → CLAHE → HSV) since it's cleanest
 4. **Tune LAB further** if other scenes expose edge cases
+
+---
+
+## 2026-03-06 - Literature Review: Tether (ICLR 2026)
+
+**Paper:** "Autonomous Functional Play with Correspondence-Driven Trajectory Warping" — [tether-research.github.io](https://tether-research.github.io/), arXiv:2603.03278
+
+### What It Does
+
+Tether generates 1000+ expert-level robot trajectories autonomously from ≤10 human demos per task. A non-parametric policy warps demonstrated trajectories to new scenes via semantic keypoint correspondences (DINOv2 + Stable Diffusion features). A VLM (Gemini Robotics-ER 1.5) handles task selection, planning, and success evaluation. After 26 hours of autonomous play, downstream diffusion policies trained on the generated data reach near-perfect success — competitive with equivalent human-collected demonstrations.
+
+### Hardware
+
+Franka Panda (same as ours), two calibrated ZED stereo cameras, 15Hz control, 6-DOF gripper pose + binary open/close. They also use a wrist camera for high-precision tasks.
+
+### Key Technical Details
+
+- **Trajectory warping**: Project 3D gripper waypoints onto demo images as keypoints. At inference, find correspondences in new scene via DINOv2+SD features, backproject to 3D, compute displacement per waypoint, linearly interpolate displacements along trajectory. Non-parametric — no training.
+- **Demo selection**: UCB bandit over k=5 candidate demos, picks closest match by waypoint Euclidean distance.
+- **Success evaluation**: VLM compares pre/post images from 3 camera views. 98.4% precision, 89.6% recall.
+- **Self-resetting tasks**: Forward/backward pairs (e.g., bowl table→shelf, shelf→table). End state of each task = valid start for another. Only 5 manual interventions in 26 hours (0.26% of attempts).
+- **Downstream training**: Filtered behavioral cloning on diffusion policy, 600 epochs, retrained every 500 play attempts on cumulative successful data.
+
+### Results
+
+- 1,085 successes from 1,946 attempts (55.8% success rate) across 6 tasks
+- 1 success per 86 seconds throughput
+- Tether (10 demos): 80-100% on in-distribution, 60-90% on OOD objects
+- Diffusion policy (10 demos): ~10% in-dist, ~0% on hard tasks — **completely failed without more data**
+- π₀ zero-shot: 40-70% on basic tasks, 10-30% on hard tasks
+- After autonomous collection, downstream policies matched human-demo-trained baselines
+
+### Relevance to Our Project
+
+**What maps directly:**
+- Same robot (Franka Panda), similar camera setup (we have ZED Mini + ZED 2 incoming)
+- VLM as task planner + success judge — we already do this with Claude
+- Autonomous data generation → downstream policy — exactly our plan (skill episodes → SmolVLM2)
+- Their 55.8% autonomous success rate is a useful benchmark for our collection runs
+
+**What's different:**
+- They use dense trajectory warping (6-DOF waypoints at 15Hz). We use parameterized skills (pick/place). Simpler, less expressive, but more learnable.
+- Their warping policy is the collector; we use Claude as the planner. Same role, different mechanism.
+- They need stereo for 3D backprojection; we use RealSense depth.
+
+**Key validation:** Diffusion policy with only 10 demos completely fails. But with 1000+ autonomously generated trajectories, it reaches near-perfect. This confirms our strategy: collect at scale first, then train. The bottleneck is data quantity and diversity, not model architecture.
+
+### Actionable Takeaways
+
+| # | Finding |
+|---|---------|
+| 86 | 10 demos are enough to bootstrap autonomous collection, but 1000+ are needed for a good downstream policy |
+| 87 | Self-resetting task pairs (forward/backward) enable hours of autonomous play with near-zero manual intervention |
+| 88 | VLM success evaluation (pre/post image comparison) achieves 98.4% precision — we should add this to our collection loop |
+| 89 | Environment diversity matters more than quantity — same-viewpoint table data risks overfitting |
+| 90 | Non-parametric methods (warping) vastly outperform learned policies in few-shot; learned policies need scale to win |
+
+### Environment Diversity Plan
+
+Our current setup is too uniform: single camera angle, same dark wood table, consistent lighting. Risk of training a VLM that learns "blocks on dark wood at 750mm" rather than manipulation skills. Planned mitigations:
+
+1. **Vary lighting** — desk lamp on/off/angled between collection runs. Zero cost, immediate diversity. LAB detection handles this.
+2. **Add vertical structure** — small shelf or raised platform. Forces different z-heights, approach angles, and occlusion handling. Highest-value single change.
+3. **Multiple camera positions** — even 2-3 D435 positions breaks single-viewpoint bias.
+4. **Different surfaces** — cutting board, towel, colored paper under blocks. Changes background.
+5. **More object variety** — beyond blocks: soup can, cups, irregular shapes.
+6. **Design reversible task pairs** — "move red block left" ↔ "move red block right", "stack" ↔ "unstack". Enables long autonomous runs.
