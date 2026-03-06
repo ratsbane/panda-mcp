@@ -1689,3 +1689,73 @@ Collected 39 skill episodes autonomously using D435 `detect_objects` for percept
 3. **Use detected z from D435** — elevated blocks need grasp height from depth, not default z=0.013
 4. **Resume episode collection** — target 100 episodes for VLM fine-tuning
 5. **Online recalibration prototype** — robot's FK + visual detection of gripper → continuous transform refinement
+
+---
+
+## 2026-03-05 ~evening - Robust Color Detection for RealSense D435
+
+### Problem
+
+HSV color detection in `detect_objects` was fragile — at certain camera viewpoints/lighting, it returned zero objects or massive false positive counts. The dark wood table triggered red/orange HSV masks. Core issue: HSV is fundamentally sensitive to illumination (saturation and value floors collapse under dim or angled lighting).
+
+### Approach
+
+Implemented three detection strategies side-by-side, selectable via `method` parameter:
+
+1. **HSV** — existing behavior, no change
+2. **CLAHE+HSV** — CLAHE on LAB L-channel normalizes lighting before HSV thresholding
+3. **LAB color space** — uses A channel (green↔red) and B channel (blue↔yellow), separating chromaticity from lightness
+4. **Auto** (default) — tries CLAHE+HSV → LAB → raw HSV, stops at first method that finds objects
+
+Also added `debug=true` mode that saves raw frame, CLAHE frame, per-color binary masks, and annotated detection image to `/tmp/detect_debug/`.
+
+### Implementation
+
+Refactored `detect_objects` in `realsense_mcp/controller.py`:
+- Extracted `_detect_hsv()` and `_detect_colors_lab()` as separate detection backends
+- Extracted `_resolve_detections_3d()` for shared depth lookup + robot-frame transform
+- Added `_preprocess_clahe()` helper
+- Added `ground_object()` method using Qwen2.5-VL via `GroundingClient` for natural-language object finding
+
+Updated `realsense_mcp/server.py` with `method`/`debug` params on `detect_objects` tool and new `ground_object` tool.
+
+### Results — Side-by-side Comparison
+
+Scene: ~7 colored blocks on dark wood table, Campbell's soup can, ArUco markers.
+
+| Method | Detections | Red/orange overlap | Table noise | Mask quality |
+|--------|------------|--------------------|-------------|--------------|
+| HSV | 15 | yes (red block→red+orange) | heavy (wood grain) | noisy blobs |
+| CLAHE+HSV | 12 | minor | moderate | better than raw HSV |
+| LAB (initial) | 16 | severe (same pixel → red AND orange) | minimal | clean rectangles |
+| LAB (tuned) | **9** | **none** | **minimal** | **clean** |
+
+### LAB Threshold Tuning
+
+Initial LAB ranges had massive red/orange overlap because both colors occupy similar A-channel values. The fix was using the B channel (yellow axis) to separate them:
+
+```
+Initial:  red a_min=145, b_max=255  |  orange a_min=135, a_max=255, b_min=145
+Tuned:    red a_min=155, b_max=170  |  orange a_min=135, a_max=175, b_min=150
+```
+
+Key insight: red has moderate B (not very yellow), orange has high B (yellow component). Capping red's b_max at 170 and orange's a_max at 175 cleanly separates them.
+
+### Key Findings
+
+| # | Finding |
+|---|---------|
+| 79 | HSV color detection on dark wood table produces heavy false positives — wood grain triggers red/orange masks |
+| 80 | LAB color space separates chromaticity from lightness, producing much cleaner masks than HSV |
+| 81 | CLAHE preprocessing helps HSV somewhat but doesn't fix fundamental sensitivity issues |
+| 82 | Red vs orange separation in LAB requires B-channel bounds — red has low B (not yellow), orange has high B |
+| 83 | Auto fallback chain (CLAHE→LAB→HSV) ensures detection works across varied lighting |
+| 84 | `debug=true` mode saving masks to `/tmp/detect_debug/` is essential for threshold tuning |
+| 85 | Synthesizing across methods (intersection/union) adds complexity for marginal gain — better to pick cleanest single method |
+
+### Next Steps
+
+1. **Test at the problem viewpoint** — the one that originally returned zero objects, verify LAB fallback fixes it
+2. **Test `ground_object`** with Spark for non-color objects (e.g. "the wooden block", "the tiger toy")
+3. **Consider making LAB the default** in auto chain (swap order: LAB → CLAHE → HSV) since it's cleanest
+4. **Tune LAB further** if other scenes expose edge cases

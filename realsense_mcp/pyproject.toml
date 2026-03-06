@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "robot-mcp-realsense"
+version = "0.1.0"
+description = "MCP server for Intel RealSense D405/D435 depth cameras"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    {name = "Doug Schallmoser"},
+]
+keywords = ["mcp", "robotics", "realsense", "depth", "rgbd"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "numpy>=1.24.0",
+    "opencv-python>=4.8.0",
+    "pyrealsense2>=2.50.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ratsbane/panda-mcp"
+Repository = "https://github.com/ratsbane/panda-mcp"
+
+[project.scripts]
+realsense-mcp = "realsense_mcp.server:main_entry"
+
+[tool.hatch.build]
+exclude = [
+    "dist/",
+    ".gitignore",
+    "pyproject.toml",
+    "README.md",
+]
+
+[tool.hatch.build.targets.wheel]
+[tool.hatch.build.targets.wheel.force-include]
+"__init__.py" = "realsense_mcp/__init__.py"
+"__main__.py" = "realsense_mcp/__main__.py"
+"server.py" = "realsense_mcp/server.py"
+"controller.py" = "realsense_mcp/controller.py"
